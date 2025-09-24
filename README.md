@@ -7,6 +7,27 @@ Advanced toolkit for analyzing Bitcoin ECDSA signatures and recovering private k
 
 > 🔐 **Security Research Project** - For educational and research purposes only
 
+# ⚠️ Legal & Ethical Notice
+> This project is for:
+
+>Cryptographic research and education
+
+>Security auditing and vulnerability assessment
+
+> Academic study of blockchain security
+
+Not for:
+
+> Malicious or unauthorized access
+
+>Illegal activities
+
+>Harming blockchain networks
+
+> Users are responsible for complying with local laws and using this tool ethically.
+
+
+
 ## 🚀 Features
 
 - **Multi-API Block Processing**: Fetches Bitcoin blockchain data from multiple sources (Mempool.space, Blockchain.com, BlockCypher)
@@ -54,3 +75,54 @@ TX_test/
 └── recovered_keys.jsonl      # Recovery results (generated)
 ```
 
+### 🧩 How It Works
+Signature Extraction
+The Python script processes Bitcoin blocks and extracts ECDSA signatures from various transaction types, normalizing them into a standardized JSONL format.
+
+Recovery Methods:
+1. Duplicate R Analysis: Finds signatures sharing the same R value to recover private keys
+
+2. Delta-Gradient Scanning: Detects linear relationships between nonces (k values)
+
+3. LCG Vulnerability Detection: Identifies weak PRNG patterns in signature generation
+
+4. Propagation Attacks: Uses recovered keys to discover additional vulnerabilities
+
+Advanced Features
+- Bucketized processing for memory efficiency
+
+- Multi-threaded parallel execution
+
+- Precomputation and caching optimizations
+
+- Support for both compressed and uncompressed public keys
+
+## 🤝 How to Contribute
+Welcome contributions in several areas:
+
+🔧 Code Improvements
+- Optimize signature parsing algorithms
+
+- Add support for Taproot (Schnorr) signatures
+
+- Implement new recovery methods
+
+- Improve multi-API fallback mechanisms
+
+- Add GPU acceleration support
+
+🔬 Research Areas
+- Develop new cryptographic attack vectors
+
+- Analyze real-world wallet implementations
+
+- Study historical Bitcoin transactions for patterns
+
+- Improve statistical analysis of signature randomness
+
+📊 Data Analysis
+- Create visualization tools for signature patterns
+
+- Build machine learning models for vulnerability detection
+
+- Develop clustering algorithms for wallet fingerprinting
