@@ -29,3 +29,28 @@ pip install requests coincurve bech32
 
 # C++ build dependencies (Ubuntu)
 sudo apt-get install g++ libsecp256k1-dev libssl-dev libboost-all-dev
+```
+
+### Basic Usage
+```bash
+# 1. Download Bitcoin signatures
+python download_signatures.py
+
+# 2. Build recovery tool
+g++ -O3 -march=native -std=c++17 ecdsa_recover_strict.cpp -o ecdsa_recover_strict \
+    -lsecp256k1 -lcrypto -lpthread -lboost_system
+
+# 3. Run analysis
+./ecdsa_recover_strict --sigs signatures.jsonl --threads 8 --out-json recovered.jsonl
+```
+
+### 📁 Project Structure
+```txt
+bitcoin-ecdsa-recovery/
+├── download_signatures.py    # Blockchain data fetcher and signature extractor
+├── ecdsa_recover_strict.cpp  # Core recovery engine (C++)
+├── gen_random_priv.c         # Test key generator
+├── signatures.jsonl          # Extracted signatures (generated)
+└── recovered_keys.jsonl      # Recovery results (generated)
+```
+
