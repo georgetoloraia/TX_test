@@ -46,7 +46,7 @@ g++ -O3 -march=native -std=c++17 ecdsa_recover_strict.cpp -o ecdsa_recover_stric
 
 ### 📁 Project Structure
 ```txt
-bitcoin-ecdsa-recovery/
+TX_test/
 ├── download_signatures.py    # Blockchain data fetcher and signature extractor
 ├── ecdsa_recover_strict.cpp  # Core recovery engine (C++)
 ├── gen_random_priv.c         # Test key generator
