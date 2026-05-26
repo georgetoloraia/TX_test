@@ -39,6 +39,13 @@ def parse_int(x: Any) -> int:
     raise TypeError(f"Unsupported integer type: {type(x)}")
 
 
+def count_nonempty_lines(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with path.open("r", encoding="utf-8") as f:
+        return sum(1 for line in f if line.strip())
+
+
 def cluster_key(obj: dict[str, Any]) -> str:
     pub = (obj.get("pubkey_hex") or obj.get("pub") or "").strip().lower()
     if pub:
@@ -209,6 +216,10 @@ def main() -> None:
     sigs = Path(args.sigs)
     if not sigs.exists():
         raise FileNotFoundError(f"Missing signatures file: {sigs}")
+    sig_rows = count_nonempty_lines(sigs)
+    if sig_rows == 0:
+        print("No signatures available yet; skipping audit/recover for this cycle.")
+        return
 
     audit_cmd = [sys.executable, "ecdsa_signature_audit.py", str(sigs), "--out", args.audit_report]
     if args.dry_run:

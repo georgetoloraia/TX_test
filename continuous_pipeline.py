@@ -115,7 +115,9 @@ def main() -> None:
         ]
         rc = run_cmd(recover_cmd)
         if rc != 0:
-            raise RuntimeError(f"automate_recover.py failed with exit code {rc}")
+            print(f"[warn] automate_recover.py failed with exit code {rc}; continuing to next batch")
+            current_start += args.batch_size
+            continue
 
         after_recovered = count_lines(Path(args.recovered))
         new_rows = max(0, after_recovered - before_recovered)

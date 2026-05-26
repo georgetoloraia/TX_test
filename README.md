@@ -52,6 +52,22 @@ pip install requests coincurve bech32
 sudo apt-get install g++ libsecp256k1-dev libssl-dev libboost-all-dev
 ```
 
+### if problem 3.14
+```
+sudo apt update
+sudo apt install -y software-properties-common
+sudo add-apt-repository ppa:deadsnakes/ppa -y
+sudo apt update
+sudo apt install -y python3.11 python3.11-venv
+
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+pip install requests coincurve bech32 base58
+python continuous_pipeline.py --start-height 1 --batch-size 100 --threads 8 --python .venv/bin/python
+```
+
+
 ### Basic Usage
 ```bash
 # 1. Download Bitcoin signatures
