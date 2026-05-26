@@ -18,7 +18,7 @@ g++ -O3 -march=native -flto -fexceptions -pthread -std=c++17 \
   --out-k    recovered_k.jsonl \
   --out-deltas delta_insights.jsonl \
   --max-iter 4 \
-  --preload-priv known_keys.txt \
+  --preload-priv known_keys2.txt \
   --dg-max-delta 65536 \
   --dg-seeds 1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,32768,65536 \
   --dg-fill-step 8 \

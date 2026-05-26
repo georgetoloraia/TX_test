@@ -65,6 +65,33 @@ g++ -O3 -march=native -std=c++17 ecdsa_recover_strict.cpp -o ecdsa_recover_stric
 ./ecdsa_recover_strict --sigs signatures.jsonl --threads 8 --out-json recovered.jsonl
 ```
 
+### Defensive Workflow (Recommended)
+```bash
+# 1) Nonce-quality forensics (JSONL or JSON input)
+python3 ecdsa_signature_audit.py signatures.jsonl --out ecdsa_audit_report.json
+
+# 2) Automated policy-based pipeline (audit -> conditional recover)
+python3 automate_recover.py --sigs signatures.jsonl --risk-threshold 40 --threads 8
+
+# 2b) Cluster-aware mode (recommended for lower false positives)
+python3 automate_recover.py \
+  --sigs signatures.jsonl \
+  --risk-threshold 40 \
+  --cluster-min-sigs 25 \
+  --cluster-risk-threshold 20 \
+  --max-clusters 50 \
+  --threads 8
+
+# 3) Deterministic extraction mode (reproducible traversal)
+python3 download_signatures.py --mode deterministic --start-height 100000 --max-blocks 100
+
+# 4) Continuous loop: start at block 1, fetch 100 blocks, run recover, repeat
+python3 continuous_pipeline.py --start-height 1 --batch-size 100 --threads 8
+
+# Stop automatically when new recovered rows appear
+python3 continuous_pipeline.py --start-height 1 --batch-size 100 --threads 8 --stop-on-found
+```
+
 ### 📁 Project Structure
 ```txt
 TX_test/

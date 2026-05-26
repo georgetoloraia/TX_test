@@ -9,6 +9,7 @@ e3bf...b468	Blocks 91722 and 91880	November 14-15, 2010	50 BTC
 
 """
 
+import argparse
 import requests, time, os, json, re, random, logging, hashlib, base58
 from typing import List, Dict, Optional, Tuple, Set
 from urllib.parse import urljoin
@@ -336,7 +337,14 @@ class PrevoutCache:
 # =====================================================================================
 
 class BlockWalker:
-    def __init__(self):
+    def __init__(
+        self,
+        deterministic: bool = True,
+        random_seed: Optional[int] = None,
+        random_min_height: int = 5000,
+        random_max_height: int = 450000,
+        emit_secrets: bool = False,
+    ):
         self.api_endpoints = [
             {"name":"Mempool.space","base_url":"https://mempool.space/api/","weight":9,"requests":0,"last_used":0,
              "endpoints":{"block_hash":"block-height/{height}","block_txids":"block/{hash}/txids","tx":"tx/{txid}"}},
@@ -349,6 +357,11 @@ class BlockWalker:
         self.session.headers.update({"User-Agent":"Mozilla/5.0 BlockWalker/5.0"})
         self.api_stats = {api["name"]:{ "success":0, "errors":0 } for api in self.api_endpoints}
         self.checkpoint_file = CHECKPOINT_FILE
+        self.deterministic = deterministic
+        self.random_min_height = random_min_height
+        self.random_max_height = random_max_height
+        self.emit_secrets = emit_secrets
+        self._rng = random.Random(random_seed if random_seed is not None else 0)
 
         # duplicate-R tracking
         self.by_r_pub: Dict[Tuple[int,str], List[dict]] = {}
@@ -363,6 +376,14 @@ class BlockWalker:
         # ensure files
         for p in [SIGS_JSONL, R_VALUES_FILE, REPEAT_JSONL, RECOVERED_JSONL, RECOVERED_TXT, SIGSCRIPTS_TXT]:
             if not os.path.exists(p): open(p,"a").close()
+
+    @staticmethod
+    def _redact_hex(value: str, prefix: int = 6, suffix: int = 4) -> str:
+        if not value:
+            return value
+        if len(value) <= prefix + suffix:
+            return "[REDACTED]"
+        return f"{value[:prefix]}...{value[-suffix:]}"
 
     # ---------------- endpoint / request ----------------
     def _pick(self, endpoint_type) -> Optional[dict]:
@@ -768,12 +789,25 @@ class BlockWalker:
                         continue
 
                     wif = to_wif(priv, compressed=True, mainnet=True)
-                    rec = {"pubkey": pub, "priv_hex": f"{priv:064x}", "priv_wif": wif,
+                    priv_hex = f"{priv:064x}"
+                    rec = {"pubkey": pub, "priv_hex": priv_hex, "priv_wif": wif,
                            "r": f"{r:064x}", "txids":[a["txid"], b["txid"]], "vins":[a["vin"], b["vin"]]}
+                    if not self.emit_secrets:
+                        rec["priv_hex"] = self._redact_hex(priv_hex)
+                        rec["priv_wif"] = "[REDACTED]"
                     with open(RECOVERED_JSONL,"a") as f: f.write(json.dumps(rec)+"\n")
                     with open(RECOVERED_TXT,"a") as f:
-                        f.write(f"PUB={pub} PRIV={priv:064x} WIF={wif} from {a['txid']}:{a['vin']} & {b['txid']}:{b['vin']}\n")
-                    logger.critical(f"[RECOVERED] pub={pub} priv={priv:064x} WIF={wif}")
+                        if self.emit_secrets:
+                            f.write(f"PUB={pub} PRIV={priv_hex} WIF={wif} from {a['txid']}:{a['vin']} & {b['txid']}:{b['vin']}\n")
+                        else:
+                            f.write(
+                                f"PUB={pub} PRIV={self._redact_hex(priv_hex)} WIF=[REDACTED] "
+                                f"from {a['txid']}:{a['vin']} & {b['txid']}:{b['vin']}\n"
+                            )
+                    if self.emit_secrets:
+                        logger.critical(f"[RECOVERED] pub={pub} priv={priv_hex} WIF={wif}")
+                    else:
+                        logger.critical(f"[RECOVERED] pub={pub} priv={self._redact_hex(priv_hex)} WIF=[REDACTED]")
                     recovered_any=True
         return recovered_any
 
@@ -828,16 +862,30 @@ class BlockWalker:
         self.try_recover_all()
         return True
 
-    def run(self, start_height: Optional[int]=None):
+    def run(
+        self,
+        start_height: Optional[int] = None,
+        max_blocks: Optional[int] = None,
+        end_height: Optional[int] = None,
+    ):
         h = self.load_checkpoint() if start_height is None else start_height
+        processed = 0
         while True:
+            if end_height is not None and h > end_height:
+                logger.info(f"Reached end height {end_height}, stopping.")
+                break
+            if max_blocks is not None and processed >= max_blocks:
+                logger.info(f"Processed max_blocks={max_blocks}, stopping.")
+                break
             try:
                 ok = self.process_block(h)
                 if ok:
                     self.save_checkpoint(h)
-                    
-                    h = random.randint(5000, 450000)
-                    # h += 1
+                    processed += 1
+                    if self.deterministic:
+                        h += 1
+                    else:
+                        h = self._rng.randint(self.random_min_height, self.random_max_height)
                 else:
                     logger.warning("block failed; sleeping 15s"); time.sleep(15)
             except KeyboardInterrupt:
@@ -847,6 +895,34 @@ class BlockWalker:
                 time.sleep(15)
 
 # ---------------------------------------------- entry ----------------------------------------------
+def build_cli() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Bitcoin signature extractor with reproducible traversal controls.")
+    p.add_argument("--start-height", type=int, default=None, help="Starting block height; defaults to checkpoint.")
+    p.add_argument("--end-height", type=int, default=None, help="Optional inclusive upper bound for deterministic traversal.")
+    p.add_argument("--max-blocks", type=int, default=None, help="Stop after processing this many successful blocks.")
+    p.add_argument("--mode", choices=["deterministic", "random"], default="deterministic",
+                   help="Traversal mode. deterministic is default and reproducible.")
+    p.add_argument("--random-seed", type=int, default=0, help="PRNG seed for random mode.")
+    p.add_argument("--random-min-height", type=int, default=5000, help="Lower bound for random mode.")
+    p.add_argument("--random-max-height", type=int, default=450000, help="Upper bound for random mode.")
+    p.add_argument("--emit-secrets", action="store_true",
+                   help="Write full recovered private keys/WIF into outputs and logs. Default is redacted.")
+    return p
+
 if __name__ == "__main__":
-    walker = BlockWalker()
-    walker.run()
+    args = build_cli().parse_args()
+    if args.random_min_height > args.random_max_height:
+        raise ValueError("random-min-height cannot be greater than random-max-height")
+
+    walker = BlockWalker(
+        deterministic=(args.mode == "deterministic"),
+        random_seed=args.random_seed,
+        random_min_height=args.random_min_height,
+        random_max_height=args.random_max_height,
+        emit_secrets=args.emit_secrets,
+    )
+    walker.run(
+        start_height=args.start_height,
+        max_blocks=args.max_blocks,
+        end_height=args.end_height,
+    )
