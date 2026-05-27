@@ -26,6 +26,30 @@ def run_cmd(cmd: list[str]) -> int:
     return p.returncode
 
 
+def run_recover_stage(
+    recover_bin: str,
+    recover_input: str,
+    threads: int,
+    max_iter: int,
+    stage_name: str,
+    extra_args: list[str],
+) -> int:
+    rec_cmd = [
+        recover_bin,
+        "--sigs", recover_input,
+        "--threads", str(threads),
+        "--out-json", "recovered_keys.jsonl",
+        "--out-txt", "recovered_keys.txt",
+        "--out-k", "recovered_k.jsonl",
+        "--out-deltas", "delta_insights.jsonl",
+        "--report-r-collisions", "r_collisions.jsonl",
+        "--export-clusters", "dupR_clusters.jsonl",
+        "--max-iter", str(max_iter),
+    ] + extra_args
+    print(f"[recover-stage] {stage_name}")
+    return run_cmd(rec_cmd)
+
+
 def parse_int(x: Any) -> int:
     if isinstance(x, int):
         return x
@@ -190,6 +214,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Automate audit + recovery orchestration")
     ap.add_argument("--sigs", default="signatures.jsonl", help="Input signatures JSONL")
     ap.add_argument("--audit-report", default="ecdsa_audit_report.json", help="Audit report output")
+    ap.add_argument("--decision-out", default="automate_decision.json", help="Automation decision summary JSON output")
+    ap.add_argument("--audit-verify-signatures", action="store_true", default=True,
+                    help="Enable signature verification gate during audit (default: enabled)")
+    ap.add_argument("--no-audit-verify-signatures", action="store_false", dest="audit_verify_signatures",
+                    help="Disable signature verification gate during audit")
+    ap.add_argument("--audit-cluster-min-size", type=int, default=25,
+                    help="Minimum cluster size for audit per-cluster analysis")
     ap.add_argument("--recover-bin", default="./ecdsa_recover_strict", help="Recover binary path")
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--max-iter", type=int, default=2)
@@ -210,6 +241,12 @@ def main() -> None:
                     help="Cluster risk report JSON")
     ap.add_argument("--disable-cluster-gating", action="store_true",
                     help="Recover on full signature file (legacy behavior)")
+    ap.add_argument("--enable-advanced-recover", action="store_true", default=True,
+                    help="Enable multi-stage advanced recovery escalation (default: enabled)")
+    ap.add_argument("--no-enable-advanced-recover", action="store_false", dest="enable_advanced_recover",
+                    help="Disable advanced recovery escalation")
+    ap.add_argument("--random-k-budget", type=int, default=0,
+                    help="Random-k tries per bucket for final escalation stage (0 disables random-k stage)")
 
     args = ap.parse_args()
 
@@ -221,7 +258,17 @@ def main() -> None:
         print("No signatures available yet; skipping audit/recover for this cycle.")
         return
 
-    audit_cmd = [sys.executable, "ecdsa_signature_audit.py", str(sigs), "--out", args.audit_report]
+    audit_cmd = [
+        sys.executable,
+        "ecdsa_signature_audit.py",
+        str(sigs),
+        "--out",
+        args.audit_report,
+        "--cluster-min-size",
+        str(args.audit_cluster_min_size),
+    ]
+    if args.audit_verify_signatures:
+        audit_cmd.append("--verify-signatures")
     if args.dry_run:
         print("DRY RUN:", " ".join(shlex.quote(x) for x in audit_cmd))
         return
@@ -235,13 +282,43 @@ def main() -> None:
     risk = int(report.get("risk", {}).get("score", 0))
     verdict = report.get("risk", {}).get("verdict", "unknown")
     dup_r = int(report.get("duplicates_r", {}).get("duplicate_count", 0))
+    cross_pub_dup_r = int(report.get("cross_pub_duplicate_r", {}).get("collision_count", 0))
+    drift_flags = int(report.get("height_time_drift", {}).get("drift_flags", 0))
+    sighash_segments = report.get("sighash_segments", {}).get("segments", [])
+    sighash_anomaly = any((int(s.get("duplicate_r", 0)) > 0 or int(s.get("fdr_bits_r", 0)) > 0) for s in sighash_segments)
 
     print(f"Audit risk score: {risk} ({verdict})")
     print(f"Duplicate-r groups: {dup_r}")
+    print(f"Cross-pub duplicate-r groups: {cross_pub_dup_r}")
+    print(f"Height/time drift flags: {drift_flags}")
 
-    should_recover = args.force_recover or risk >= args.risk_threshold or dup_r > 0
+    should_recover = (
+        args.force_recover
+        or risk >= args.risk_threshold
+        or dup_r > 0
+        or cross_pub_dup_r > 0
+        or drift_flags > 0
+        or sighash_anomaly
+    )
     if not should_recover:
         print("Recovery skipped by policy (low anomaly signal).")
+        with open(args.decision_out, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "should_recover": False,
+                    "recover_executed": False,
+                    "risk_score": risk,
+                    "risk_verdict": verdict,
+                    "duplicate_r": dup_r,
+                    "cross_pub_duplicate_r": cross_pub_dup_r,
+                    "drift_flags": drift_flags,
+                    "sighash_anomaly": sighash_anomaly,
+                    "recover_input": None,
+                    "cluster_gating_used": not args.disable_cluster_gating,
+                },
+                f,
+                indent=2,
+            )
         return
 
     recover_input = str(sigs)
@@ -266,24 +343,75 @@ def main() -> None:
         if cluster_report["selected_signatures"] > 0:
             recover_input = args.clustered_sigs_out
 
-    rec_cmd = [
-        args.recover_bin,
-        "--sigs", recover_input,
-        "--threads", str(args.threads),
-        "--out-json", "recovered_keys.jsonl",
-        "--out-txt", "recovered_keys.txt",
-        "--out-k", "recovered_k.jsonl",
-        "--out-deltas", "delta_insights.jsonl",
-        "--report-r-collisions", "r_collisions.jsonl",
-        "--export-clusters", "dupR_clusters.jsonl",
-        "--max-iter", str(args.max_iter),
-    ]
+    # Multi-stage recovery:
+    # stage1: primary/cheap scan (disable LCG + no random-k)
+    # stage2: enable LCG/delta if anomaly signal is strong
+    # stage3: optional random-k budget, only on strongest signals
+    stage_runs = []
+    stage1_rc = run_recover_stage(
+        recover_bin=args.recover_bin,
+        recover_input=recover_input,
+        threads=args.threads,
+        max_iter=max(1, args.max_iter),
+        stage_name="stage1-primary",
+        extra_args=["--no-lcg", "--scan-random-k", "0"],
+    )
+    stage_runs.append({"name": "stage1-primary", "rc": stage1_rc})
+    if stage1_rc != 0:
+        raise RuntimeError(f"Recover stage1 failed with exit code {stage1_rc}")
 
-    rc = run_cmd(rec_cmd)
-    if rc != 0:
-        raise RuntimeError(f"Recover step failed with exit code {rc}")
+    strong_signal = (
+        risk >= max(args.risk_threshold, 80)
+        or cross_pub_dup_r > 0
+        or dup_r > 0
+        or drift_flags > 0
+        or sighash_anomaly
+    )
+    if args.enable_advanced_recover and strong_signal:
+        stage2_rc = run_recover_stage(
+            recover_bin=args.recover_bin,
+            recover_input=recover_input,
+            threads=args.threads,
+            max_iter=max(args.max_iter, 2),
+            stage_name="stage2-lcg-delta",
+            extra_args=["--scan-random-k", "0"],
+        )
+        stage_runs.append({"name": "stage2-lcg-delta", "rc": stage2_rc})
+        if stage2_rc != 0:
+            raise RuntimeError(f"Recover stage2 failed with exit code {stage2_rc}")
+
+        if args.random_k_budget > 0 and (cross_pub_dup_r > 0 or drift_flags > 0 or risk >= 120):
+            stage3_rc = run_recover_stage(
+                recover_bin=args.recover_bin,
+                recover_input=recover_input,
+                threads=args.threads,
+                max_iter=max(args.max_iter, 2),
+                stage_name="stage3-random-k",
+                extra_args=["--scan-random-k", str(args.random_k_budget)],
+            )
+            stage_runs.append({"name": "stage3-random-k", "rc": stage3_rc})
+            if stage3_rc != 0:
+                raise RuntimeError(f"Recover stage3 failed with exit code {stage3_rc}")
 
     print(f"Recovery automation complete. input={recover_input}")
+    with open(args.decision_out, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "should_recover": True,
+                "recover_executed": True,
+                "risk_score": risk,
+                "risk_verdict": verdict,
+                "duplicate_r": dup_r,
+                "cross_pub_duplicate_r": cross_pub_dup_r,
+                "drift_flags": drift_flags,
+                "sighash_anomaly": sighash_anomaly,
+                "recover_input": recover_input,
+                "cluster_gating_used": not args.disable_cluster_gating,
+                "recover_stages": stage_runs,
+            },
+            f,
+            indent=2,
+        )
 
 
 if __name__ == "__main__":

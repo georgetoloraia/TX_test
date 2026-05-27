@@ -716,7 +716,7 @@ class BlockWalker:
         return results
 
     # ---------------- duplicate-R bookkeeping & recovery ----------------
-    def record_sig(self, txid:str, vin:int, entry:dict):
+    def record_sig(self, txid:str, vin:int, entry:dict, block_height: Optional[int] = None, block_time: Optional[int] = None):
         # dedup line guard
         key = (txid, vin, entry["r"], entry["s"])
         if key in self._seen_lines:
@@ -731,6 +731,8 @@ class BlockWalker:
             "sighash": entry["sighash"], "z": f"{entry['z']:064x}",
             "prev_value": entry["prev_value"], "prev_spk": entry["prev_spk"],
             "prev_txid": entry.get("prev_txid"), "prev_vout": entry.get("prev_vout"),
+            "block_height": block_height,
+            "block_time": block_time,
         }
         # context for multisig / segwit
         if entry.get("witness_script"): rec["witness_script"] = entry["witness_script"]
@@ -842,6 +844,19 @@ class BlockWalker:
             raw = self.get_tx(txid)
             if not raw: continue
             tx = self.normalize_tx(raw)
+            tx_block_time = None
+            try:
+                status = raw.get("status") if isinstance(raw, dict) else None
+                if isinstance(status, dict):
+                    if status.get("block_time") is not None:
+                        tx_block_time = int(status.get("block_time"))
+                if tx_block_time is None and isinstance(raw, dict):
+                    if raw.get("block_time") is not None:
+                        tx_block_time = int(raw.get("block_time"))
+                    elif raw.get("time") is not None:
+                        tx_block_time = int(raw.get("time"))
+            except Exception:
+                tx_block_time = None
 
             all_coinbase_inputs = True
             for vin_index in range(len(tx["vin"])):
@@ -849,7 +864,7 @@ class BlockWalker:
                     all_coinbase_inputs = False
                 entries = self.extract_sigs_from_input(tx, vin_index)
                 for e in entries:
-                    self.record_sig(tx["txid"], vin_index, e)
+                    self.record_sig(tx["txid"], vin_index, e, block_height=height, block_time=tx_block_time)
                     sig_count += 1
 
             if all_coinbase_inputs:
