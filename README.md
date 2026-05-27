@@ -108,6 +108,10 @@ python3 continuous_pipeline.py --start-height 1 --batch-size 100 --threads 8
 python3 continuous_pipeline.py --start-height 1 --batch-size 100 --threads 8 --stop-on-found
 ```
 
+```
+python3 continuous_pipeline.py --start-height 1 --batch-size 100 --threads 8 --python .venv/bin/python --random-k-budget 2048
+```
+
 ### 📁 Project Structure
 ```txt
 TX_test/

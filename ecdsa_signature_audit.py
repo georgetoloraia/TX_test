@@ -281,15 +281,24 @@ def audit_tiny_values(values: list[int], name: str) -> dict[str, Any]:
     return out
 
 
-def audit_bit_bias(values: list[int], name: str, warn_sigma: float = 4.0, fdr_alpha: float = 0.05) -> dict[str, Any]:
+def audit_bit_bias(
+    values: list[int],
+    name: str,
+    warn_sigma: float = 4.0,
+    fdr_alpha: float = 0.05,
+    ignore_bits: set[int] | None = None,
+) -> dict[str, Any]:
     total = len(values)
     counts = bit_frequency(values)
     expected = total / 2
     sigma = math.sqrt(total * 0.25)
+    ignore_bits = ignore_bits or set()
 
     rows = []
     pvals = []
     for bit, ones in enumerate(counts):
+        if bit in ignore_bits:
+            continue
         z = (ones - expected) / sigma if sigma else 0.0
         p = normal_two_sided_p_from_z(z)
         ratio = ones / total if total else 0.0
@@ -309,6 +318,7 @@ def audit_bit_bias(values: list[int], name: str, warn_sigma: float = 4.0, fdr_al
         "suspicious_bit_count": len(suspicious_sigma),
         "fdr_significant_bit_count": len(suspicious_fdr),
         "fdr_alpha": fdr_alpha,
+        "ignored_bits": sorted(list(ignore_bits)),
         "top_suspicious_bits": rows_sorted[:20],
     }
 
@@ -480,6 +490,39 @@ def audit_height_time_drift(sigs: list[dict[str, Any]], window_size: int = 500) 
     return {"enabled": True, "mode": mode, "windows": len(rs) // window_size, "drift_flags": len(flags), "top_flags": flags[:20]}
 
 
+def audit_signer_longitudinal_drift(sigs: list[dict[str, Any]], min_signer_size: int = 50, window_size: int = 50) -> dict[str, Any]:
+    by_signer: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in sigs:
+        pub = (row.get("pubkey_hex") or "").strip().lower()
+        if pub:
+            by_signer[pub].append(row)
+
+    flagged = []
+    analyzed = 0
+    for pub, rows in by_signer.items():
+        if len(rows) < min_signer_size:
+            continue
+        analyzed += 1
+        drift = audit_height_time_drift(rows, window_size=window_size)
+        if drift.get("drift_flags", 0) > 0:
+            flagged.append(
+                {
+                    "pubkey": pub,
+                    "count": len(rows),
+                    "mode": drift.get("mode"),
+                    "drift_flags": drift.get("drift_flags", 0),
+                    "top_flags": drift.get("top_flags", [])[:5],
+                }
+            )
+    flagged.sort(key=lambda x: (x["drift_flags"], x["count"]), reverse=True)
+    return {
+        "signer_count_total": len(by_signer),
+        "signer_count_analyzed": analyzed,
+        "signer_count_flagged": len(flagged),
+        "top_flagged_signers": flagged[:20],
+    }
+
+
 def risk_score(report: dict[str, Any]) -> dict[str, Any]:
     score = 0
     reasons = []
@@ -550,20 +593,25 @@ def build_core_report(sigs: list[dict[str, Any]]) -> dict[str, Any]:
     ss = [x["s"] for x in sigs]
     zs = [x["z"] for x in sigs]
     range_problems = audit_ranges(sigs)
+    low_high_s_rep = audit_low_high_s(ss)
+    # Low-S normalization pushes top bit of s to 0 by design; suppress bit255 false positives.
+    ignore_s_bits: set[int] = set()
+    if low_high_s_rep["low_s_ratio"] >= 0.98:
+        ignore_s_bits.add(255)
     report: dict[str, Any] = {
         "signature_count": len(sigs),
         "range_problems_count": len(range_problems),
         "range_problems_sample": range_problems[:10],
         "duplicates_r": audit_duplicates(rs, "r"),
         "duplicates_s": audit_duplicates(ss, "s"),
-        "low_high_s": audit_low_high_s(ss),
+        "low_high_s": low_high_s_rep,
         "leading_zero_r": audit_leading_zero(rs, "r"),
         "leading_zero_s": audit_leading_zero(ss, "s"),
         "leading_zero_z": audit_leading_zero(zs, "z"),
         "tiny_r": audit_tiny_values(rs, "r"),
         "tiny_s": audit_tiny_values(ss, "s"),
         "bit_bias_r": audit_bit_bias(rs, "r"),
-        "bit_bias_s": audit_bit_bias(ss, "s"),
+        "bit_bias_s": audit_bit_bias(ss, "s", ignore_bits=ignore_s_bits),
         "bit_bias_z": audit_bit_bias(zs, "z"),
         "byte_uniformity_r": audit_byte_uniformity(rs, "r"),
         "byte_uniformity_s": audit_byte_uniformity(ss, "s"),
@@ -578,9 +626,41 @@ def build_core_report(sigs: list[dict[str, Any]]) -> dict[str, Any]:
         "cross_pub_duplicate_r": audit_cross_pub_duplicate_r(sigs),
         "sighash_segments": audit_sighash_segments(sigs),
         "height_time_drift": audit_height_time_drift(sigs),
+        "signer_longitudinal_drift": audit_signer_longitudinal_drift(sigs),
     }
     report["risk"] = risk_score(report)
     return report
+
+
+def compare_with_baseline(current: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
+    def g(d: dict[str, Any], path: list[str], default: float = 0.0) -> float:
+        x: Any = d
+        for p in path:
+            if not isinstance(x, dict):
+                return default
+            x = x.get(p)
+        try:
+            return float(x)
+        except Exception:
+            return default
+
+    return {
+        "baseline_signature_count": int(g(baseline, ["signature_count"], 0)),
+        "current_signature_count": int(g(current, ["signature_count"], 0)),
+        "delta_signature_count": int(g(current, ["signature_count"], 0) - g(baseline, ["signature_count"], 0)),
+        "baseline_risk_score": int(g(baseline, ["risk", "score"], 0)),
+        "current_risk_score": int(g(current, ["risk", "score"], 0)),
+        "delta_risk_score": int(g(current, ["risk", "score"], 0) - g(baseline, ["risk", "score"], 0)),
+        "delta_duplicate_r": int(g(current, ["duplicates_r", "duplicate_count"], 0) - g(baseline, ["duplicates_r", "duplicate_count"], 0)),
+        "delta_cross_pub_duplicate_r": int(
+            g(current, ["cross_pub_duplicate_r", "collision_count"], 0) - g(baseline, ["cross_pub_duplicate_r", "collision_count"], 0)
+        ),
+        "delta_drift_flags": int(g(current, ["height_time_drift", "drift_flags"], 0) - g(baseline, ["height_time_drift", "drift_flags"], 0)),
+        "delta_signer_drift_flagged": int(
+            g(current, ["signer_longitudinal_drift", "signer_count_flagged"], 0)
+            - g(baseline, ["signer_longitudinal_drift", "signer_count_flagged"], 0)
+        ),
+    }
 
 
 def build_cluster_reports(sigs: list[dict[str, Any]], min_cluster_size: int) -> dict[str, Any]:
@@ -651,6 +731,7 @@ def main() -> None:
     ap.add_argument("--out", default="ecdsa_audit_report.json", help="Output report JSON path")
     ap.add_argument("--verify-signatures", action="store_true", help="Enable signature verification gate")
     ap.add_argument("--cluster-min-size", type=int, default=25, help="Minimum signatures per cluster for per-cluster report")
+    ap.add_argument("--baseline-report", default="", help="Optional previous audit report JSON for delta comparison")
     args = ap.parse_args()
 
     sigs_raw = load_signatures(args.input)
@@ -658,6 +739,13 @@ def main() -> None:
     report = build_core_report(sigs)
     report["verification_gate"] = gate_info
     report["clusters"] = build_cluster_reports(sigs, min_cluster_size=args.cluster_min_size)
+    if args.baseline_report:
+        try:
+            with open(args.baseline_report, "r", encoding="utf-8") as f:
+                baseline = json.load(f)
+            report["delta_vs_baseline"] = compare_with_baseline(report, baseline)
+        except Exception as e:
+            report["delta_vs_baseline"] = {"error": str(e)}
 
     print_report(report)
     with open(args.out, "w", encoding="utf-8") as f:

@@ -50,6 +50,46 @@ def run_recover_stage(
     return run_cmd(rec_cmd)
 
 
+def build_strong_signal_subset_from_cluster_report(
+    sig_path: Path,
+    cluster_report_path: Path,
+    out_path: Path,
+) -> int:
+    if not sig_path.exists() or not cluster_report_path.exists():
+        return 0
+    try:
+        crep = json.loads(cluster_report_path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    tops = crep.get("top_clusters", []) or []
+    strong_clusters = {
+        x.get("cluster")
+        for x in tops
+        if int(x.get("dup_r_values", 0)) > 0
+        or int(x.get("dup_r_events", 0)) > 0
+        or float(x.get("tiny_r_ratio", 0.0)) >= 0.01
+    }
+    if not strong_clusters:
+        return 0
+
+    selected = 0
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with sig_path.open("r", encoding="utf-8") as fin, out_path.open("w", encoding="utf-8") as fout:
+        for line in fin:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            key = cluster_key(obj)
+            if key in strong_clusters:
+                fout.write(raw + "\n")
+                selected += 1
+    return selected
+
+
 def parse_int(x: Any) -> int:
     if isinstance(x, int):
         return x
@@ -215,6 +255,8 @@ def main() -> None:
     ap.add_argument("--sigs", default="signatures.jsonl", help="Input signatures JSONL")
     ap.add_argument("--audit-report", default="ecdsa_audit_report.json", help="Audit report output")
     ap.add_argument("--decision-out", default="automate_decision.json", help="Automation decision summary JSON output")
+    ap.add_argument("--baseline-report", default="ecdsa_audit_report_prev.json",
+                    help="Previous audit report JSON path used for automatic delta comparison")
     ap.add_argument("--audit-verify-signatures", action="store_true", default=True,
                     help="Enable signature verification gate during audit (default: enabled)")
     ap.add_argument("--no-audit-verify-signatures", action="store_false", dest="audit_verify_signatures",
@@ -266,6 +308,8 @@ def main() -> None:
         args.audit_report,
         "--cluster-min-size",
         str(args.audit_cluster_min_size),
+        "--baseline-report",
+        args.baseline_report,
     ]
     if args.audit_verify_signatures:
         audit_cmd.append("--verify-signatures")
@@ -319,6 +363,10 @@ def main() -> None:
                 f,
                 indent=2,
             )
+        try:
+            Path(args.baseline_report).write_text(Path(args.audit_report).read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            pass
         return
 
     recover_input = str(sigs)
@@ -381,9 +429,18 @@ def main() -> None:
             raise RuntimeError(f"Recover stage2 failed with exit code {stage2_rc}")
 
         if args.random_k_budget > 0 and (cross_pub_dup_r > 0 or drift_flags > 0 or risk >= 120):
+            stage3_input = recover_input
+            strong_subset = Path("signatures.strong_signal.jsonl")
+            selected = build_strong_signal_subset_from_cluster_report(
+                sig_path=Path(recover_input),
+                cluster_report_path=Path(args.cluster_report),
+                out_path=strong_subset,
+            )
+            if selected > 0:
+                stage3_input = str(strong_subset)
             stage3_rc = run_recover_stage(
                 recover_bin=args.recover_bin,
-                recover_input=recover_input,
+                recover_input=stage3_input,
                 threads=args.threads,
                 max_iter=max(args.max_iter, 2),
                 stage_name="stage3-random-k",
@@ -412,6 +469,10 @@ def main() -> None:
             f,
             indent=2,
         )
+    try:
+        Path(args.baseline_report).write_text(Path(args.audit_report).read_text(encoding="utf-8"), encoding="utf-8")
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
