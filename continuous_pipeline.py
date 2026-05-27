@@ -208,6 +208,10 @@ def main() -> None:
                     help="Alert dedup/rate-limit state file")
     ap.add_argument("--alert-cooldown-minutes", type=int, default=180,
                     help="Rate-limit window for identical anomaly alerts")
+    ap.add_argument("--telegram-startup-test", action="store_true", default=True,
+                    help="Send startup test message to Telegram when pipeline starts (default: enabled)")
+    ap.add_argument("--no-telegram-startup-test", action="store_false", dest="telegram_startup_test",
+                    help="Disable startup test message")
     ap.add_argument("--stop-on-found", action="store_true",
                     help="Stop pipeline when new recovered key rows appear")
     ap.add_argument("--telegram-chat-id", default="7037604847",
@@ -226,6 +230,17 @@ def main() -> None:
     cycle = 0
     bot_token = args.telegram_bot_token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
     alert_state_path = Path(args.alert_state)
+
+    if args.telegram_startup_test and bot_token:
+        startup_msg = (
+            "Pipeline started.\n"
+            f"start_height={args.start_height}\n"
+            f"batch_size={args.batch_size}\n"
+            f"threads={args.threads}\n"
+            f"utc={now_utc_iso()}"
+        )
+        ok = send_telegram_message(bot_token, args.telegram_chat_id, startup_msg)
+        print(f"Telegram startup test sent={ok} chat_id={args.telegram_chat_id}")
 
     while True:
         cycle += 1
