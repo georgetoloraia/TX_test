@@ -106,6 +106,9 @@ python3 continuous_pipeline.py --start-height 1 --batch-size 100 --threads 8
 
 # Stop automatically when new recovered rows appear
 python3 continuous_pipeline.py --start-height 1 --batch-size 100 --threads 8 --stop-on-found
+
+# Recommended: force known-good venv interpreter for verification diagnostics
+venv/bin/python continuous_pipeline.py --start-height 1 --batch-size 100 --threads 8 --python venv/bin/python
 ```
 
 ```

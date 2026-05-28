@@ -24,9 +24,46 @@ import urllib.request
 from pathlib import Path
 
 
+def resolve_python_explicit_or_default(python_arg: str) -> str:
+    """Pick a deterministic interpreter for the pipeline.
+
+    Priority:
+    1) user-provided --python
+    2) local ./venv/bin/python
+    3) local ./.venv/bin/python
+    4) current interpreter
+    """
+    if python_arg and python_arg != sys.executable:
+        return python_arg
+    for candidate in ("venv/bin/python", ".venv/bin/python"):
+        p = Path(candidate)
+        if p.exists() and os.access(p, os.X_OK):
+            return str(p)
+    return sys.executable
+
+
 def run_cmd(cmd: list[str]) -> int:
     print("$", " ".join(shlex.quote(x) for x in cmd), flush=True)
     return subprocess.run(cmd).returncode
+
+
+def check_python_env(python_bin: str) -> tuple[bool, str]:
+    probe = [
+        python_bin,
+        "-c",
+        "import sys; "
+        "print(sys.version.split()[0]); "
+        "import coincurve; "
+        "print('coincurve=' + getattr(coincurve, '__version__', 'unknown'))",
+    ]
+    try:
+        p = subprocess.run(probe, capture_output=True, text=True)
+        if p.returncode == 0:
+            return True, p.stdout.strip()
+        msg = (p.stderr or p.stdout or "unknown error").strip()
+        return False, msg
+    except Exception as e:
+        return False, str(e)
 
 
 def send_telegram_message(bot_token: str, chat_id: str, text: str) -> bool:
@@ -221,10 +258,21 @@ def main() -> None:
     ap.add_argument("--python", default=sys.executable, help="Python executable")
     args = ap.parse_args()
 
+    args.python = resolve_python_explicit_or_default(args.python)
+
     if args.start_height < 1:
         raise ValueError("--start-height must be >= 1")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be > 0")
+
+    ok_env, env_msg = check_python_env(args.python)
+    if ok_env:
+        print(f"Python environment OK: {args.python} ({env_msg})")
+    else:
+        print(
+            f"[warn] Python environment check failed for {args.python}: {env_msg}\n"
+            "[warn] Verification gate may be skipped if coincurve is unavailable."
+        )
 
     current_start = args.start_height
     cycle = 0

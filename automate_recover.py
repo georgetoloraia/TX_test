@@ -185,6 +185,25 @@ def compute_cluster_stats(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def verification_quality(report: dict[str, Any]) -> dict[str, Any]:
+    vg = report.get("verification_gate", {}) or {}
+    enabled = bool(vg.get("enabled", False))
+    coincurve_available = bool(vg.get("coincurve_available", False))
+    verifiable = int(vg.get("verifiable", 0) or 0)
+    invalid = int(vg.get("invalid", 0) or 0)
+    valid = int(vg.get("valid", 0) or 0)
+    invalid_ratio = (invalid / verifiable) if verifiable > 0 else 0.0
+    return {
+        "enabled": enabled,
+        "coincurve_available": coincurve_available,
+        "verifiable": verifiable,
+        "valid": valid,
+        "invalid": invalid,
+        "invalid_ratio": invalid_ratio,
+        "reason_counts": vg.get("reason_counts", {}) or {},
+    }
+
+
 def build_cluster_subset(
     sig_path: Path,
     min_sigs: int,
@@ -192,6 +211,7 @@ def build_cluster_subset(
     max_clusters: int,
     out_path: Path,
     report_path: Path,
+    audit_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     grouped: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
 
@@ -208,16 +228,42 @@ def build_cluster_subset(
                 continue
             grouped[cluster_key(obj)].append((raw, obj))
 
+    cluster_fdr_map: dict[str, int] = {}
+    if audit_report:
+        for c in ((audit_report.get("clusters", {}) or {}).get("top_clusters", []) or []):
+            key = c.get("cluster")
+            if isinstance(key, str):
+                cluster_fdr_map[key] = int(c.get("fdr_bits_r", 0) or 0)
+    global_drift_flags = int(((audit_report or {}).get("height_time_drift", {}) or {}).get("drift_flags", 0) or 0)
+    signer_drift_flagged = int(
+        ((audit_report or {}).get("signer_longitudinal_drift", {}) or {}).get("signer_count_flagged", 0) or 0
+    )
+
     cluster_rows = []
     for key, rows in grouped.items():
         if len(rows) < min_sigs:
             continue
         stats = compute_cluster_stats([obj for _, obj in rows])
+        # Cluster scoring v2: combine local signal with audit context (FDR/drift).
+        fdr_bits = int(cluster_fdr_map.get(key, 0))
+        drift_weight = 0
+        if global_drift_flags > 0:
+            drift_weight += 8
+        if signer_drift_flagged > 0:
+            drift_weight += 6
+        context_score = min(40, fdr_bits * 6) + drift_weight
+        stats["fdr_bits_r"] = fdr_bits
+        stats["context_drift_weight"] = drift_weight
+        stats["cluster_risk_score_v2"] = int(stats["cluster_risk_score"]) + context_score
         cluster_rows.append({"cluster": key, **stats})
 
-    cluster_rows.sort(key=lambda x: (x["cluster_risk_score"], x["dup_r_events"], x["count"]), reverse=True)
+    cluster_rows.sort(key=lambda x: (x["cluster_risk_score_v2"], x["dup_r_events"], x["count"]), reverse=True)
 
-    flagged = [r for r in cluster_rows if r["cluster_risk_score"] >= cluster_risk_threshold or r["dup_r_values"] > 0]
+    flagged = [
+        r
+        for r in cluster_rows
+        if r["cluster_risk_score_v2"] >= cluster_risk_threshold or r["dup_r_values"] > 0
+    ]
     flagged = flagged[:max_clusters]
     flagged_keys = {r["cluster"] for r in flagged}
 
@@ -240,6 +286,7 @@ def build_cluster_subset(
             "min_sigs": min_sigs,
             "cluster_risk_threshold": cluster_risk_threshold,
             "max_clusters": max_clusters,
+            "scoring": "v2(base+fdr+drift)",
         },
         "top_clusters": flagged,
     }
@@ -289,6 +336,12 @@ def main() -> None:
                     help="Disable advanced recovery escalation")
     ap.add_argument("--random-k-budget", type=int, default=0,
                     help="Random-k tries per bucket for final escalation stage (0 disables random-k stage)")
+    ap.add_argument("--max-invalid-ratio", type=float, default=0.35,
+                    help="If verification invalid_ratio exceeds this (and enough verifiable rows), treat dataset as low-quality")
+    ap.add_argument("--min-verifiable-for-gate", type=int, default=200,
+                    help="Minimum verifiable signatures before invalid-ratio quality gate is enforced")
+    ap.add_argument("--fusion-min-confidence", type=float, default=0.45,
+                    help="Minimum signal_fusion confidence to allow recovery without hard signal")
 
     args = ap.parse_args()
 
@@ -328,22 +381,52 @@ def main() -> None:
     dup_r = int(report.get("duplicates_r", {}).get("duplicate_count", 0))
     cross_pub_dup_r = int(report.get("cross_pub_duplicate_r", {}).get("collision_count", 0))
     drift_flags = int(report.get("height_time_drift", {}).get("drift_flags", 0))
+    signer_drift_flagged = int(report.get("signer_longitudinal_drift", {}).get("signer_count_flagged", 0))
     sighash_segments = report.get("sighash_segments", {}).get("segments", [])
     sighash_anomaly = any((int(s.get("duplicate_r", 0)) > 0 or int(s.get("fdr_bits_r", 0)) > 0) for s in sighash_segments)
+    fusion = report.get("signal_fusion", {}) or {}
+    fusion_conf = float(fusion.get("confidence", 0.0) or 0.0)
+    fusion_tier = str(fusion.get("tier", "low") or "low")
+    fusion_reco = str(fusion.get("recommendation", "monitor_only") or "monitor_only")
+    vq = verification_quality(report)
+    low_quality_data = (
+        vq["enabled"]
+        and vq["coincurve_available"]
+        and vq["verifiable"] >= args.min_verifiable_for_gate
+        and vq["invalid_ratio"] > args.max_invalid_ratio
+    )
 
     print(f"Audit risk score: {risk} ({verdict})")
     print(f"Duplicate-r groups: {dup_r}")
     print(f"Cross-pub duplicate-r groups: {cross_pub_dup_r}")
     print(f"Height/time drift flags: {drift_flags}")
+    print(f"Signal fusion: tier={fusion_tier} conf={fusion_conf:.3f} recommendation={fusion_reco}")
+    print(
+        "Verification quality:",
+        f"verifiable={vq['verifiable']}",
+        f"invalid={vq['invalid']}",
+        f"invalid_ratio={vq['invalid_ratio']:.4f}",
+    )
 
     should_recover = (
         args.force_recover
         or risk >= args.risk_threshold
+        or fusion_conf >= args.fusion_min_confidence
         or dup_r > 0
         or cross_pub_dup_r > 0
         or drift_flags > 0
         or sighash_anomaly
     )
+    hard_signal = (
+        dup_r > 0
+        or cross_pub_dup_r > 0
+        or drift_flags > 0
+        or signer_drift_flagged > 0
+        or sighash_anomaly
+    )
+    if low_quality_data and not (hard_signal or args.force_recover):
+        should_recover = False
+
     if not should_recover:
         print("Recovery skipped by policy (low anomaly signal).")
         with open(args.decision_out, "w", encoding="utf-8") as f:
@@ -357,6 +440,11 @@ def main() -> None:
                     "cross_pub_duplicate_r": cross_pub_dup_r,
                     "drift_flags": drift_flags,
                     "sighash_anomaly": sighash_anomaly,
+                    "signal_fusion_tier": fusion_tier,
+                    "signal_fusion_confidence": fusion_conf,
+                    "signal_fusion_recommendation": fusion_reco,
+                    "verification_quality": vq,
+                    "low_quality_data": low_quality_data,
                     "recover_input": None,
                     "cluster_gating_used": not args.disable_cluster_gating,
                 },
@@ -370,14 +458,52 @@ def main() -> None:
         return
 
     recover_input = str(sigs)
+    allow_advanced = args.enable_advanced_recover
+    if fusion_reco == "monitor_only" and not (hard_signal or args.force_recover):
+        print("Fusion recommendation is monitor_only; recovery skipped.")
+        with open(args.decision_out, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "should_recover": False,
+                    "recover_executed": False,
+                    "risk_score": risk,
+                    "risk_verdict": verdict,
+                    "duplicate_r": dup_r,
+                    "cross_pub_duplicate_r": cross_pub_dup_r,
+                    "drift_flags": drift_flags,
+                    "sighash_anomaly": sighash_anomaly,
+                    "signal_fusion_tier": fusion_tier,
+                    "signal_fusion_confidence": fusion_conf,
+                    "signal_fusion_recommendation": fusion_reco,
+                    "verification_quality": vq,
+                    "low_quality_data": low_quality_data,
+                    "recover_input": None,
+                    "cluster_gating_used": not args.disable_cluster_gating,
+                },
+                f,
+                indent=2,
+            )
+        return
+    if fusion_reco == "run_clustered_recovery":
+        allow_advanced = False
+
+    effective_cluster_threshold = args.cluster_risk_threshold
+    if low_quality_data:
+        # Defensive: require stronger per-cluster signal when verification quality is poor.
+        effective_cluster_threshold += 15
+    if fusion_tier == "high":
+        effective_cluster_threshold = max(5, effective_cluster_threshold - 5)
+    elif fusion_tier == "critical":
+        effective_cluster_threshold = max(0, effective_cluster_threshold - 10)
     if not args.disable_cluster_gating:
         cluster_report = build_cluster_subset(
             sig_path=sigs,
             min_sigs=args.cluster_min_sigs,
-            cluster_risk_threshold=args.cluster_risk_threshold,
+            cluster_risk_threshold=effective_cluster_threshold,
             max_clusters=args.max_clusters,
             out_path=Path(args.clustered_sigs_out),
             report_path=Path(args.cluster_report),
+            audit_report=report,
         )
         print(
             "Cluster gating:",
@@ -396,11 +522,16 @@ def main() -> None:
     # stage2: enable LCG/delta if anomaly signal is strong
     # stage3: optional random-k budget, only on strongest signals
     stage_runs = []
+    stage1_threads = args.threads
+    stage1_iter = max(1, args.max_iter)
+    if low_quality_data:
+        stage1_threads = max(1, min(args.threads, 4))
+        stage1_iter = 1
     stage1_rc = run_recover_stage(
         recover_bin=args.recover_bin,
         recover_input=recover_input,
-        threads=args.threads,
-        max_iter=max(1, args.max_iter),
+        threads=stage1_threads,
+        max_iter=stage1_iter,
         stage_name="stage1-primary",
         extra_args=["--no-lcg", "--scan-random-k", "0"],
     )
@@ -414,13 +545,18 @@ def main() -> None:
         or dup_r > 0
         or drift_flags > 0
         or sighash_anomaly
+        or signer_drift_flagged > 0
     )
-    if args.enable_advanced_recover and strong_signal:
+    if allow_advanced and strong_signal and not low_quality_data:
+        stage2_threads = min(max(2, args.threads), 16)
+        stage2_iter = max(args.max_iter, 2)
+        if fusion_tier == "critical":
+            stage2_iter = max(stage2_iter, 3)
         stage2_rc = run_recover_stage(
             recover_bin=args.recover_bin,
             recover_input=recover_input,
-            threads=args.threads,
-            max_iter=max(args.max_iter, 2),
+            threads=stage2_threads,
+            max_iter=stage2_iter,
             stage_name="stage2-lcg-delta",
             extra_args=["--scan-random-k", "0"],
         )
@@ -441,8 +577,8 @@ def main() -> None:
             stage3_rc = run_recover_stage(
                 recover_bin=args.recover_bin,
                 recover_input=stage3_input,
-                threads=args.threads,
-                max_iter=max(args.max_iter, 2),
+                threads=min(max(2, args.threads), 16),
+                max_iter=max(args.max_iter, 3 if fusion_tier == "critical" else 2),
                 stage_name="stage3-random-k",
                 extra_args=["--scan-random-k", str(args.random_k_budget)],
             )
@@ -462,6 +598,12 @@ def main() -> None:
                 "cross_pub_duplicate_r": cross_pub_dup_r,
                 "drift_flags": drift_flags,
                 "sighash_anomaly": sighash_anomaly,
+                "signal_fusion_tier": fusion_tier,
+                "signal_fusion_confidence": fusion_conf,
+                "signal_fusion_recommendation": fusion_reco,
+                "verification_quality": vq,
+                "low_quality_data": low_quality_data,
+                "effective_cluster_risk_threshold": effective_cluster_threshold,
                 "recover_input": recover_input,
                 "cluster_gating_used": not args.disable_cluster_gating,
                 "recover_stages": stage_runs,

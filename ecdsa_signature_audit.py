@@ -203,20 +203,40 @@ def verification_gate(sigs: list[dict[str, Any]], enabled: bool) -> tuple[list[d
 
     kept: list[dict[str, Any]] = []
     verifiable = valid = invalid = 0
-    for row in sigs:
+    reason_counts: dict[str, int] = defaultdict(int)
+    reason_samples: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    max_samples_per_reason = 5
+
+    for i, row in enumerate(sigs):
         pub = row.get("pubkey_hex", "")
         sig_hex = row.get("signature_hex", "")
         der = extract_der_signature(sig_hex)
-        if not pub or der is None:
+        if not pub:
+            reason_counts["missing_pubkey"] += 1
+            if len(reason_samples["missing_pubkey"]) < max_samples_per_reason:
+                reason_samples["missing_pubkey"].append({"index": i, "r": f"{row['r']:064x}"})
+            kept.append(row)
+            continue
+        if der is None:
+            reason_counts["bad_der_or_missing_signature_hex"] += 1
+            if len(reason_samples["bad_der_or_missing_signature_hex"]) < max_samples_per_reason:
+                reason_samples["bad_der_or_missing_signature_hex"].append({"index": i, "pubkey_hex_prefix": pub[:20]})
             kept.append(row)
             continue
         verifiable += 1
         ok = False
+        fail_reason = "verify_false"
         try:
             pk = PublicKey(bytes.fromhex(pub))
             msg32 = int(row["z"]).to_bytes(32, "big", signed=False)
             ok = bool(pk.verify(der, msg32, hasher=None))
+            if not ok:
+                fail_reason = "verify_false"
+        except ValueError:
+            fail_reason = "pubkey_parse_error"
+            ok = False
         except Exception:
+            fail_reason = "verify_exception"
             ok = False
 
         if ok:
@@ -224,6 +244,11 @@ def verification_gate(sigs: list[dict[str, Any]], enabled: bool) -> tuple[list[d
             kept.append(row)
         else:
             invalid += 1
+            reason_counts[fail_reason] += 1
+            if len(reason_samples[fail_reason]) < max_samples_per_reason:
+                reason_samples[fail_reason].append(
+                    {"index": i, "pubkey_hex_prefix": pub[:20], "r": f"{row['r']:064x}"}
+                )
 
     return kept, {
         "enabled": True,
@@ -232,6 +257,8 @@ def verification_gate(sigs: list[dict[str, Any]], enabled: bool) -> tuple[list[d
         "valid": valid,
         "invalid": invalid,
         "dropped": invalid,
+        "reason_counts": dict(reason_counts),
+        "reason_samples": dict(reason_samples),
     }
 
 
@@ -523,6 +550,670 @@ def audit_signer_longitudinal_drift(sigs: list[dict[str, Any]], min_signer_size:
     }
 
 
+def cusum_change_points(series: list[float], k: float = 0.5, h: float = 8.0) -> list[int]:
+    """Two-sided CUSUM over z-scored series; returns change-point indices."""
+    n = len(series)
+    if n < 10:
+        return []
+    mu = mean(series)
+    sigma = pstdev(series)
+    if sigma == 0:
+        return []
+
+    gp = 0.0
+    gn = 0.0
+    points = []
+    for i, x in enumerate(series):
+        z = (x - mu) / sigma
+        gp = max(0.0, gp + z - k)
+        gn = min(0.0, gn + z + k)
+        if gp > h or gn < -h:
+            points.append(i)
+            gp = 0.0
+            gn = 0.0
+    return points
+
+
+def audit_signer_change_points(
+    sigs: list[dict[str, Any]],
+    min_signer_size: int = 80,
+    window_size: int = 40,
+) -> dict[str, Any]:
+    """Per-signer CUSUM change-point detection on rolling nonce proxies."""
+    by_signer: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in sigs:
+        pub = (row.get("pubkey_hex") or "").strip().lower()
+        if pub:
+            by_signer[pub].append(row)
+
+    flagged = []
+    analyzed = 0
+
+    for pub, rows in by_signer.items():
+        if len(rows) < min_signer_size:
+            continue
+        analyzed += 1
+
+        rs = []
+        for r in rows:
+            try:
+                rs.append(int(r["r"]))
+            except Exception:
+                pass
+        if len(rs) < min_signer_size:
+            continue
+
+        hw_series = [hamming_weight(x) for x in rs]
+        lsb8_series = [x & 0xFF for x in rs]
+
+        hw_roll = rolling_feature(hw_series, window_size, lambda w: mean(w))
+        lsb_roll = rolling_feature(lsb8_series, window_size, lambda w: mean(w))
+        if len(hw_roll) < 10 or len(lsb_roll) < 10:
+            continue
+
+        hw_cp = cusum_change_points(hw_roll, k=0.5, h=8.0)
+        lsb_cp = cusum_change_points(lsb_roll, k=0.5, h=8.0)
+        cp_total = len(hw_cp) + len(lsb_cp)
+        if cp_total > 0:
+            flagged.append(
+                {
+                    "pubkey": pub,
+                    "count": len(rs),
+                    "window_size": window_size,
+                    "change_points_total": cp_total,
+                    "change_points_hamming": hw_cp[:10],
+                    "change_points_lsb8_mean": lsb_cp[:10],
+                }
+            )
+
+    flagged.sort(key=lambda x: (x["change_points_total"], x["count"]), reverse=True)
+    return {
+        "signer_count_total": len(by_signer),
+        "signer_count_analyzed": analyzed,
+        "signer_count_flagged": len(flagged),
+        "top_flagged_signers": flagged[:20],
+    }
+
+
+def kmeans_1d_two_clusters(values: list[float], max_iter: int = 30) -> tuple[list[int], tuple[float, float]]:
+    """Simple deterministic 1D k-means with k=2."""
+    if len(values) < 2:
+        return [0] * len(values), (0.0, 0.0)
+    c1 = min(values)
+    c2 = max(values)
+    if c1 == c2:
+        return [0] * len(values), (c1, c2)
+
+    labels = [0] * len(values)
+    for _ in range(max_iter):
+        changed = False
+        for i, x in enumerate(values):
+            d1 = abs(x - c1)
+            d2 = abs(x - c2)
+            new_l = 0 if d1 <= d2 else 1
+            if new_l != labels[i]:
+                labels[i] = new_l
+                changed = True
+        g1 = [x for x, l in zip(values, labels) if l == 0]
+        g2 = [x for x, l in zip(values, labels) if l == 1]
+        if not g1 or not g2:
+            break
+        nc1 = mean(g1)
+        nc2 = mean(g2)
+        if abs(nc1 - c1) < 1e-9 and abs(nc2 - c2) < 1e-9 and not changed:
+            break
+        c1, c2 = nc1, nc2
+    return labels, (c1, c2)
+
+
+def bimodality_score(values: list[float]) -> dict[str, Any]:
+    """Quantify two-mode separation against within-cluster spread."""
+    n = len(values)
+    if n < 30:
+        return {"ok": False, "reason": "too_few_points"}
+    labels, (c1, c2) = kmeans_1d_two_clusters(values)
+    g1 = [x for x, l in zip(values, labels) if l == 0]
+    g2 = [x for x, l in zip(values, labels) if l == 1]
+    if len(g1) < 10 or len(g2) < 10:
+        return {"ok": False, "reason": "tiny_cluster"}
+    s1 = pstdev(g1)
+    s2 = pstdev(g2)
+    pooled = max(1e-9, (s1 + s2) / 2.0)
+    sep = abs(c1 - c2) / pooled
+    balance = min(len(g1), len(g2)) / max(len(g1), len(g2))
+    return {
+        "ok": True,
+        "cluster_sizes": [len(g1), len(g2)],
+        "centers": [c1, c2],
+        "pooled_std": pooled,
+        "separation_sigma": sep,
+        "balance_ratio": balance,
+    }
+
+
+def audit_signer_mixture_modes(sigs: list[dict[str, Any]], min_signer_size: int = 100) -> dict[str, Any]:
+    """Detect multi-regime signer behavior via simple mixture scoring."""
+    by_signer: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in sigs:
+        pub = (row.get("pubkey_hex") or "").strip().lower()
+        if pub:
+            by_signer[pub].append(row)
+
+    analyzed = 0
+    flagged = []
+    for pub, rows in by_signer.items():
+        if len(rows) < min_signer_size:
+            continue
+        analyzed += 1
+        rvals = []
+        for r in rows:
+            try:
+                rvals.append(int(r["r"]))
+            except Exception:
+                pass
+        if len(rvals) < min_signer_size:
+            continue
+
+        hw = [float(hamming_weight(x)) for x in rvals]
+        lsb8 = [float(x & 0xFF) for x in rvals]
+        msb8 = [float((x >> 248) & 0xFF) for x in rvals]
+
+        hw_b = bimodality_score(hw)
+        lsb_b = bimodality_score(lsb8)
+        msb_b = bimodality_score(msb8)
+        scores = []
+        for rep in (hw_b, lsb_b, msb_b):
+            if rep.get("ok"):
+                scores.append(float(rep.get("separation_sigma", 0.0)) * float(rep.get("balance_ratio", 0.0)))
+        mode_score = max(scores) if scores else 0.0
+
+        # conservative threshold: separation with cluster balance
+        if mode_score >= 2.5:
+            flagged.append(
+                {
+                    "pubkey": pub,
+                    "count": len(rvals),
+                    "mixture_mode_score": mode_score,
+                    "hamming": hw_b,
+                    "lsb8": lsb_b,
+                    "msb8": msb_b,
+                }
+            )
+
+    flagged.sort(key=lambda x: (x["mixture_mode_score"], x["count"]), reverse=True)
+    return {
+        "signer_count_total": len(by_signer),
+        "signer_count_analyzed": analyzed,
+        "signer_count_flagged": len(flagged),
+        "top_flagged_signers": flagged[:20],
+    }
+
+
+def fit_lcg_mod_2k(seq: list[int], kbits: int) -> dict[str, Any]:
+    """Fit x_{i+1} = a*x_i + c (mod 2^k) by brute over first transitions.
+
+    Defensive/narrow fitting used for anomaly scoring only.
+    """
+    if len(seq) < 4:
+        return {"ok": False, "reason": "too_short"}
+    mod = 1 << kbits
+    xs = [x % mod for x in seq]
+    x0, x1, x2 = xs[0], xs[1], xs[2]
+    denom = (x1 - x0) % mod
+    inv = inv_mod(denom, mod)
+    if inv is None:
+        return {"ok": False, "reason": "non_invertible_seed"}
+    a = ((x2 - x1) % mod) * inv % mod
+    c = (x1 - a * x0) % mod
+
+    ok_edges = 0
+    total_edges = max(0, len(xs) - 1)
+    for i in range(total_edges):
+        pred = (a * xs[i] + c) % mod
+        if pred == xs[i + 1]:
+            ok_edges += 1
+    fit_ratio = (ok_edges / total_edges) if total_edges else 0.0
+    return {
+        "ok": True,
+        "kbits": kbits,
+        "modulus": mod,
+        "a": a,
+        "c": c,
+        "edge_fit_ratio": fit_ratio,
+        "edges_total": total_edges,
+        "edges_fit": ok_edges,
+    }
+
+
+def fit_counter_model(seq: list[int], mod: int) -> dict[str, Any]:
+    if len(seq) < 3:
+        return {"ok": False, "reason": "too_short"}
+    xs = [x % mod for x in seq]
+    deltas = [((xs[i + 1] - xs[i]) % mod) for i in range(len(xs) - 1)]
+    if not deltas:
+        return {"ok": False, "reason": "no_deltas"}
+    cnt = Counter(deltas)
+    top_delta, top_count = cnt.most_common(1)[0]
+    ratio = top_count / len(deltas)
+    return {
+        "ok": True,
+        "modulus": mod,
+        "dominant_delta": top_delta,
+        "delta_fit_ratio": ratio,
+        "edges_total": len(deltas),
+        "edges_fit": top_count,
+    }
+
+
+def audit_constraint_model_fits(sigs: list[dict[str, Any]], min_signer_size: int = 120) -> dict[str, Any]:
+    """Constraint-based heuristic fitting for weak nonce generator families.
+
+    Models:
+    - LCG on low bits of r (mod 2^16, 2^24)
+    - Counter-like constant-step model on low bits
+    """
+    by_signer: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in sigs:
+        pub = (row.get("pubkey_hex") or "").strip().lower()
+        if pub:
+            by_signer[pub].append(row)
+
+    analyzed = 0
+    flagged = []
+    for pub, rows in by_signer.items():
+        if len(rows) < min_signer_size:
+            continue
+        analyzed += 1
+        rvals = []
+        for r in rows:
+            try:
+                rvals.append(int(r["r"]))
+            except Exception:
+                pass
+        if len(rvals) < min_signer_size:
+            continue
+
+        lsb16 = [x & 0xFFFF for x in rvals]
+        lsb24 = [x & 0xFFFFFF for x in rvals]
+
+        lcg16 = fit_lcg_mod_2k(lsb16, 16)
+        lcg24 = fit_lcg_mod_2k(lsb24, 24)
+        ctr16 = fit_counter_model(lsb16, 1 << 16)
+        ctr24 = fit_counter_model(lsb24, 1 << 24)
+
+        fit_scores = []
+        for rep in (lcg16, lcg24):
+            if rep.get("ok"):
+                fit_scores.append(float(rep.get("edge_fit_ratio", 0.0)))
+        for rep in (ctr16, ctr24):
+            if rep.get("ok"):
+                fit_scores.append(float(rep.get("delta_fit_ratio", 0.0)))
+        best_fit = max(fit_scores) if fit_scores else 0.0
+
+        # conservative trigger to reduce false positives on random data
+        if best_fit >= 0.55:
+            flagged.append(
+                {
+                    "pubkey": pub,
+                    "count": len(rvals),
+                    "best_fit_ratio": best_fit,
+                    "lcg16": lcg16,
+                    "lcg24": lcg24,
+                    "counter16": ctr16,
+                    "counter24": ctr24,
+                }
+            )
+
+    flagged.sort(key=lambda x: (x["best_fit_ratio"], x["count"]), reverse=True)
+    return {
+        "signer_count_total": len(by_signer),
+        "signer_count_analyzed": analyzed,
+        "signer_count_flagged": len(flagged),
+        "top_flagged_signers": flagged[:20],
+    }
+
+
+def inv_mod(x: int, m: int) -> int | None:
+    x %= m
+    if x == 0:
+        return None
+    try:
+        return pow(x, -1, m)
+    except ValueError:
+        return None
+
+
+def audit_algebraic_reuse_candidates(sigs: list[dict[str, Any]], max_groups: int = 50) -> dict[str, Any]:
+    """Algebraic nonce-reuse diagnostics on duplicate-r groups.
+
+    For pairs with same r and different s:
+      k = (z1-z2)/(s1-s2) mod n
+      d = (s1*k-z1)/r mod n
+    This does not leak/print private keys; it only counts consistent candidates.
+    """
+    by_r: dict[int, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    for i, row in enumerate(sigs):
+        by_r[row.get("r", 0)].append((i, row))
+
+    dup_groups = [(r, rows) for r, rows in by_r.items() if len(rows) > 1]
+    dup_groups.sort(key=lambda x: len(x[1]), reverse=True)
+    dup_groups = dup_groups[:max_groups]
+
+    total_pairs = 0
+    solvable_pairs = 0
+    consistent_pairs = 0
+    inconsistent_pairs = 0
+    group_summaries = []
+
+    for r, rows in dup_groups:
+        r_inv = inv_mod(r, SECP256K1_N)
+        if r_inv is None:
+            continue
+        local_total = 0
+        local_solvable = 0
+        local_consistent = 0
+        local_inconsistent = 0
+        d_counts: Counter[int] = Counter()
+        k_counts: Counter[int] = Counter()
+
+        for a in range(len(rows)):
+            i1, x1 = rows[a]
+            s1 = int(x1.get("s", 0))
+            z1 = int(x1.get("z", 0))
+            for b in range(a + 1, len(rows)):
+                i2, x2 = rows[b]
+                s2 = int(x2.get("s", 0))
+                z2 = int(x2.get("z", 0))
+                local_total += 1
+                denom = (s1 - s2) % SECP256K1_N
+                denom_inv = inv_mod(denom, SECP256K1_N)
+                if denom_inv is None:
+                    continue
+                local_solvable += 1
+                k = ((z1 - z2) % SECP256K1_N) * denom_inv % SECP256K1_N
+                d = (((s1 * k - z1) % SECP256K1_N) * r_inv) % SECP256K1_N
+                lhs1 = (s1 * k - z1) % SECP256K1_N
+                lhs2 = (s2 * k - z2) % SECP256K1_N
+                rhs = (r * d) % SECP256K1_N
+                if lhs1 == rhs and lhs2 == rhs:
+                    local_consistent += 1
+                    d_counts[d] += 1
+                    k_counts[k] += 1
+                else:
+                    local_inconsistent += 1
+
+        total_pairs += local_total
+        solvable_pairs += local_solvable
+        consistent_pairs += local_consistent
+        inconsistent_pairs += local_inconsistent
+
+        if local_total > 0:
+            dominant_d = d_counts.most_common(1)[0][1] if d_counts else 0
+            dominant_k = k_counts.most_common(1)[0][1] if k_counts else 0
+            group_summaries.append(
+                {
+                    "r": hex(r),
+                    "group_size": len(rows),
+                    "pairs_total": local_total,
+                    "pairs_solvable": local_solvable,
+                    "pairs_consistent": local_consistent,
+                    "pairs_inconsistent": local_inconsistent,
+                    "dominant_d_pair_support": dominant_d,
+                    "dominant_k_pair_support": dominant_k,
+                }
+            )
+
+    group_summaries.sort(
+        key=lambda x: (x["pairs_consistent"], x["dominant_d_pair_support"], x["group_size"]),
+        reverse=True,
+    )
+    strong_groups = [
+        g for g in group_summaries
+        if g["pairs_consistent"] > 0 and g["dominant_d_pair_support"] > 0
+    ]
+
+    return {
+        "duplicate_r_groups_checked": len(dup_groups),
+        "pairs_total": total_pairs,
+        "pairs_solvable": solvable_pairs,
+        "pairs_consistent": consistent_pairs,
+        "pairs_inconsistent": inconsistent_pairs,
+        "strong_group_count": len(strong_groups),
+        "top_strong_groups": strong_groups[:20],
+    }
+
+
+def audit_hnp_lattice_readiness(report: dict[str, Any]) -> dict[str, Any]:
+    """Defensive HNP/lattice feasibility estimator (no key recovery execution)."""
+    n = int(report.get("signature_count", 0) or 0)
+    if n <= 0:
+        return {"enabled": True, "status": "insufficient-data", "hypotheses": []}
+
+    dup_r = int(report.get("duplicates_r", {}).get("duplicate_count", 0) or 0)
+    cross_dup = int(report.get("cross_pub_duplicate_r", {}).get("collision_count", 0) or 0)
+    tiny_r_240 = int(report.get("tiny_r", {}).get("count_lt_2^240", 0) or 0)
+    tiny_r_224 = int(report.get("tiny_r", {}).get("count_lt_2^224", 0) or 0)
+    bit_fdr_r = int(report.get("bit_bias_r", {}).get("fdr_significant_bit_count", 0) or 0)
+    psb = report.get("prefix_suffix_bias_r", {}) or {}
+    psb_susp = int(psb.get("suspicious_test_count", 0) or 0)
+    drift_flags = int(report.get("height_time_drift", {}).get("drift_flags", 0) or 0)
+    signer_drift = int(report.get("signer_longitudinal_drift", {}).get("signer_count_flagged", 0) or 0)
+
+    # Very rough practical sample targets for leakage hypotheses.
+    # Used only for triage/prioritization in audits.
+    targets = {
+        "known_low_4_bits": 4000,
+        "known_low_8_bits": 1000,
+        "known_low_12_bits": 300,
+        "known_low_16_bits": 120,
+        "small_nonce_lt_2^240": 300,
+        "small_nonce_lt_2^224": 120,
+    }
+    observed = {
+        "known_low_4_bits": min(n, bit_fdr_r * 200 + psb_susp * 60),
+        "known_low_8_bits": min(n, bit_fdr_r * 120 + psb_susp * 45),
+        "known_low_12_bits": min(n, bit_fdr_r * 70 + psb_susp * 30),
+        "known_low_16_bits": min(n, bit_fdr_r * 40 + psb_susp * 20),
+        "small_nonce_lt_2^240": tiny_r_240,
+        "small_nonce_lt_2^224": tiny_r_224,
+    }
+
+    hypotheses = []
+    for name, target in targets.items():
+        got = int(observed.get(name, 0))
+        ratio = got / target if target > 0 else 0.0
+        if ratio >= 1.0:
+            grade = "ready"
+        elif ratio >= 0.4:
+            grade = "watch"
+        else:
+            grade = "not_ready"
+        hypotheses.append(
+            {
+                "hypothesis": name,
+                "observed_support": got,
+                "target_support": target,
+                "readiness_ratio": ratio,
+                "grade": grade,
+            }
+        )
+
+    hypotheses.sort(key=lambda x: x["readiness_ratio"], reverse=True)
+    summary_grade = "not_ready"
+    if any(h["grade"] == "ready" for h in hypotheses):
+        summary_grade = "ready"
+    elif any(h["grade"] == "watch" for h in hypotheses):
+        summary_grade = "watch"
+
+    notes = []
+    if dup_r > 0 or cross_dup > 0:
+        notes.append("duplicate-r present; direct algebraic checks take priority over lattice")
+    if drift_flags > 0 or signer_drift > 0:
+        notes.append("temporal/signer drift suggests segmentation before advanced lattice experiments")
+    if bit_fdr_r == 0 and psb_susp == 0 and tiny_r_240 == 0:
+        notes.append("no strong leakage proxy detected; lattice attempts likely low-yield")
+
+    return {
+        "enabled": True,
+        "summary_grade": summary_grade,
+        "inputs": {
+            "signature_count": n,
+            "bit_fdr_r": bit_fdr_r,
+            "prefix_suffix_suspicious_tests": psb_susp,
+            "tiny_r_lt_2^240": tiny_r_240,
+            "tiny_r_lt_2^224": tiny_r_224,
+            "duplicate_r": dup_r,
+            "cross_pub_duplicate_r": cross_dup,
+            "drift_flags": drift_flags,
+            "signer_drift_flagged": signer_drift,
+        },
+        "hypotheses": hypotheses,
+        "notes": notes,
+    }
+
+
+def audit_prefix_suffix_bias(values: list[int], name: str, widths: list[int] | None = None) -> dict[str, Any]:
+    """Detect concentration anomalies in top/bottom bit slices.
+
+    This is a defensive detector: it does not assume a leak model, it reports
+    unusually frequent MSB/LSB buckets that can motivate deeper HNP tests.
+    """
+    if widths is None:
+        widths = [4, 8, 12, 16]
+
+    n = len(values)
+    out_tests = []
+    for w in widths:
+        if w <= 0 or w > 16:
+            continue
+        mod = 1 << w
+        msb_counts = [0] * mod
+        lsb_counts = [0] * mod
+        shift = max(0, BIT_SIZE - w)
+        for v in values:
+            msb_counts[(v >> shift) & (mod - 1)] += 1
+            lsb_counts[v & (mod - 1)] += 1
+
+        exp = n / mod if mod else 0.0
+        msb_chi2 = chi_square_uniform(msb_counts, exp) if exp > 0 else 0.0
+        lsb_chi2 = chi_square_uniform(lsb_counts, exp) if exp > 0 else 0.0
+        msb_max = max(msb_counts) if msb_counts else 0
+        lsb_max = max(lsb_counts) if lsb_counts else 0
+        msb_ratio = (msb_max / exp) if exp > 0 else 0.0
+        lsb_ratio = (lsb_max / exp) if exp > 0 else 0.0
+
+        msb_top = sorted(enumerate(msb_counts), key=lambda x: x[1], reverse=True)[:5]
+        lsb_top = sorted(enumerate(lsb_counts), key=lambda x: x[1], reverse=True)[:5]
+
+        out_tests.append(
+            {
+                "width_bits": w,
+                "bucket_count": mod,
+                "expected_per_bucket": exp,
+                "msb": {
+                    "chi_square": msb_chi2,
+                    "max_bucket_count": msb_max,
+                    "max_over_expected_ratio": msb_ratio,
+                    "top_buckets": [{"bucket": b, "count": c} for b, c in msb_top],
+                },
+                "lsb": {
+                    "chi_square": lsb_chi2,
+                    "max_bucket_count": lsb_max,
+                    "max_over_expected_ratio": lsb_ratio,
+                    "top_buckets": [{"bucket": b, "count": c} for b, c in lsb_top],
+                },
+            }
+        )
+
+    suspicious = [
+        t
+        for t in out_tests
+        if t["msb"]["max_over_expected_ratio"] >= 2.0 or t["lsb"]["max_over_expected_ratio"] >= 2.0
+    ]
+
+    return {
+        "name": name,
+        "sample_count": n,
+        "tests": out_tests,
+        "suspicious_test_count": len(suspicious),
+        "suspicious_tests": suspicious[:10],
+    }
+
+
+def sigmoid(x: float) -> float:
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+
+def build_signal_fusion(report: dict[str, Any]) -> dict[str, Any]:
+    """Unified calibrated ranking across anomaly detectors."""
+    dup_r = int(report.get("duplicates_r", {}).get("duplicate_count", 0) or 0)
+    cross_dup = int(report.get("cross_pub_duplicate_r", {}).get("collision_count", 0) or 0)
+    alg_strong = int(report.get("algebraic_reuse_candidates", {}).get("strong_group_count", 0) or 0)
+    bit_fdr_r = int(report.get("bit_bias_r", {}).get("fdr_significant_bit_count", 0) or 0)
+    psb_susp = int(report.get("prefix_suffix_bias_r", {}).get("suspicious_test_count", 0) or 0)
+    drift = int(report.get("height_time_drift", {}).get("drift_flags", 0) or 0)
+    signer_cp = int(report.get("signer_change_points", {}).get("signer_count_flagged", 0) or 0)
+    signer_mix = int(report.get("signer_mixture_modes", {}).get("signer_count_flagged", 0) or 0)
+    signer_fit = int(report.get("constraint_model_fits", {}).get("signer_count_flagged", 0) or 0)
+    corr_abs_max = max(abs(v) for v in (report.get("correlations", {}) or {}).values()) if report.get("correlations") else 0.0
+    hnp_grade = (report.get("hnp_lattice_readiness", {}) or {}).get("summary_grade", "not_ready")
+    hnp_map = {"not_ready": 0.0, "watch": 0.5, "ready": 1.0}
+    hnp = float(hnp_map.get(hnp_grade, 0.0))
+
+    f_dup = min(1.0, dup_r / 2.0)
+    f_cross = min(1.0, cross_dup / 1.0)
+    f_alg = min(1.0, alg_strong / 1.0)
+    f_bit = min(1.0, bit_fdr_r / 6.0)
+    f_psb = min(1.0, psb_susp / 4.0)
+    f_drift = min(1.0, drift / 3.0)
+    f_cp = min(1.0, signer_cp / 3.0)
+    f_mix = min(1.0, signer_mix / 3.0)
+    f_fit = min(1.0, signer_fit / 3.0)
+    f_corr = min(1.0, corr_abs_max / 0.20)
+    f_hnp = hnp
+
+    logit = (
+        -2.2
+        + 2.0 * f_dup
+        + 2.5 * f_cross
+        + 2.6 * f_alg
+        + 1.0 * f_bit
+        + 0.9 * f_psb
+        + 0.9 * f_drift
+        + 0.8 * f_cp
+        + 0.8 * f_mix
+        + 1.1 * f_fit
+        + 0.7 * f_corr
+        + 0.8 * f_hnp
+    )
+    confidence = sigmoid(logit)
+
+    if confidence >= 0.85:
+        tier = "critical"
+    elif confidence >= 0.65:
+        tier = "high"
+    elif confidence >= 0.45:
+        tier = "medium"
+    else:
+        tier = "low"
+
+    recommendation = "monitor_only"
+    if tier in {"critical", "high"}:
+        recommendation = "run_full_recovery"
+    elif tier == "medium":
+        recommendation = "run_clustered_recovery"
+
+    return {
+        "confidence": confidence,
+        "tier": tier,
+        "recommendation": recommendation,
+    }
+
+
 def risk_score(report: dict[str, Any]) -> dict[str, Any]:
     score = 0
     reasons = []
@@ -573,6 +1264,21 @@ def risk_score(report: dict[str, Any]) -> dict[str, Any]:
     if report.get("height_time_drift", {}).get("drift_flags", 0) > 0:
         score += 20
         reasons.append("height/time-window drift detected")
+    cp_flagged = int(report.get("signer_change_points", {}).get("signer_count_flagged", 0) or 0)
+    if cp_flagged > 0:
+        score += min(30, 5 * cp_flagged)
+        reasons.append("signer change-point drift detected")
+    mix_flagged = int(report.get("signer_mixture_modes", {}).get("signer_count_flagged", 0) or 0)
+    if mix_flagged > 0:
+        score += min(35, 7 * mix_flagged)
+        reasons.append("signer mixture-mode anomaly detected")
+    cmf_flagged = int(report.get("constraint_model_fits", {}).get("signer_count_flagged", 0) or 0)
+    if cmf_flagged > 0:
+        score += min(40, 8 * cmf_flagged)
+        reasons.append("constraint-model fit anomaly detected")
+    if report.get("algebraic_reuse_candidates", {}).get("strong_group_count", 0) > 0:
+        score += 80
+        reasons.append("algebraic duplicate-r reuse candidates detected")
 
     if score == 0:
         verdict = "LOW: no obvious nonce/RNG weakness found"
@@ -623,11 +1329,18 @@ def build_core_report(sigs: list[dict[str, Any]]) -> dict[str, Any]:
         "sequential_r": audit_sequential_patterns(rs, "r"),
         "sequential_s": audit_sequential_patterns(ss, "s"),
         "correlations": audit_correlations(rs, ss, zs),
+        "prefix_suffix_bias_r": audit_prefix_suffix_bias(rs, "r"),
         "cross_pub_duplicate_r": audit_cross_pub_duplicate_r(sigs),
+        "algebraic_reuse_candidates": audit_algebraic_reuse_candidates(sigs),
         "sighash_segments": audit_sighash_segments(sigs),
         "height_time_drift": audit_height_time_drift(sigs),
         "signer_longitudinal_drift": audit_signer_longitudinal_drift(sigs),
+        "signer_change_points": audit_signer_change_points(sigs),
+        "signer_mixture_modes": audit_signer_mixture_modes(sigs),
+        "constraint_model_fits": audit_constraint_model_fits(sigs),
     }
+    report["hnp_lattice_readiness"] = audit_hnp_lattice_readiness(report)
+    report["signal_fusion"] = build_signal_fusion(report)
     report["risk"] = risk_score(report)
     return report
 
@@ -705,6 +1418,9 @@ def print_report(report: dict[str, Any]) -> None:
             f"invalid={vg.get('invalid', 0)}",
             f"dropped={vg.get('dropped', 0)}",
         )
+        rc = vg.get("reason_counts", {})
+        if rc:
+            print(f"Verification invalid reasons: {rc}")
     print("\n--- Risk ---")
     print(f"Verdict: {report['risk']['verdict']}")
     print(f"Score: {report['risk']['score']}")
@@ -714,9 +1430,35 @@ def print_report(report: dict[str, Any]) -> None:
     print(f"Duplicate r count: {report['duplicates_r']['duplicate_count']}")
     print(f"Duplicate s count: {report['duplicates_s']['duplicate_count']}")
     print(f"Cross-pub duplicate r count: {report.get('cross_pub_duplicate_r', {}).get('collision_count', 0)}")
+    alg = report.get("algebraic_reuse_candidates", {})
+    print(
+        "Algebraic reuse:",
+        f"strong_groups={alg.get('strong_group_count', 0)}",
+        f"pairs_consistent={alg.get('pairs_consistent', 0)}",
+    )
     print(f"Sighash segments analyzed: {report.get('sighash_segments', {}).get('segment_count', 0)}")
     htd = report.get("height_time_drift", {})
     print(f"Height/time drift flags: {htd.get('drift_flags', 0)} (mode={htd.get('mode', 'none')})")
+    scp = report.get("signer_change_points", {})
+    if scp:
+        print(f"Signer change-point flagged: {scp.get('signer_count_flagged', 0)}")
+    smm = report.get("signer_mixture_modes", {})
+    if smm:
+        print(f"Signer mixture-mode flagged: {smm.get('signer_count_flagged', 0)}")
+    cmf = report.get("constraint_model_fits", {})
+    if cmf:
+        print(f"Constraint-model fit flagged: {cmf.get('signer_count_flagged', 0)}")
+    hnp = report.get("hnp_lattice_readiness", {})
+    if hnp:
+        print(f"HNP/Lattice readiness: {hnp.get('summary_grade', 'unknown')}")
+    sf = report.get("signal_fusion", {})
+    if sf:
+        print(
+            "Signal fusion:",
+            f"tier={sf.get('tier', 'unknown')}",
+            f"confidence={float(sf.get('confidence', 0.0)):.3f}",
+            f"recommendation={sf.get('recommendation', 'monitor_only')}",
+        )
     clusters = report.get("clusters", {})
     if clusters:
         print("\n--- Cluster Summary ---")
