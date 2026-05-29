@@ -135,27 +135,51 @@ def build_duplicate_r_focus_subset(sig_path: Path, out_path: Path) -> dict[str, 
     dup_groups = {r: rows for r, rows in rows_by_r.items() if len(rows) > 1}
     selected = 0
     nontrivial_groups = 0
+    exact_replay_groups = 0
+    same_r_same_s_diff_z_groups = 0
+    same_r_diff_s_groups = 0
+    nontrivial_selected = 0
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as out:
         for _, rows in dup_groups.items():
             s_set = set()
             z_set = set()
+            uniq_sz = set()
             for _, obj in rows:
                 try:
-                    s_set.add(parse_int(obj.get("s")))
-                    z_set.add(parse_int(obj.get("z")))
+                    sv = parse_int(obj.get("s"))
+                    zv = parse_int(obj.get("z"))
+                    s_set.add(sv)
+                    z_set.add(zv)
+                    uniq_sz.add((sv, zv))
                 except Exception:
                     pass
-            if len(s_set) > 1 or len(z_set) > 1:
+            is_nontrivial = False
+            if len(uniq_sz) == 1:
+                exact_replay_groups += 1
+            elif len(s_set) == 1 and len(z_set) > 1:
+                same_r_same_s_diff_z_groups += 1
+            elif len(s_set) > 1:
+                same_r_diff_s_groups += 1
                 nontrivial_groups += 1
+                is_nontrivial = True
+            else:
+                nontrivial_groups += 1
+                is_nontrivial = True
             for raw, _ in rows:
                 out.write(raw + "\n")
                 selected += 1
+                if is_nontrivial:
+                    nontrivial_selected += 1
 
     return {
         "duplicate_r_groups": len(dup_groups),
         "nontrivial_duplicate_r_groups": nontrivial_groups,
+        "exact_replay_groups": exact_replay_groups,
+        "same_r_same_s_diff_z_groups": same_r_same_s_diff_z_groups,
+        "same_r_diff_s_groups": same_r_diff_s_groups,
         "selected_signatures": selected,
+        "selected_signatures_nontrivial": nontrivial_selected,
         "output": str(out_path),
     }
 
@@ -675,8 +699,36 @@ def main() -> None:
             "Stage0 duplicate-r focus:",
             f"groups={stage0_subset_info.get('duplicate_r_groups', 0)}",
             f"nontrivial={stage0_subset_info.get('nontrivial_duplicate_r_groups', 0)}",
+            f"same_r_diff_s={stage0_subset_info.get('same_r_diff_s_groups', 0)}",
             f"selected={stage0_subset_info.get('selected_signatures', 0)}",
         )
+
+    # #7 kill switch: replay-like duplicate-r groups are not exploitable for key recovery.
+    if stage0_subset_info and stage0_subset_info.get("duplicate_r_groups", 0) > 0:
+        if int(stage0_subset_info.get("nontrivial_duplicate_r_groups", 0)) == 0:
+            print("Duplicate-r groups are replay-like only (no same-r/diff-s); recovery skipped.")
+            write_decision(args.decision_out, {
+                "should_recover": True,
+                "recover_executed": False,
+                "risk_score": risk,
+                "risk_verdict": verdict,
+                "duplicate_r": dup_r,
+                "cross_pub_duplicate_r": cross_pub_dup_r,
+                "drift_flags": drift_flags,
+                "sighash_anomaly": sighash_anomaly,
+                "signal_fusion_tier": fusion_tier,
+                "signal_fusion_confidence": fusion_conf,
+                "signal_fusion_recommendation": fusion_reco,
+                "verification_quality": vq,
+                "low_quality_data": low_quality_data,
+                "effective_cluster_risk_threshold": effective_cluster_threshold,
+                "recover_input": None,
+                "cluster_gating_used": not args.disable_cluster_gating,
+                "recover_stages": [],
+                "stage0_subset": stage0_subset_info,
+                "skip_reason": "duplicate_r_replay_like_no_nontrivial_pairs",
+            })
+            return
 
     # Multi-stage recovery:
     # stage1: primary/cheap scan (disable LCG + no random-k)
