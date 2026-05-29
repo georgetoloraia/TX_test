@@ -17,6 +17,46 @@ import shlex
 import subprocess
 import sys
 from collections import Counter, defaultdict
+import importlib.util
+import sys as _sys
+import os
+def try_hnp_lll_bkz_solver(sig_path, bits_known=6, q=None, out_path="hnp_lll_bkz_candidates.txt"):
+    """
+    Try to run the HNP/LLL/BKZ solver on a set of signatures with partial nonce leaks.
+    Expects sig_path to be a JSONL file with fields r, s, z, and known_nonce_bits (if available).
+    """
+    solver_path = os.path.join(os.path.dirname(__file__), "hnp_lll_bkz_solver.py")
+    if not os.path.exists(solver_path):
+        print("[HNP/LLL/BKZ] Solver script not found.")
+        return None
+    # Try to import the solver as a module
+    spec = importlib.util.spec_from_file_location("hnp_lll_bkz_solver", solver_path)
+    hnp_solver = importlib.util.module_from_spec(spec)
+    _sys.modules["hnp_lll_bkz_solver"] = hnp_solver
+    spec.loader.exec_module(hnp_solver)
+    leaks = []
+    with open(sig_path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                obj = json.loads(line.strip())
+                r = parse_int(obj.get("r"))
+                s = parse_int(obj.get("s"))
+                m = parse_int(obj.get("z"))
+                known_nonce = obj.get("known_nonce_bits", 0)
+                leaks.append((r, s, m, known_nonce))
+            except Exception:
+                continue
+    if not leaks:
+        print("[HNP/LLL/BKZ] No valid leaks found in input.")
+        return None
+    if q is None:
+        q = int("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
+    candidates = hnp_solver.recover_private_key(leaks, q, bits_known)
+    with open(out_path, "w", encoding="utf-8") as fout:
+        for c in candidates:
+            fout.write(f"{c}\n")
+    print(f"[HNP/LLL/BKZ] Candidates written to {out_path}")
+    return candidates
 from pathlib import Path
 from typing import Any
 
@@ -729,6 +769,9 @@ def main() -> None:
                 "skip_reason": "duplicate_r_replay_like_no_nontrivial_pairs",
             })
             return
+        # If there are nontrivial duplicate-r groups, try HNP/LLL/BKZ solver
+        print("[HNP/LLL/BKZ] Attempting key recovery from nontrivial duplicate-r group subset...")
+        try_hnp_lll_bkz_solver(str(stage0_path), bits_known=6, q=None, out_path="hnp_lll_bkz_candidates.txt")
 
     # Multi-stage recovery:
     # stage1: primary/cheap scan (disable LCG + no random-k)

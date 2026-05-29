@@ -1197,6 +1197,11 @@ def build_signal_fusion(report: dict[str, Any]) -> dict[str, Any]:
     hnp_grade = (report.get("hnp_lattice_readiness", {}) or {}).get("summary_grade", "not_ready")
     hnp_map = {"not_ready": 0.0, "watch": 0.5, "ready": 1.0}
     hnp = float(hnp_map.get(hnp_grade, 0.0))
+    vg = report.get("verification_gate", {}) or {}
+    verifiable = int(vg.get("verifiable", 0) or 0)
+    valid = int(vg.get("valid", 0) or 0)
+    invalid = int(vg.get("invalid", 0) or 0)
+    invalid_ratio = (invalid / verifiable) if verifiable > 0 else 0.0
 
     f_dup = min(1.0, dup_r / 2.0)
     f_cross = min(1.0, cross_dup / 1.0)
@@ -1209,6 +1214,14 @@ def build_signal_fusion(report: dict[str, Any]) -> dict[str, Any]:
     f_fit = min(1.0, signer_fit / 3.0)
     f_corr = min(1.0, corr_abs_max / 0.20)
     f_hnp = hnp
+
+    # Penalize confidence when signature verification quality is poor.
+    # With ~50% invalid signatures, treat statistical anomalies as weaker evidence.
+    quality_scale = 1.0
+    if verifiable > 0:
+        quality_scale = max(0.35, 1.0 - 0.9 * invalid_ratio)
+        if valid < 500:
+            quality_scale *= 0.85
 
     logit = (
         -2.2
@@ -1224,6 +1237,7 @@ def build_signal_fusion(report: dict[str, Any]) -> dict[str, Any]:
         + 0.7 * f_corr
         + 0.8 * f_hnp
     )
+    logit *= quality_scale
     confidence = sigmoid(logit)
 
     if confidence >= 0.85:
@@ -1245,13 +1259,21 @@ def build_signal_fusion(report: dict[str, Any]) -> dict[str, Any]:
         "confidence": confidence,
         "tier": tier,
         "recommendation": recommendation,
+        "quality_scale": quality_scale,
+        "verification_invalid_ratio": invalid_ratio,
     }
 
 
 def risk_score(report: dict[str, Any]) -> dict[str, Any]:
     score = 0
     reasons = []
-    if report["duplicates_r"]["duplicate_count"] > 0:
+    vg = report.get("verification_gate", {}) or {}
+    verifiable = int(vg.get("verifiable", 0) or 0)
+    valid = int(vg.get("valid", 0) or 0)
+    invalid = int(vg.get("invalid", 0) or 0)
+    invalid_ratio = (invalid / verifiable) if verifiable > 0 else 0.0
+    dup_r_count = int(report["duplicates_r"]["duplicate_count"] or 0)
+    if dup_r_count > 0:
         score += 100
         reasons.append("duplicate r values detected")
     if report["range_problems_count"] > 0:
@@ -1313,6 +1335,22 @@ def risk_score(report: dict[str, Any]) -> dict[str, Any]:
     if report.get("algebraic_reuse_candidates", {}).get("strong_group_count", 0) > 0:
         score += 80
         reasons.append("algebraic duplicate-r reuse candidates detected")
+
+    # If data quality is poor, down-weight pure statistical/structural evidence
+    # unless there is direct algebraic evidence.
+    has_direct_evidence = (
+        dup_r_count > 0
+        and (
+            int(report.get("cross_pub_duplicate_r", {}).get("collision_count", 0) or 0) > 0
+            or int(report.get("algebraic_reuse_candidates", {}).get("strong_group_count", 0) or 0) > 0
+        )
+    )
+    if verifiable > 0 and invalid_ratio >= 0.45 and not has_direct_evidence:
+        original = score
+        score = int(round(score * 0.55))
+        reasons.append(
+            f"low verification quality dampening applied (invalid_ratio={invalid_ratio:.3f}, score {original}->{score})"
+        )
 
     if score == 0:
         verdict = "LOW: no obvious nonce/RNG weakness found"
