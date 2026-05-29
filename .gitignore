@@ -28,3 +28,4 @@ gen
 # OS
 .DS_Store
 venv
+fibonaci.py

@@ -10,6 +10,7 @@ Default behavior is defensive and reproducible.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import shlex
@@ -24,6 +25,11 @@ def run_cmd(cmd: list[str]) -> int:
     print("$", " ".join(shlex.quote(x) for x in cmd))
     p = subprocess.run(cmd)
     return p.returncode
+
+
+def write_decision(path: str, payload: dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
 
 
 def run_recover_stage(
@@ -108,6 +114,136 @@ def count_nonempty_lines(path: Path) -> int:
         return 0
     with path.open("r", encoding="utf-8") as f:
         return sum(1 for line in f if line.strip())
+
+
+def build_duplicate_r_focus_subset(sig_path: Path, out_path: Path) -> dict[str, Any]:
+    rows_by_r: dict[int, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
+    with sig_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+                if not isinstance(obj, dict):
+                    continue
+                r = parse_int(obj.get("r"))
+            except Exception:
+                continue
+            rows_by_r[r].append((raw, obj))
+
+    dup_groups = {r: rows for r, rows in rows_by_r.items() if len(rows) > 1}
+    selected = 0
+    nontrivial_groups = 0
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as out:
+        for _, rows in dup_groups.items():
+            s_set = set()
+            z_set = set()
+            for _, obj in rows:
+                try:
+                    s_set.add(parse_int(obj.get("s")))
+                    z_set.add(parse_int(obj.get("z")))
+                except Exception:
+                    pass
+            if len(s_set) > 1 or len(z_set) > 1:
+                nontrivial_groups += 1
+            for raw, _ in rows:
+                out.write(raw + "\n")
+                selected += 1
+
+    return {
+        "duplicate_r_groups": len(dup_groups),
+        "nontrivial_duplicate_r_groups": nontrivial_groups,
+        "selected_signatures": selected,
+        "output": str(out_path),
+    }
+
+
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+SECP256K1_N = int("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
+
+
+def b58decode(s: str) -> bytes:
+    n = 0
+    for ch in s:
+        n = n * 58 + BASE58_ALPHABET.index(ch)
+    b = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    pad = 0
+    for ch in s:
+        if ch == "1":
+            pad += 1
+        else:
+            break
+    return b"\x00" * pad + b
+
+
+def parse_priv_candidate(x: str) -> int | None:
+    s = x.strip()
+    if not s:
+        return None
+    try:
+        if s.startswith(("0x", "0X")):
+            k = int(s, 16)
+        elif len(s) in {51, 52} and all(ch in BASE58_ALPHABET for ch in s):
+            raw = b58decode(s)
+            if len(raw) not in {37, 38}:
+                return None
+            payload, chk = raw[:-4], raw[-4:]
+            good = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+            if chk != good:
+                return None
+            if payload[0] not in (0x80, 0xEF):
+                return None
+            key = payload[1:33]
+            if len(payload) == 34 and payload[-1] != 0x01:
+                return None
+            k = int.from_bytes(key, "big")
+        elif all(c in "0123456789abcdefABCDEF" for c in s) and len(s) == 64:
+            k = int(s, 16)
+        else:
+            k = int(s, 10)
+    except Exception:
+        return None
+    if 1 <= k < SECP256K1_N:
+        return k
+    return None
+
+
+def post_validate_recovered(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"exists": False, "rows": 0, "valid_rows": 0, "invalid_rows": 0}
+    rows = 0
+    valid = 0
+    invalid = 0
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            rows += 1
+            cand: str | None = None
+            try:
+                obj = json.loads(raw)
+                if isinstance(obj, dict):
+                    for k in ("wif", "priv", "privkey", "private_key", "d"):
+                        if k in obj and obj[k] is not None:
+                            cand = str(obj[k])
+                            break
+            except Exception:
+                cand = raw
+            if cand is None:
+                invalid += 1
+            elif parse_priv_candidate(cand) is not None:
+                valid += 1
+            else:
+                invalid += 1
+    return {
+        "exists": True,
+        "rows": rows,
+        "valid_rows": valid,
+        "invalid_rows": invalid,
+    }
 
 
 def cluster_key(obj: dict[str, Any]) -> str:
@@ -429,28 +565,23 @@ def main() -> None:
 
     if not should_recover:
         print("Recovery skipped by policy (low anomaly signal).")
-        with open(args.decision_out, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "should_recover": False,
-                    "recover_executed": False,
-                    "risk_score": risk,
-                    "risk_verdict": verdict,
-                    "duplicate_r": dup_r,
-                    "cross_pub_duplicate_r": cross_pub_dup_r,
-                    "drift_flags": drift_flags,
-                    "sighash_anomaly": sighash_anomaly,
-                    "signal_fusion_tier": fusion_tier,
-                    "signal_fusion_confidence": fusion_conf,
-                    "signal_fusion_recommendation": fusion_reco,
-                    "verification_quality": vq,
-                    "low_quality_data": low_quality_data,
-                    "recover_input": None,
-                    "cluster_gating_used": not args.disable_cluster_gating,
-                },
-                f,
-                indent=2,
-            )
+        write_decision(args.decision_out, {
+            "should_recover": False,
+            "recover_executed": False,
+            "risk_score": risk,
+            "risk_verdict": verdict,
+            "duplicate_r": dup_r,
+            "cross_pub_duplicate_r": cross_pub_dup_r,
+            "drift_flags": drift_flags,
+            "sighash_anomaly": sighash_anomaly,
+            "signal_fusion_tier": fusion_tier,
+            "signal_fusion_confidence": fusion_conf,
+            "signal_fusion_recommendation": fusion_reco,
+            "verification_quality": vq,
+            "low_quality_data": low_quality_data,
+            "recover_input": None,
+            "cluster_gating_used": not args.disable_cluster_gating,
+        })
         try:
             Path(args.baseline_report).write_text(Path(args.audit_report).read_text(encoding="utf-8"), encoding="utf-8")
         except Exception:
@@ -461,28 +592,23 @@ def main() -> None:
     allow_advanced = args.enable_advanced_recover
     if fusion_reco == "monitor_only" and not (hard_signal or args.force_recover):
         print("Fusion recommendation is monitor_only; recovery skipped.")
-        with open(args.decision_out, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "should_recover": False,
-                    "recover_executed": False,
-                    "risk_score": risk,
-                    "risk_verdict": verdict,
-                    "duplicate_r": dup_r,
-                    "cross_pub_duplicate_r": cross_pub_dup_r,
-                    "drift_flags": drift_flags,
-                    "sighash_anomaly": sighash_anomaly,
-                    "signal_fusion_tier": fusion_tier,
-                    "signal_fusion_confidence": fusion_conf,
-                    "signal_fusion_recommendation": fusion_reco,
-                    "verification_quality": vq,
-                    "low_quality_data": low_quality_data,
-                    "recover_input": None,
-                    "cluster_gating_used": not args.disable_cluster_gating,
-                },
-                f,
-                indent=2,
-            )
+        write_decision(args.decision_out, {
+            "should_recover": False,
+            "recover_executed": False,
+            "risk_score": risk,
+            "risk_verdict": verdict,
+            "duplicate_r": dup_r,
+            "cross_pub_duplicate_r": cross_pub_dup_r,
+            "drift_flags": drift_flags,
+            "sighash_anomaly": sighash_anomaly,
+            "signal_fusion_tier": fusion_tier,
+            "signal_fusion_confidence": fusion_conf,
+            "signal_fusion_recommendation": fusion_reco,
+            "verification_quality": vq,
+            "low_quality_data": low_quality_data,
+            "recover_input": None,
+            "cluster_gating_used": not args.disable_cluster_gating,
+        })
         return
     if fusion_reco == "run_clustered_recovery":
         allow_advanced = False
@@ -513,9 +639,42 @@ def main() -> None:
         )
         if cluster_report["selected_signatures"] == 0 and not args.force_recover:
             print("No suspicious clusters selected; recovery skipped.")
+            write_decision(args.decision_out, {
+                "should_recover": True,
+                "recover_executed": False,
+                "risk_score": risk,
+                "risk_verdict": verdict,
+                "duplicate_r": dup_r,
+                "cross_pub_duplicate_r": cross_pub_dup_r,
+                "drift_flags": drift_flags,
+                "sighash_anomaly": sighash_anomaly,
+                "signal_fusion_tier": fusion_tier,
+                "signal_fusion_confidence": fusion_conf,
+                "signal_fusion_recommendation": fusion_reco,
+                "verification_quality": vq,
+                "low_quality_data": low_quality_data,
+                "recover_input": None,
+                "cluster_gating_used": not args.disable_cluster_gating,
+                "effective_cluster_risk_threshold": effective_cluster_threshold,
+                "cluster_report": cluster_report,
+            })
             return
         if cluster_report["selected_signatures"] > 0:
             recover_input = args.clustered_sigs_out
+
+    # Stage0: deterministic duplicate-r focus subset to force pair-construction on strongest anomaly.
+    stage0_subset_info = None
+    if dup_r > 0:
+        stage0_path = Path("signatures.dup_r_focus.jsonl")
+        stage0_subset_info = build_duplicate_r_focus_subset(Path(recover_input), stage0_path)
+        if stage0_subset_info.get("selected_signatures", 0) > 0:
+            recover_input = str(stage0_path)
+            print(
+                "Stage0 duplicate-r focus:",
+                f"groups={stage0_subset_info.get('duplicate_r_groups', 0)}",
+                f"nontrivial={stage0_subset_info.get('nontrivial_duplicate_r_groups', 0)}",
+                f"selected={stage0_subset_info.get('selected_signatures', 0)}",
+            )
 
     # Multi-stage recovery:
     # stage1: primary/cheap scan (disable LCG + no random-k)
@@ -527,13 +686,16 @@ def main() -> None:
     if low_quality_data:
         stage1_threads = max(1, min(args.threads, 4))
         stage1_iter = 1
+    stage1_extra = ["--no-lcg", "--scan-random-k", "0"]
+    if dup_r > 0:
+        stage1_extra += ["--min-count", "1"]
     stage1_rc = run_recover_stage(
         recover_bin=args.recover_bin,
         recover_input=recover_input,
         threads=stage1_threads,
         max_iter=stage1_iter,
         stage_name="stage1-primary",
-        extra_args=["--no-lcg", "--scan-random-k", "0"],
+        extra_args=stage1_extra,
     )
     stage_runs.append({"name": "stage1-primary", "rc": stage1_rc})
     if stage1_rc != 0:
@@ -586,31 +748,29 @@ def main() -> None:
             if stage3_rc != 0:
                 raise RuntimeError(f"Recover stage3 failed with exit code {stage3_rc}")
 
+    post_validation = post_validate_recovered(Path("recovered_keys.jsonl"))
     print(f"Recovery automation complete. input={recover_input}")
-    with open(args.decision_out, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "should_recover": True,
-                "recover_executed": True,
-                "risk_score": risk,
-                "risk_verdict": verdict,
-                "duplicate_r": dup_r,
-                "cross_pub_duplicate_r": cross_pub_dup_r,
-                "drift_flags": drift_flags,
-                "sighash_anomaly": sighash_anomaly,
-                "signal_fusion_tier": fusion_tier,
-                "signal_fusion_confidence": fusion_conf,
-                "signal_fusion_recommendation": fusion_reco,
-                "verification_quality": vq,
-                "low_quality_data": low_quality_data,
-                "effective_cluster_risk_threshold": effective_cluster_threshold,
-                "recover_input": recover_input,
-                "cluster_gating_used": not args.disable_cluster_gating,
-                "recover_stages": stage_runs,
-            },
-            f,
-            indent=2,
-        )
+    write_decision(args.decision_out, {
+        "should_recover": True,
+        "recover_executed": True,
+        "risk_score": risk,
+        "risk_verdict": verdict,
+        "duplicate_r": dup_r,
+        "cross_pub_duplicate_r": cross_pub_dup_r,
+        "drift_flags": drift_flags,
+        "sighash_anomaly": sighash_anomaly,
+        "signal_fusion_tier": fusion_tier,
+        "signal_fusion_confidence": fusion_conf,
+        "signal_fusion_recommendation": fusion_reco,
+        "verification_quality": vq,
+        "low_quality_data": low_quality_data,
+        "effective_cluster_risk_threshold": effective_cluster_threshold,
+        "recover_input": recover_input,
+        "cluster_gating_used": not args.disable_cluster_gating,
+        "recover_stages": stage_runs,
+        "stage0_subset": stage0_subset_info,
+        "post_recover_validation": post_validation,
+    })
     try:
         Path(args.baseline_report).write_text(Path(args.audit_report).read_text(encoding="utf-8"), encoding="utf-8")
     except Exception:
