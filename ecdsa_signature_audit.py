@@ -211,6 +211,16 @@ def extract_der_signature(sig_hex: str) -> bytes | None:
     return None
 
 
+def rolling_feature(values: list[float], window: int, fn) -> list[float]:
+    if window <= 1 or len(values) < window:
+        return values[:]
+    out: list[float] = []
+    for i in range(0, len(values) - window + 1):
+        w = values[i:i + window]
+        out.append(float(fn(w)))
+    return out
+
+
 def verification_gate(sigs: list[dict[str, Any]], enabled: bool) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if not enabled:
         return sigs, {"enabled": False, "verifiable": 0, "valid": 0, "invalid": 0, "dropped": 0, "coincurve_available": PublicKey is not None}
