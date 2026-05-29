@@ -42,7 +42,7 @@ def run_recover_stage(
         "--out-txt", "recovered_keys.txt",
         "--out-k", "recovered_k.jsonl",
         "--out-deltas", "delta_insights.jsonl",
-        "--report-r-collisions", "r_collisions.jsonl",
+        "--report-collisions", "r_collisions.jsonl",
         "--export-clusters", "dupR_clusters.jsonl",
         "--max-iter", str(max_iter),
     ] + extra_args
