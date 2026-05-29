@@ -621,6 +621,12 @@ def main() -> None:
         effective_cluster_threshold = max(5, effective_cluster_threshold - 5)
     elif fusion_tier == "critical":
         effective_cluster_threshold = max(0, effective_cluster_threshold - 10)
+    # Stage0 is built from the full input before any cluster filtering.
+    stage0_subset_info = None
+    stage0_path = Path("signatures.dup_r_focus.jsonl")
+    if dup_r > 0:
+        stage0_subset_info = build_duplicate_r_focus_subset(sigs, stage0_path)
+
     if not args.disable_cluster_gating:
         cluster_report = build_cluster_subset(
             sig_path=sigs,
@@ -662,19 +668,15 @@ def main() -> None:
         if cluster_report["selected_signatures"] > 0:
             recover_input = args.clustered_sigs_out
 
-    # Stage0: deterministic duplicate-r focus subset to force pair-construction on strongest anomaly.
-    stage0_subset_info = None
-    if dup_r > 0:
-        stage0_path = Path("signatures.dup_r_focus.jsonl")
-        stage0_subset_info = build_duplicate_r_focus_subset(Path(recover_input), stage0_path)
-        if stage0_subset_info.get("selected_signatures", 0) > 0:
-            recover_input = str(stage0_path)
-            print(
-                "Stage0 duplicate-r focus:",
-                f"groups={stage0_subset_info.get('duplicate_r_groups', 0)}",
-                f"nontrivial={stage0_subset_info.get('nontrivial_duplicate_r_groups', 0)}",
-                f"selected={stage0_subset_info.get('selected_signatures', 0)}",
-            )
+    # Stage0: deterministic duplicate-r focus subset overrides cluster filtering if non-empty.
+    if stage0_subset_info and stage0_subset_info.get("selected_signatures", 0) > 0:
+        recover_input = str(stage0_path)
+        print(
+            "Stage0 duplicate-r focus:",
+            f"groups={stage0_subset_info.get('duplicate_r_groups', 0)}",
+            f"nontrivial={stage0_subset_info.get('nontrivial_duplicate_r_groups', 0)}",
+            f"selected={stage0_subset_info.get('selected_signatures', 0)}",
+        )
 
     # Multi-stage recovery:
     # stage1: primary/cheap scan (disable LCG + no random-k)
