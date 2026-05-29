@@ -126,18 +126,31 @@ def cluster_id(item: dict[str, Any]) -> str:
     return "unknown"
 
 
-def load_signatures(path: str) -> list[dict[str, Any]]:
+def load_signatures(path: str, strict_jsonl: bool = False, strict_entries: bool = False) -> list[dict[str, Any]]:
     p = Path(path)
     raw_items: list[dict[str, Any]] = []
+    bad_jsonl_lines = 0
+    bad_entry_count = 0
     if p.suffix.lower() == ".jsonl":
         with p.open("r", encoding="utf-8") as f:
             for i, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:
                     continue
-                obj = json.loads(line)
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as e:
+                    if strict_jsonl:
+                        raise ValueError(f"Bad JSONL at line {i}: {e}") from e
+                    bad_jsonl_lines += 1
+                    print(f"[warn] skipping bad JSONL line {i}: {e}", file=sys.stderr)
+                    continue
                 if not isinstance(obj, dict):
-                    raise ValueError(f"Bad JSONL object at line {i}")
+                    if strict_jsonl:
+                        raise ValueError(f"Bad JSONL object at line {i}")
+                    bad_jsonl_lines += 1
+                    print(f"[warn] skipping non-object JSONL line {i}", file=sys.stderr)
+                    continue
                 raw_items.append(obj)
     else:
         with p.open("r", encoding="utf-8") as f:
@@ -153,7 +166,11 @@ def load_signatures(path: str) -> list[dict[str, Any]]:
             s = parse_int(item["s"])
             z = parse_int(item["z"])
         except Exception as e:
-            raise ValueError(f"Bad signature entry at index {i}: {e}") from e
+            if strict_entries:
+                raise ValueError(f"Bad signature entry at index {i}: {e}") from e
+            bad_entry_count += 1
+            print(f"[warn] skipping bad signature entry index={i}: {e}", file=sys.stderr)
+            continue
         sigs.append(
             {
                 "r": r,
@@ -166,6 +183,12 @@ def load_signatures(path: str) -> list[dict[str, Any]]:
                 "block_time": item.get("block_time"),
                 "cluster": cluster_id(item),
             }
+        )
+    if bad_jsonl_lines > 0 or bad_entry_count > 0:
+        print(
+            f"[warn] load_signatures summary: skipped_jsonl_lines={bad_jsonl_lines} "
+            f"skipped_bad_entries={bad_entry_count} loaded={len(sigs)}",
+            file=sys.stderr,
         )
     return sigs
 
@@ -1474,9 +1497,11 @@ def main() -> None:
     ap.add_argument("--verify-signatures", action="store_true", help="Enable signature verification gate")
     ap.add_argument("--cluster-min-size", type=int, default=25, help="Minimum signatures per cluster for per-cluster report")
     ap.add_argument("--baseline-report", default="", help="Optional previous audit report JSON for delta comparison")
+    ap.add_argument("--strict-jsonl", action="store_true", help="Fail on malformed JSONL lines instead of skipping")
+    ap.add_argument("--strict-entries", action="store_true", help="Fail on bad signature entries instead of skipping")
     args = ap.parse_args()
 
-    sigs_raw = load_signatures(args.input)
+    sigs_raw = load_signatures(args.input, strict_jsonl=args.strict_jsonl, strict_entries=args.strict_entries)
     sigs, gate_info = verification_gate(sigs_raw, enabled=args.verify_signatures)
     report = build_core_report(sigs)
     report["verification_gate"] = gate_info
