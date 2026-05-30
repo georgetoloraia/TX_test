@@ -167,19 +167,42 @@ def recover_private_key(leaks, q, bits_known, reduction_mode="LLL", bkz_blocksiz
         BKZ.reduction(M, BKZ.Param(bkz_blocksize))
     else:
         raise ValueError(f"Unknown reduction_mode: {reduction_mode}")
-    # Babai's nearest plane (CVP)
+    # Babai's nearest plane (CVP) - main candidate
     closest = _closest_vector_cvp(M, target)
-    # The last coordinate is d (mod q)
     d_cand = int(closest[-1]) % q
+
+    # Enumerate additional short vectors (multi-candidate)
+    from fpylll import GSO, Enumeration
+    gso = GSO.Mat(M)
+    gso.update_gso()
+    enum = Enumeration(M, gso)
+    # Limit: up to 32 best vectors (configurable)
+    max_enum = 128  # გაზრდილი ბარიერი
+    enum_vectors = []
+    enum_count = 0
+    print("[DEBUG] Babai candidate:", d_cand)
+    try:
+        for v in enum.enumerate(0, M.nrows, 1e12):  # ძალიან მაღალი ბარიერი
+            enum_count += 1
+            print(f"[DEBUG] Enum vector #{enum_count}: {v}")
+            if len(v) == M.nrows:
+                enum_vectors.append(int(v[-1]) % q)
+            if len(enum_vectors) >= max_enum:
+                break
+    except Exception as e:
+        print(f"[DEBUG] Enumeration exception: {e}")
+    print(f"[DEBUG] Total enum vectors found: {len(enum_vectors)}")
+    # Always include Babai candidate
+    all_candidates = [d_cand] + [c for c in enum_vectors if c != d_cand]
     t1 = time.time()
     reduction_metrics = {
         "matrix_dim": M.nrows,
         "runtime_sec": t1 - t0,
-        "candidate_count": 1,
+        "candidate_count": len(all_candidates),
         "reduction_mode": reduction_mode,
         "bkz_blocksize": bkz_blocksize if reduction_mode == "BKZ" else None
     }
-    return [d_cand], reduction_metrics
+    return all_candidates, reduction_metrics
 def synthetic_fixture_lsb(n=8, bits_known=6, q=DEFAULT_Q):
     # Generate cryptographically correct ECDSA signatures with LSB-known nonces and known d
     from ecdsa import SECP256k1, SigningKey
