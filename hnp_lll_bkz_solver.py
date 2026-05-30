@@ -96,11 +96,11 @@ def build_hnp_lattice(leaks, q, bits_known, leakage_model="LSB"):
         B = 2^{bits_known}
     Returns IntegerMatrix (n+1)x(n+1), target vector (for CVP/Babai)
     """
+    # Nguyen-Regev HNP lattice: Each row encodes u_i * d + B * x_i = t_i (mod q)
     from fpylll import IntegerMatrix
     n = len(leaks)
     B = 1 << bits_known
-    M = IntegerMatrix(n+1, n+1)
-    target = []
+    M = IntegerMatrix(n + 1, n + 1)
     for i, (r, s, m, known_nonce) in enumerate(leaks):
         s_inv = pow(s, -1, q)
         if leakage_model == "LSB":
@@ -109,25 +109,33 @@ def build_hnp_lattice(leaks, q, bits_known, leakage_model="LSB"):
             B_row = B
         elif leakage_model == "MSB":
             u = (-r * s_inv) % q
-            # For MSB, known_nonce is the known MSB bits, so the error is (k - known_nonce << (klen-bits_known))
             klen = q.bit_length()
             shift = klen - bits_known
             t = (m * s_inv - (known_nonce << shift)) % q
             B_row = B << shift
         else:
             raise ValueError(f"Unknown leakage_model: {leakage_model}")
-        for j in range(n+1):
+        # Fill row: [0,...,B_row,...,u]
+        for j in range(n + 1):
             M[i, j] = 0
         M[i, i] = B_row
         M[i, n] = u
-        target.append(t)
-    # Last row: [0,...,0, q]
-    for j in range(n+1):
+    # Last row: [0,...,0,q]
+    for j in range(n + 1):
         M[n, j] = 0
     M[n, n] = q
-    # Target vector for CVP: [t_1, ..., t_n, 0]
-    target.append(0)
-    # Normalize target type for fpylll APIs (Python ints only).
+    # Target vector: [t_1, ..., t_n, 0]
+    target = [0] * (n + 1)
+    for i, (r, s, m, known_nonce) in enumerate(leaks):
+        s_inv = pow(s, -1, q)
+        if leakage_model == "LSB":
+            t = (m * s_inv - known_nonce) % q
+        elif leakage_model == "MSB":
+            klen = q.bit_length()
+            shift = klen - bits_known
+            t = (m * s_inv - (known_nonce << shift)) % q
+        target[i] = t
+    # Last coordinate is 0
     target = tuple(int(x) for x in target)
     return M, target
 
@@ -239,7 +247,8 @@ def recover_private_key(leaks, q, bits_known, reduction_mode="LLL", bkz_blocksiz
     # Babai's nearest plane (CVP) - main candidate
     closest = _closest_vector_cvp(M, target)
     closest = [int(v) for v in closest]
-    # --- Correct Babai/CVP decoding: recover d from each row ---
+    # Babai vector: [x_1, ..., x_n, d_var] (d_var არ არის d!)
+    # აღვადგინოთ d ყველა row-დან: d_i = (t_i - B * x_i) * u_i^{-1} mod q
     d_candidates = []
     for i, (r, s, m, known_nonce) in enumerate(leaks):
         s_inv = pow(int(s), -1, int(q))
@@ -253,8 +262,7 @@ def recover_private_key(leaks, q, bits_known, reduction_mode="LLL", bkz_blocksiz
             u = (-int(r) * s_inv) % int(q)
             t = (int(m) * s_inv - (int(known_nonce) << shift)) % int(q)
             B_row = (1 << int(bits_known)) << shift
-        x_i = int(round((closest[i] - 0) / B_row))  # lattice x_i coordinate
-        # Recover d: d_i = (t - B_row * x_i) * u^{-1} mod q
+        x_i = closest[i]
         try:
             u_inv = pow(u, -1, int(q))
             d_i = ((t - B_row * x_i) * u_inv) % int(q)
