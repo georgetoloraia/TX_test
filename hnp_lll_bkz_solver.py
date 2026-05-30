@@ -86,7 +86,7 @@ def strict_parse_leaks(leaks, q, bits_known):
 
 
 # --- Mathematically correct HNP lattice for LSB leakage ---
-def build_hnp_lattice(leaks, q, bits_known):
+def build_hnp_lattice(leaks, q, bits_known, leakage_model="LSB"):
     """
     Construct the standard HNP lattice for LSB-known ECDSA nonces (Nguyen-Regev style).
     Each signature gives: u_i * d + B * x_i ≡ t_i mod q
@@ -101,12 +101,6 @@ def build_hnp_lattice(leaks, q, bits_known):
     B = 1 << bits_known
     M = IntegerMatrix(n+1, n+1)
     target = []
-    # Detect leakage model: LSB or MSB (default LSB)
-    leakage_model = None
-    if hasattr(build_hnp_lattice, "leakage_model"):
-        leakage_model = build_hnp_lattice.leakage_model
-    if leakage_model is None:
-        leakage_model = "LSB"
     for i, (r, s, m, known_nonce) in enumerate(leaks):
         s_inv = pow(s, -1, q)
         if leakage_model == "LSB":
@@ -133,6 +127,8 @@ def build_hnp_lattice(leaks, q, bits_known):
     M[n, n] = q
     # Target vector for CVP: [t_1, ..., t_n, 0]
     target.append(0)
+    # Normalize target type for fpylll APIs (Python ints only).
+    target = tuple(int(x) for x in target)
     return M, target
 
 def _closest_vector_cvp(M, target):
@@ -140,12 +136,87 @@ def _closest_vector_cvp(M, target):
     Compatibility wrapper for fpylll CVP API differences across versions.
     """
     from fpylll import CVP
+    target_vec = tuple(int(x) for x in target)
     try:
         # Newer/commonly documented API
-        return CVP.closest_vector(M, target)
+        return CVP.closest_vector(M, target_vec)
     except Exception:
         # Older API style
-        return CVP(M).closest_vector(target)
+        return CVP(M).closest_vector(target_vec)
+
+
+def _matvec(M, vec):
+    rows = M.nrows
+    cols = M.ncols
+    out = [0] * rows
+    for i in range(rows):
+        s = 0
+        for j in range(cols):
+            s += int(M[i, j]) * int(vec[j])
+        out[i] = s
+    return out
+
+
+def _compute_hnp_residuals(leaks, q, bits_known, d_cand, leakage_model):
+    """
+    Per-signature congruence diagnostics:
+      u_i * d + B_i * x_i ≡ t_i (mod q)
+    We estimate x_i via nearest integer and report residuals.
+    """
+    rows = []
+    abs_mod_residuals = []
+    for idx, (r, s, m, known_nonce) in enumerate(leaks):
+        s_inv = pow(int(s), -1, int(q))
+        u = (-int(r) * s_inv) % int(q)
+        if leakage_model == "LSB":
+            t = (int(m) * s_inv - int(known_nonce)) % int(q)
+            B_i = 1 << int(bits_known)
+        else:
+            klen = int(q).bit_length()
+            shift = klen - int(bits_known)
+            t = (int(m) * s_inv - (int(known_nonce) << shift)) % int(q)
+            B_i = (1 << int(bits_known)) << shift
+        num = t - ((u * int(d_cand)) % int(q))
+        x_hat = int(round(num / float(B_i)))
+        lhs = (u * int(d_cand) + B_i * x_hat) % int(q)
+        mod_res = (lhs - t) % int(q)
+        mod_res_alt = min(mod_res, int(q) - mod_res)
+        abs_mod_residuals.append(int(mod_res_alt))
+        rows.append(
+            {
+                "index": idx,
+                "u": int(u),
+                "t": int(t),
+                "B_i": int(B_i),
+                "x_hat": int(x_hat),
+                "lhs_mod_q": int(lhs),
+                "residual_mod_q": int(mod_res),
+                "residual_mod_q_absmin": int(mod_res_alt),
+            }
+        )
+    summary = {
+        "count": len(rows),
+        "max_absmin_residual_mod_q": max(abs_mod_residuals) if abs_mod_residuals else 0,
+        "avg_absmin_residual_mod_q": (sum(abs_mod_residuals) / len(abs_mod_residuals)) if abs_mod_residuals else 0.0,
+        "median_absmin_residual_mod_q": (
+            sorted(abs_mod_residuals)[len(abs_mod_residuals) // 2] if abs_mod_residuals else 0
+        ),
+        "nonzero_absmin_residual_count": sum(1 for x in abs_mod_residuals if x != 0),
+    }
+    return {"summary": summary, "rows": rows}
+
+
+def _top_worst_residuals(hnp_diag_rows, top_k=5):
+    rows = list(hnp_diag_rows)
+    rows.sort(key=lambda r: int(r.get("residual_mod_q_absmin", 0)), reverse=True)
+    return rows[:top_k]
+
+
+def _candidate_neighborhood(cand, q, radius=8):
+    out = []
+    for delta in range(-radius, radius + 1):
+        out.append((int(cand) + delta) % int(q))
+    return out
 
 
 def recover_private_key(leaks, q, bits_known, reduction_mode="LLL", bkz_blocksize=10):
@@ -156,10 +227,8 @@ def recover_private_key(leaks, q, bits_known, reduction_mode="LLL", bkz_blocksiz
     """
     if not HAVE_FPYLLL:
         raise RuntimeError("fpylll is required for recovery (pip install fpylll).")
-    # Pass leakage_model via function attribute for build_hnp_lattice
     leakage_model = recover_private_key.leakage_model if hasattr(recover_private_key, "leakage_model") else "LSB"
-    build_hnp_lattice.leakage_model = leakage_model
-    M, target = build_hnp_lattice(leaks, q, bits_known)
+    M, target = build_hnp_lattice(leaks, q, bits_known, leakage_model=leakage_model)
     t0 = time.time()
     if reduction_mode == "LLL":
         LLL.reduction(M)
@@ -169,40 +238,30 @@ def recover_private_key(leaks, q, bits_known, reduction_mode="LLL", bkz_blocksiz
         raise ValueError(f"Unknown reduction_mode: {reduction_mode}")
     # Babai's nearest plane (CVP) - main candidate
     closest = _closest_vector_cvp(M, target)
+    closest = [int(v) for v in closest]
     d_cand = int(closest[-1]) % q
-
-    # Enumerate additional short vectors (multi-candidate)
-    from fpylll import GSO, Enumeration
-    gso = GSO.Mat(M)
-    gso.update_gso()
-    enum = Enumeration(M, gso)
-    # Limit: up to 32 best vectors (configurable)
-    max_enum = 128  # გაზრდილი ბარიერი
-    enum_vectors = []
-    enum_count = 0
-    print("[DEBUG] Babai candidate:", d_cand)
-    try:
-        for v in enum.enumerate(0, M.nrows, 1e12):  # ძალიან მაღალი ბარიერი
-            enum_count += 1
-            print(f"[DEBUG] Enum vector #{enum_count}: {v}")
-            if len(v) == M.nrows:
-                enum_vectors.append(int(v[-1]) % q)
-            if len(enum_vectors) >= max_enum:
-                break
-    except Exception as e:
-        print(f"[DEBUG] Enumeration exception: {e}")
-    print(f"[DEBUG] Total enum vectors found: {len(enum_vectors)}")
-    # Always include Babai candidate
-    all_candidates = [d_cand] + [c for c in enum_vectors if c != d_cand]
+    all_candidates = [d_cand]
+    mv = _matvec(M, closest)
+    target_int = [int(x) for x in target]
+    residual_vec = [int(mv[i] - target_int[i]) for i in range(len(target_int))]
+    residual_l1 = int(sum(abs(x) for x in residual_vec))
+    residual_linf = int(max((abs(x) for x in residual_vec), default=0))
+    hnp_diag = _compute_hnp_residuals(leaks, q, bits_known, d_cand, leakage_model)
     t1 = time.time()
     reduction_metrics = {
         "matrix_dim": M.nrows,
         "runtime_sec": t1 - t0,
         "candidate_count": len(all_candidates),
+        "leakage_model": leakage_model,
         "reduction_mode": reduction_mode,
-        "bkz_blocksize": bkz_blocksize if reduction_mode == "BKZ" else None
+        "bkz_blocksize": bkz_blocksize if reduction_mode == "BKZ" else None,
+        "closest_vector": closest,
+        "target_vector": target_int,
+        "matvec_minus_target_l1": residual_l1,
+        "matvec_minus_target_linf": residual_linf,
+        "hnp_diag_summary": hnp_diag["summary"],
     }
-    return all_candidates, reduction_metrics
+    return all_candidates, reduction_metrics, hnp_diag
 def synthetic_fixture_lsb(n=8, bits_known=6, q=DEFAULT_Q):
     # Generate cryptographically correct ECDSA signatures with LSB-known nonces and known d
     from ecdsa import SECP256k1, SigningKey
@@ -416,7 +475,7 @@ def main():
     try:
         # Pass leakage_model to recover_private_key via function attribute
         recover_private_key.leakage_model = config.get("leakage_model", "LSB")
-        candidates, reduction_metrics = recover_private_key(
+        candidates, reduction_metrics, hnp_diag = recover_private_key(
             leaks,
             int(config["q"], 0) if isinstance(config["q"], str) else int(config["q"]),
             int(config["bits_known"]),
@@ -426,10 +485,47 @@ def main():
     except Exception as e:
         reduction_metrics = {"error": str(e)}
         candidates = []
+        hnp_diag = {"summary": {"count": 0}, "rows": []}
     t1 = time.time()
     reduction_metrics["runtime_total_sec"] = t1 - t0
     reduction_metrics["input_count"] = len(leaks)
     save_json(reduction_metrics, os.path.join(out_dir, "reduction_metrics.json"))
+    save_json(hnp_diag, os.path.join(out_dir, "hnp_diagnostics.json"))
+
+    # Extended diagnostics: residual ranking and synthetic ground-truth comparison.
+    diag_report = {
+        "candidate": int(candidates[0]) if candidates else None,
+        "hnp_diag_summary": hnp_diag.get("summary", {}),
+        "worst_residual_rows": _top_worst_residuals(hnp_diag.get("rows", []), top_k=8),
+    }
+    if config.get("synthetic_test") and candidates:
+        q_int = int(config["q"], 0) if isinstance(config["q"], str) else int(config["q"])
+        bits_int = int(config["bits_known"])
+        gt_diag = _compute_hnp_residuals(
+            leaks,
+            q_int,
+            bits_int,
+            int(ground_truth_d),
+            config.get("leakage_model", "LSB"),
+        )
+        cand = int(candidates[0])
+        near = _candidate_neighborhood(cand, q_int, radius=8)
+        near_scores = []
+        for x in near:
+            m = candidate_score(x, leaks, q_int, bits_int)
+            near_scores.append(
+                {"candidate": int(x), "match_ratio": float(m["match_ratio"]), "match_count": int(m["match_count"])}
+            )
+        near_scores.sort(key=lambda z: (z["match_ratio"], z["match_count"]), reverse=True)
+        diag_report["synthetic_compare"] = {
+            "ground_truth_d": int(ground_truth_d),
+            "candidate_d": cand,
+            "delta_mod_q": int((cand - int(ground_truth_d)) % q_int),
+            "candidate_diag_summary": hnp_diag.get("summary", {}),
+            "ground_truth_diag_summary": gt_diag.get("summary", {}),
+            "candidate_neighborhood_top": near_scores[:10],
+        }
+    save_json(diag_report, os.path.join(out_dir, "diagnostics_report.json"))
 
     # Synthetic test: check if ground-truth d is recovered
     if config.get("synthetic_test"):
