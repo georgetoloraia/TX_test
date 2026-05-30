@@ -56,13 +56,24 @@ def try_hnp_lll_bkz_solver(sig_path, bits_known=6, q=None, out_path="hnp_lll_bkz
     if q is None:
         q = int("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
     try:
-        candidates = hnp_solver.recover_private_key(leaks, q, bits_known)
+        result = hnp_solver.recover_private_key(leaks, q, bits_known)
     except Exception as e:
         print(f"[HNP/LLL/BKZ] Solver execution failed: {e}")
         return None
+    # recover_private_key returns (candidates, reduction_metrics, hnp_diag) in current solver.
+    if isinstance(result, tuple):
+        candidates = result[0] if len(result) > 0 else []
+    else:
+        candidates = result
+    if not isinstance(candidates, (list, tuple, set)):
+        print("[HNP/LLL/BKZ] Unexpected candidates type; skipping write.")
+        return None
     with open(out_path, "w", encoding="utf-8") as fout:
         for c in candidates:
-            fout.write(f"{c}\n")
+            try:
+                fout.write(f"{int(c)}\n")
+            except Exception:
+                continue
     print(f"[HNP/LLL/BKZ] Candidates written to {out_path}")
     return candidates
 from pathlib import Path

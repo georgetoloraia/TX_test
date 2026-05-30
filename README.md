@@ -116,7 +116,12 @@ python3 continuous_pipeline.py --start-height 1 --batch-size 100 --threads 8 --p
 ```
 
 ```
-./venv/bin/python continuous_pipeline.py --start-height "$(cat last_processed_block.txt)" --batch-size 100 --max-cycles 1 --threads 8 --python ./venv/bin/python --random-k-budget 2048
+python3 -m py_compile automate_recover.py continuous_pipeline.py
+
+export TELEGRAM_BOT_TOKEN='...'
+export TELEGRAM_CHAT_ID='...'
+
+python3 continuous_pipeline.py --start-height "$(cat last_processed_block.txt)" --batch-size 100 --max-cycles 1 --threads 8 --random-k-budget 2048
 ```
 
 ### 📁 Project Structure

@@ -261,7 +261,7 @@ def main() -> None:
                     help="Disable startup test message")
     ap.add_argument("--stop-on-found", action="store_true",
                     help="Stop pipeline when new recovered key rows appear")
-    ap.add_argument("--telegram-chat-id", default="7037604847",
+    ap.add_argument("--telegram-chat-id", default="",
                     help="Telegram chat id for alerts")
     ap.add_argument("--telegram-bot-token", default="8249251869:AAHpYzEGTDx2u25h5RjAARL5-50sld3Dgws",
                     help="Telegram bot token; if empty uses TELEGRAM_BOT_TOKEN env var")
@@ -287,9 +287,10 @@ def main() -> None:
     current_start = args.start_height
     cycle = 0
     bot_token = args.telegram_bot_token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id = args.telegram_chat_id or os.environ.get("TELEGRAM_CHAT_ID", "")
     alert_state_path = Path(args.alert_state)
 
-    if args.telegram_startup_test and bot_token:
+    if args.telegram_startup_test and bot_token and telegram_chat_id:
         startup_msg = (
             "Pipeline started.\n"
             f"start_height={args.start_height}\n"
@@ -297,8 +298,8 @@ def main() -> None:
             f"threads={args.threads}\n"
             f"utc={now_utc_iso()}"
         )
-        ok = send_telegram_message(bot_token, args.telegram_chat_id, startup_msg)
-        print(f"Telegram startup test sent={ok} chat_id={args.telegram_chat_id}")
+        ok = send_telegram_message(bot_token, telegram_chat_id, startup_msg)
+        print(f"Telegram startup test sent={ok} chat_id={telegram_chat_id}")
 
     while True:
         cycle += 1
@@ -306,7 +307,8 @@ def main() -> None:
             print("Reached max cycles, stopping.")
             break
 
-        print(f"\\n=== Cycle {cycle} | start={current_start} | batch={args.batch_size} ===")
+        cycle_start = current_start
+        print(f"\\n=== Cycle {cycle} | start={cycle_start} | batch={args.batch_size} ===")
 
         before_recovered = count_lines(Path(args.recovered))
 
@@ -314,13 +316,18 @@ def main() -> None:
             args.python,
             "download_signatures.py",
             "--mode", "deterministic",
-            "--start-height", str(current_start),
+            "--start-height", str(cycle_start),
             "--max-blocks", str(args.batch_size),
         ]
         rc = run_cmd(download_cmd)
         if rc != 0:
             raise RuntimeError(f"download_signatures.py failed with exit code {rc}")
 
+        # Reset HNP candidates file per cycle to avoid stale counts in alerts.
+        try:
+            Path("hnp_lll_bkz_candidates.txt").unlink(missing_ok=True)
+        except Exception:
+            pass
         recover_cmd = [
             args.python,
             "automate_recover.py",
@@ -376,7 +383,7 @@ def main() -> None:
                     anomaly_alert = (
                         "Critical anomaly signal.\n"
                         f"cycle={cycle}\n"
-                        f"start_height={current_start}\n"
+                        f"start_height={cycle_start}\n"
                         f"risk_score={d.get('risk_score')}\n"
                         f"risk_verdict={d.get('risk_verdict')}\n"
                         f"duplicate_r={d.get('duplicate_r')}\n"
@@ -426,34 +433,34 @@ def main() -> None:
                 print(f"[warn] failed to parse audit report: {e}")
 
         if new_rows > 0:
-            if bot_token:
+            if bot_token and telegram_chat_id:
                 new_key_lines = tail_nonempty_lines(Path(args.recovered), min(new_rows, 5))
                 key_block = "\n".join(new_key_lines) if new_key_lines else "n/a"
                 msg = (
                     "Recovered new rows.\n"
                     f"cycle={cycle}\n"
-                    f"start_height={current_start}\n"
+                    f"start_height={cycle_start}\n"
                     f"batch_size={args.batch_size}\n"
                     f"new_rows={new_rows}\n"
                     f"total_rows={after_recovered}\n"
                     "latest_recovered_rows:\n"
                     f"{key_block}"
                 )
-                ok = send_telegram_message(bot_token, args.telegram_chat_id, msg)
-                print(f"Telegram alert sent={ok} chat_id={args.telegram_chat_id}")
+                ok = send_telegram_message(bot_token, telegram_chat_id, msg)
+                print(f"Telegram alert sent={ok} chat_id={telegram_chat_id}")
             else:
-                print("[warn] new rows found but TELEGRAM_BOT_TOKEN is not set; skipping telegram alert")
+                print("[warn] new rows found but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID is not set; skipping telegram alert")
             if args.stop_on_found:
                 print("New recovered rows detected; stopping due to --stop-on-found.")
                 break
 
-        if anomaly_alert and bot_token:
+        if anomaly_alert and bot_token and telegram_chat_id:
             state = load_json(alert_state_path, default={})
             fp = anomaly_fingerprint_value or hashlib.sha256(anomaly_alert.encode("utf-8")).hexdigest()
             can_send, reason = should_send_alert(state, fp, args.alert_cooldown_minutes)
             if can_send:
-                ok = send_telegram_message(bot_token, args.telegram_chat_id, anomaly_alert)
-                print(f"Telegram anomaly alert sent={ok} chat_id={args.telegram_chat_id} reason={reason}")
+                ok = send_telegram_message(bot_token, telegram_chat_id, anomaly_alert)
+                print(f"Telegram anomaly alert sent={ok} chat_id={telegram_chat_id} reason={reason}")
                 if ok:
                     mark_alert_sent(state, fp, anomaly_alert.splitlines()[0])
                     save_json(alert_state_path, state)
@@ -464,7 +471,7 @@ def main() -> None:
             "ts_utc": now_utc_iso(),
             "day": dt.datetime.now().date().isoformat(),
             "cycle": cycle,
-            "start_height": current_start,
+            "start_height": cycle_start,
             "batch_size": args.batch_size,
             "new_recovered_rows": new_rows,
             "anomaly_detected": bool(anomaly_alert),
@@ -483,7 +490,7 @@ def main() -> None:
         summary = build_daily_summary(day_events, day_iso)
         write_daily_reports(Path(args.reports_dir), day_iso, summary, day_events)
 
-        current_start += args.batch_size
+        current_start = cycle_start + args.batch_size
 
 
 if __name__ == "__main__":
