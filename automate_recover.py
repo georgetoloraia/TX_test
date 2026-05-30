@@ -30,10 +30,14 @@ def try_hnp_lll_bkz_solver(sig_path, bits_known=6, q=None, out_path="hnp_lll_bkz
         print("[HNP/LLL/BKZ] Solver script not found.")
         return None
     # Try to import the solver as a module
-    spec = importlib.util.spec_from_file_location("hnp_lll_bkz_solver", solver_path)
-    hnp_solver = importlib.util.module_from_spec(spec)
-    _sys.modules["hnp_lll_bkz_solver"] = hnp_solver
-    spec.loader.exec_module(hnp_solver)
+    try:
+        spec = importlib.util.spec_from_file_location("hnp_lll_bkz_solver", solver_path)
+        hnp_solver = importlib.util.module_from_spec(spec)
+        _sys.modules["hnp_lll_bkz_solver"] = hnp_solver
+        spec.loader.exec_module(hnp_solver)
+    except Exception as e:
+        print(f"[HNP/LLL/BKZ] Failed to import solver: {e}")
+        return None
     leaks = []
     with open(sig_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -51,7 +55,11 @@ def try_hnp_lll_bkz_solver(sig_path, bits_known=6, q=None, out_path="hnp_lll_bkz
         return None
     if q is None:
         q = int("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
-    candidates = hnp_solver.recover_private_key(leaks, q, bits_known)
+    try:
+        candidates = hnp_solver.recover_private_key(leaks, q, bits_known)
+    except Exception as e:
+        print(f"[HNP/LLL/BKZ] Solver execution failed: {e}")
+        return None
     with open(out_path, "w", encoding="utf-8") as fout:
         for c in candidates:
             fout.write(f"{c}\n")
@@ -743,35 +751,19 @@ def main() -> None:
             f"selected={stage0_subset_info.get('selected_signatures', 0)}",
         )
 
-    # #7 kill switch: replay-like duplicate-r groups are not exploitable for key recovery.
+    # Always attempt HNP/LLL/BKZ when recovery is enabled.
+    # Replay-like duplicate-r groups are still useful to test solver integration and diagnostics.
+    hnp_input = recover_input
+    if stage0_subset_info and stage0_subset_info.get("selected_signatures", 0) > 0:
+        hnp_input = str(stage0_path)
     if stage0_subset_info and stage0_subset_info.get("duplicate_r_groups", 0) > 0:
         if int(stage0_subset_info.get("nontrivial_duplicate_r_groups", 0)) == 0:
-            print("Duplicate-r groups are replay-like only (no same-r/diff-s); recovery skipped.")
-            write_decision(args.decision_out, {
-                "should_recover": True,
-                "recover_executed": False,
-                "risk_score": risk,
-                "risk_verdict": verdict,
-                "duplicate_r": dup_r,
-                "cross_pub_duplicate_r": cross_pub_dup_r,
-                "drift_flags": drift_flags,
-                "sighash_anomaly": sighash_anomaly,
-                "signal_fusion_tier": fusion_tier,
-                "signal_fusion_confidence": fusion_conf,
-                "signal_fusion_recommendation": fusion_reco,
-                "verification_quality": vq,
-                "low_quality_data": low_quality_data,
-                "effective_cluster_risk_threshold": effective_cluster_threshold,
-                "recover_input": None,
-                "cluster_gating_used": not args.disable_cluster_gating,
-                "recover_stages": [],
-                "stage0_subset": stage0_subset_info,
-                "skip_reason": "duplicate_r_replay_like_no_nontrivial_pairs",
-            })
-            return
-        # If there are nontrivial duplicate-r groups, try HNP/LLL/BKZ solver
-        print("[HNP/LLL/BKZ] Attempting key recovery from nontrivial duplicate-r group subset...")
-        try_hnp_lll_bkz_solver(str(stage0_path), bits_known=6, q=None, out_path="hnp_lll_bkz_candidates.txt")
+            print("Duplicate-r groups are replay-like only (no same-r/diff-s); continuing with HNP + staged recovery.")
+        else:
+            print("[HNP/LLL/BKZ] Attempting key recovery from nontrivial duplicate-r group subset...")
+    else:
+        print("[HNP/LLL/BKZ] Attempting key recovery from selected recovery input...")
+    try_hnp_lll_bkz_solver(hnp_input, bits_known=6, q=None, out_path="hnp_lll_bkz_candidates.txt")
 
     # Multi-stage recovery:
     # stage1: primary/cheap scan (disable LCG + no random-k)

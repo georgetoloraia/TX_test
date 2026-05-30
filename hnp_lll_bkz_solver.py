@@ -88,56 +88,41 @@ def strict_parse_leaks(leaks, q, bits_known):
 # --- Mathematically correct HNP lattice for LSB leakage ---
 def build_hnp_lattice(leaks, q, bits_known, leakage_model="LSB"):
     """
-    Construct the standard HNP lattice for LSB-known ECDSA nonces (Nguyen-Regev style).
-    Each signature gives: u_i * d + B * x_i ≡ t_i mod q
-    where:
-        u_i = -r_i * s_i^{-1} mod q
-        t_i = (m_i * s_i^{-1} - known_i) mod q
-        B = 2^{bits_known}
-    Returns IntegerMatrix (n+1)x(n+1), target vector (for CVP/Babai)
+    Build HNP lattice and target vector for CVP-style decoding.
+    Returns: (M, target) where M is IntegerMatrix (n+1)x(n+1), target is tuple[int].
     """
-    # Nguyen-Regev HNP lattice: Each row encodes u_i * d + B * x_i = t_i (mod q)
     from fpylll import IntegerMatrix
     n = len(leaks)
-    B = 1 << bits_known
-    M = IntegerMatrix(n + 1, n + 1)
-    for i, (r, s, m, known_nonce) in enumerate(leaks):
-        s_inv = pow(s, -1, q)
-        if leakage_model == "LSB":
-            u = (-r * s_inv) % q
-            t = (m * s_inv - known_nonce) % q
-            B_row = B
-        elif leakage_model == "MSB":
-            u = (-r * s_inv) % q
-            klen = q.bit_length()
-            shift = klen - bits_known
-            t = (m * s_inv - (known_nonce << shift)) % q
-            B_row = B << shift
-        else:
-            raise ValueError(f"Unknown leakage_model: {leakage_model}")
-        # Fill row: [0,...,B_row,...,u]
+    B = 1 << int(bits_known)
+    def make_matrix(scale=1, target_last=0):
+        M = IntegerMatrix(n + 1, n + 1)
+        target = []
+        for i, (r, s, m, known_nonce) in enumerate(leaks):
+            s_inv = pow(int(s), -1, int(q))
+            if leakage_model == "LSB":
+                u = (-int(r) * s_inv) % int(q)
+                t = (int(m) * s_inv - int(known_nonce)) % int(q)
+                B_row = B * scale
+            elif leakage_model == "MSB":
+                klen = int(q).bit_length()
+                shift = klen - int(bits_known)
+                u = (-int(r) * s_inv) % int(q)
+                t = (int(m) * s_inv - (int(known_nonce) << shift)) % int(q)
+                B_row = (B << shift) * scale
+            else:
+                raise ValueError(f"Unknown leakage_model: {leakage_model}")
+            for j in range(n + 1):
+                M[i, j] = 0
+            M[i, i] = int(B_row)
+            M[i, n] = int(u)
+            target.append(int(t) * scale)
         for j in range(n + 1):
-            M[i, j] = 0
-        M[i, i] = B_row
-        M[i, n] = u
-    # Last row: [0,...,0,q]
-    for j in range(n + 1):
-        M[n, j] = 0
-    M[n, n] = q
-    # Target vector: [t_1, ..., t_n, 0]
-    target = [0] * (n + 1)
-    for i, (r, s, m, known_nonce) in enumerate(leaks):
-        s_inv = pow(s, -1, q)
-        if leakage_model == "LSB":
-            t = (m * s_inv - known_nonce) % q
-        elif leakage_model == "MSB":
-            klen = q.bit_length()
-            shift = klen - bits_known
-            t = (m * s_inv - (known_nonce << shift)) % q
-        target[i] = t
-    # Last coordinate is 0
-    target = tuple(int(x) for x in target)
-    return M, target
+            M[n, j] = 0
+        M[n, n] = int(q) * scale
+        target.append(int(target_last))
+        return M, tuple(int(x) for x in target)
+    return make_matrix
+
 
 def _closest_vector_cvp(M, target):
     """
@@ -146,11 +131,25 @@ def _closest_vector_cvp(M, target):
     from fpylll import CVP
     target_vec = tuple(int(x) for x in target)
     try:
-        # Newer/commonly documented API
+        # Exact/enum-based CVP (can fail on builds with small max enum dimension).
         return CVP.closest_vector(M, target_vec)
     except Exception:
-        # Older API style
-        return CVP(M).closest_vector(target_vec)
+        # Deterministic Babai fallback works for high dimensions and older/newer APIs.
+        return CVP.babai(M, target_vec)
+
+
+def _log_lattice_inputs(leaks, q, bits_known, leakage_model, limit=5):
+    print(f"[ALGO] leakage_model={leakage_model} q_bits={int(q).bit_length()} bits_known={int(bits_known)} n={len(leaks)}")
+    for i, (r, s, m, known_nonce) in enumerate(leaks[:limit]):
+        s_inv = pow(int(s), -1, int(q))
+        if leakage_model == "LSB":
+            u = (-int(r) * s_inv) % int(q)
+            t = (int(m) * s_inv - int(known_nonce)) % int(q)
+        else:
+            shift = int(q).bit_length() - int(bits_known)
+            u = (-int(r) * s_inv) % int(q)
+            t = (int(m) * s_inv - (int(known_nonce) << shift)) % int(q)
+        print(f"[ALGO] row={i} u={u} t={t} r={int(r)} s={int(s)} known={int(known_nonce)}")
 
 
 def _matvec(M, vec):
@@ -236,70 +235,122 @@ def recover_private_key(leaks, q, bits_known, reduction_mode="LLL", bkz_blocksiz
     if not HAVE_FPYLLL:
         raise RuntimeError("fpylll is required for recovery (pip install fpylll).")
     leakage_model = recover_private_key.leakage_model if hasattr(recover_private_key, "leakage_model") else "LSB"
-    M, target = build_hnp_lattice(leaks, q, bits_known, leakage_model=leakage_model)
-    t0 = time.time()
-    if reduction_mode == "LLL":
-        LLL.reduction(M)
-    elif reduction_mode == "BKZ":
-        BKZ.reduction(M, BKZ.Param(bkz_blocksize))
-    else:
-        raise ValueError(f"Unknown reduction_mode: {reduction_mode}")
-    # Babai's nearest plane (CVP) - main candidate
-    closest = _closest_vector_cvp(M, target)
-    closest = [int(v) for v in closest]
-    # Babai vector: [x_1, ..., x_n, d_var] (d_var არ არის d!)
-    # აღვადგინოთ d ყველა row-დან: d_i = (t_i - B * x_i) * u_i^{-1} mod q
-    d_candidates = []
-    for i, (r, s, m, known_nonce) in enumerate(leaks):
-        s_inv = pow(int(s), -1, int(q))
-        if leakage_model == "LSB":
-            u = (-int(r) * s_inv) % int(q)
-            t = (int(m) * s_inv - int(known_nonce)) % int(q)
-            B_row = 1 << int(bits_known)
-        else:
-            klen = int(q).bit_length()
-            shift = klen - int(bits_known)
-            u = (-int(r) * s_inv) % int(q)
-            t = (int(m) * s_inv - (int(known_nonce) << shift)) % int(q)
-            B_row = (1 << int(bits_known)) << shift
-        x_i = closest[i]
-        try:
-            u_inv = pow(u, -1, int(q))
-            d_i = ((t - B_row * x_i) * u_inv) % int(q)
-            d_candidates.append(d_i)
-        except Exception:
-            continue
-    # ავარჩიოთ ყველაზე ხშირად გამეორებული d
-    from collections import Counter
-    if d_candidates:
-        d_counter = Counter(d_candidates)
-        d_cand, count = d_counter.most_common(1)[0]
-    else:
-        d_cand = int(closest[-1]) % q  # fallback
-    print(f"[DEBUG] d_candidates: {d_candidates}")
-    print(f"[DEBUG] selected d_cand: {d_cand}")
-    all_candidates = [d_cand]
-    mv = _matvec(M, closest)
-    target_int = [int(x) for x in target]
-    residual_vec = [int(mv[i] - target_int[i]) for i in range(len(target_int))]
-    residual_l1 = int(sum(abs(x) for x in residual_vec))
-    residual_linf = int(max((abs(x) for x in residual_vec), default=0))
-    hnp_diag = _compute_hnp_residuals(leaks, q, bits_known, d_cand, leakage_model)
-    t1 = time.time()
-    reduction_metrics = {
-        "matrix_dim": M.nrows,
-        "runtime_sec": t1 - t0,
-        "candidate_count": len(all_candidates),
-        "leakage_model": leakage_model,
-        "reduction_mode": reduction_mode,
-        "bkz_blocksize": bkz_blocksize if reduction_mode == "BKZ" else None,
-        "closest_vector": closest,
-        "target_vector": target_int,
-        "matvec_minus_target_l1": residual_l1,
-        "matvec_minus_target_linf": residual_linf,
-        "hnp_diag_summary": hnp_diag["summary"],
-    }
-    return all_candidates, reduction_metrics, hnp_diag
+    debug_algo = bool(getattr(recover_private_key, "debug_algo", False))
+    if debug_algo:
+        _log_lattice_inputs(leaks, q, bits_known, leakage_model, limit=5)
+    make_matrix = build_hnp_lattice(leaks, q, bits_known, leakage_model=leakage_model)
+    scaling_factors = [1, 2, 0.5]
+    target_last_options = [0, int(q)//2, -int(q)//2]
+    all_candidates = set()
+    reduction_metrics = None
+    hnp_diag = None
+    debug_scaling = []
+    for scale in scaling_factors:
+        # Only integer scaling
+        if scale < 1:
+            if (1 << int(bits_known)) % int(1/scale) != 0:
+                continue
+        scale_int = int(scale) if scale >= 1 else int(1/scale)
+        for target_last in target_last_options:
+            M, target = make_matrix(scale=scale_int, target_last=target_last)
+            t0 = time.time()
+            if reduction_mode == "LLL":
+                LLL.reduction(M)
+            elif reduction_mode == "BKZ":
+                BKZ.reduction(M, BKZ.Param(bkz_blocksize))
+            else:
+                raise ValueError(f"Unknown reduction_mode: {reduction_mode}")
+            closest = _closest_vector_cvp(M, target)
+            closest = [int(v) for v in closest]
+            n = len(leaks)
+            d_candidates = set()
+            # Babai solution
+            if debug_algo:
+                print(f"[DIAG] scale={scale} target_last={target_last}")
+                print(f"[DIAG] lattice M (first 4 rows):")
+                for row_idx in range(min(4, M.nrows)):
+                    print(f"  {row_idx}: {[int(M[row_idx, j]) for j in range(M.ncols)]}")
+                print(f"[DIAG] target: {list(target)}")
+                print(f"[DIAG] closest_vector: {closest}")
+            for i, (r, s, m, known_nonce) in enumerate(leaks):
+                s_inv = pow(int(s), -1, int(q))
+                if leakage_model == "LSB":
+                    u = (-int(r) * s_inv) % int(q)
+                    t_i = (int(m) * s_inv - int(known_nonce)) % int(q)
+                    B_i = (1 << int(bits_known)) * scale_int
+                else:
+                    klen = int(q).bit_length()
+                    shift = klen - int(bits_known)
+                    u = (-int(r) * s_inv) % int(q)
+                    t_i = (int(m) * s_inv - (int(known_nonce) << shift)) % int(q)
+                    B_i = ((1 << int(bits_known)) << shift) * scale_int
+                x_i = closest[i]
+                try:
+                    u_inv = pow(u, -1, int(q))
+                except ValueError:
+                    if debug_algo:
+                        print(f"[DIAG] row={i} u={u} not invertible mod q")
+                    continue  # skip if u not invertible
+                d_i = ((t_i - B_i * x_i) * u_inv) % int(q)
+                d_candidates.add(d_i)
+                if debug_algo:
+                    print(f"[DIAG] row={i} x_i={x_i} t_i={t_i} u={u} B_i={B_i} u_inv={u_inv} d_i={d_i}")
+            # Basis row candidates (first 4 rows)
+            for row_idx in range(min(4, M.nrows)):
+                basis_vec = [int(M[row_idx, j]) for j in range(M.ncols)]
+                for i, (r, s, m, known_nonce) in enumerate(leaks):
+                    s_inv = pow(int(s), -1, int(q))
+                    if leakage_model == "LSB":
+                        u = (-int(r) * s_inv) % int(q)
+                        t_i = (int(m) * s_inv - int(known_nonce)) % int(q)
+                        B_i = (1 << int(bits_known)) * scale_int
+                    else:
+                        klen = int(q).bit_length()
+                        shift = klen - int(bits_known)
+                        u = (-int(r) * s_inv) % int(q)
+                        t_i = (int(m) * s_inv - (int(known_nonce) << shift)) % int(q)
+                        B_i = ((1 << int(bits_known)) << shift) * scale_int
+                    x_i = basis_vec[i]
+                    try:
+                        u_inv = pow(u, -1, int(q))
+                    except ValueError:
+                        continue
+                    d_i = ((t_i - B_i * x_i) * u_inv) % int(q)
+                    d_candidates.add(d_i)
+            all_candidates.update(d_candidates)
+            if debug_algo:
+                debug_scaling.append({
+                    "scale": scale,
+                    "target_last": target_last,
+                    "closest_vector": closest,
+                    "d_candidates": list(d_candidates)
+                })
+            # For diagnostics, use the first scale/target_last
+            if reduction_metrics is None:
+                d_cand = list(d_candidates)[0] if d_candidates else 0
+                mv = _matvec(M, closest)
+                target_int = [int(x) for x in target]
+                residual_vec = [int(mv[i] - target_int[i]) for i in range(len(target_int))]
+                residual_l1 = int(sum(abs(x) for x in residual_vec))
+                residual_linf = int(max((abs(x) for x in residual_vec), default=0))
+                hnp_diag = _compute_hnp_residuals(leaks, q, bits_known, d_cand, leakage_model)
+                t1 = time.time()
+                reduction_metrics = {
+                    "matrix_dim": M.nrows,
+                    "runtime_sec": t1 - t0,
+                    "candidate_count": len(d_candidates),
+                    "leakage_model": leakage_model,
+                    "reduction_mode": reduction_mode,
+                    "bkz_blocksize": bkz_blocksize if reduction_mode == "BKZ" else None,
+                    "closest_vector": closest,
+                    "target_vector": target_int,
+                    "matvec_minus_target_l1": residual_l1,
+                    "matvec_minus_target_linf": residual_linf,
+                    "hnp_diag_summary": hnp_diag["summary"],
+                }
+    if debug_algo:
+        print(f"[ALGO] scaling/target/basis sweep debug: {debug_scaling}")
+    return list(all_candidates), reduction_metrics, hnp_diag
 def synthetic_fixture_lsb(n=8, bits_known=6, q=DEFAULT_Q):
     # Generate cryptographically correct ECDSA signatures with LSB-known nonces and known d
     from ecdsa import SECP256k1, SigningKey
@@ -426,6 +477,7 @@ def main():
     parser.add_argument("--reduction-mode", type=str, default="LLL", choices=["LLL", "BKZ"], help="Lattice reduction mode")
     parser.add_argument("--bkz-blocksize", type=int, default=10, help="BKZ block size (if using BKZ)")
     parser.add_argument("--synthetic-test", action="store_true", help="Run synthetic regression test (CI mode)")
+    parser.add_argument("--debug-algo", action="store_true", help="Verbose algorithm-correctness logs")
     args = parser.parse_args()
 
     # Config merge
@@ -513,6 +565,7 @@ def main():
     try:
         # Pass leakage_model to recover_private_key via function attribute
         recover_private_key.leakage_model = config.get("leakage_model", "LSB")
+        recover_private_key.debug_algo = bool(config.get("debug_algo", False))
         candidates, reduction_metrics, hnp_diag = recover_private_key(
             leaks,
             int(config["q"], 0) if isinstance(config["q"], str) else int(config["q"]),
@@ -568,6 +621,14 @@ def main():
     # Synthetic test: check if ground-truth d is recovered
     if config.get("synthetic_test"):
         found = any(abs(c - ground_truth_d) % int(config["q"], 0) == 0 for c in candidates)
+        if config.get("debug_algo"):
+            q_int = int(config["q"], 0) if isinstance(config["q"], str) else int(config["q"])
+            print(f"[ALGO] ground_truth_d={ground_truth_d}")
+            print(f"[ALGO] candidates={candidates}")
+            for c in candidates[:10]:
+                delta = (int(c) - int(ground_truth_d)) % q_int
+                m = candidate_score(c, leaks, q_int, int(config["bits_known"]))
+                print(f"[ALGO] cand={c} delta_mod_q={delta} match_ratio={m['match_ratio']:.6f} match={m['match_count']}/{len(leaks)}")
         with open(os.path.join(out_dir, "bench_results.json"), "w", encoding="utf-8") as f:
             json.dump({"ground_truth_d": ground_truth_d, "found": found, "candidates": candidates}, f, indent=2)
         print(f"[SYNTHETIC] Success: {found}")

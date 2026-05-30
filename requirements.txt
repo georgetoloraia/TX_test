@@ -1,4 +1,4 @@
-cysignals==1.12.6
+cysignals==1.12.5
 ecdsa==0.19.2
 fpylll==0.6.4
 numpy==2.4.6
