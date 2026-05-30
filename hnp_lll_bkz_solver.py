@@ -239,7 +239,37 @@ def recover_private_key(leaks, q, bits_known, reduction_mode="LLL", bkz_blocksiz
     # Babai's nearest plane (CVP) - main candidate
     closest = _closest_vector_cvp(M, target)
     closest = [int(v) for v in closest]
-    d_cand = int(closest[-1]) % q
+    # --- Correct Babai/CVP decoding: recover d from each row ---
+    d_candidates = []
+    for i, (r, s, m, known_nonce) in enumerate(leaks):
+        s_inv = pow(int(s), -1, int(q))
+        if leakage_model == "LSB":
+            u = (-int(r) * s_inv) % int(q)
+            t = (int(m) * s_inv - int(known_nonce)) % int(q)
+            B_row = 1 << int(bits_known)
+        else:
+            klen = int(q).bit_length()
+            shift = klen - int(bits_known)
+            u = (-int(r) * s_inv) % int(q)
+            t = (int(m) * s_inv - (int(known_nonce) << shift)) % int(q)
+            B_row = (1 << int(bits_known)) << shift
+        x_i = int(round((closest[i] - 0) / B_row))  # lattice x_i coordinate
+        # Recover d: d_i = (t - B_row * x_i) * u^{-1} mod q
+        try:
+            u_inv = pow(u, -1, int(q))
+            d_i = ((t - B_row * x_i) * u_inv) % int(q)
+            d_candidates.append(d_i)
+        except Exception:
+            continue
+    # ავარჩიოთ ყველაზე ხშირად გამეორებული d
+    from collections import Counter
+    if d_candidates:
+        d_counter = Counter(d_candidates)
+        d_cand, count = d_counter.most_common(1)[0]
+    else:
+        d_cand = int(closest[-1]) % q  # fallback
+    print(f"[DEBUG] d_candidates: {d_candidates}")
+    print(f"[DEBUG] selected d_cand: {d_cand}")
     all_candidates = [d_cand]
     mv = _matvec(M, closest)
     target_int = [int(x) for x in target]
