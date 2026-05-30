@@ -115,6 +115,10 @@ venv/bin/python continuous_pipeline.py --start-height 1 --batch-size 100 --threa
 python3 continuous_pipeline.py --start-height 1 --batch-size 100 --threads 8 --python .venv/bin/python --random-k-budget 2048
 ```
 
+```
+./venv/bin/python continuous_pipeline.py --start-height "$(cat last_processed_block.txt)" --batch-size 100 --max-cycles 1 --threads 8 --python ./venv/bin/python --random-k-budget 2048
+```
+
 ### 📁 Project Structure
 ```txt
 TX_test/
