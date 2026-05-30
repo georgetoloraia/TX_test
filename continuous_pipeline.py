@@ -100,12 +100,20 @@ def now_utc_iso() -> str:
 
 def anomaly_fingerprint(decision: dict) -> str:
     core = {
+        "risk_score": int(decision.get("risk_score", 0) or 0),
         "risk_verdict": decision.get("risk_verdict"),
+        "duplicate_r": int(decision.get("duplicate_r", 0) or 0),
         "cross_pub_duplicate_r": int(decision.get("cross_pub_duplicate_r", 0)),
         "drift_flags": int(decision.get("drift_flags", 0)),
         "sighash_anomaly": bool(decision.get("sighash_anomaly", False)),
+        "signal_fusion_tier": decision.get("signal_fusion_tier"),
+        "signal_fusion_confidence": round(float(decision.get("signal_fusion_confidence", 0.0) or 0.0), 3),
+        "recover_input": decision.get("recover_input"),
         "should_recover": bool(decision.get("should_recover", False)),
     }
+    stage0 = decision.get("stage0_subset", {}) or {}
+    core["stage0_selected_signatures"] = int(stage0.get("selected_signatures", 0) or 0)
+    core["stage0_nontrivial_groups"] = int(stage0.get("nontrivial_duplicate_r_groups", 0) or 0)
     raw = json.dumps(core, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 

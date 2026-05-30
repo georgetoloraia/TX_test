@@ -20,7 +20,41 @@ from collections import Counter, defaultdict
 import importlib.util
 import sys as _sys
 import os
-def try_hnp_lll_bkz_solver(sig_path, bits_known=6, q=None, out_path="hnp_lll_bkz_candidates.txt"):
+import multiprocessing as mp
+
+
+def _hnp_worker(leaks, q, bits_known, solver_path, qout):
+    try:
+        spec = importlib.util.spec_from_file_location("hnp_lll_bkz_solver_worker", solver_path)
+        hnp_solver = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hnp_solver)
+        result = hnp_solver.recover_private_key(leaks, q, bits_known)
+        if isinstance(result, tuple):
+            candidates = result[0] if len(result) > 0 else []
+        else:
+            candidates = result
+        if not isinstance(candidates, (list, tuple, set)):
+            qout.put(("error", "unexpected_candidates_type"))
+            return
+        clean = []
+        for c in candidates:
+            try:
+                clean.append(int(c))
+            except Exception:
+                continue
+        qout.put(("ok", clean))
+    except Exception as e:
+        qout.put(("error", str(e)))
+
+
+def try_hnp_lll_bkz_solver(
+    sig_path,
+    bits_known=6,
+    q=None,
+    out_path="hnp_lll_bkz_candidates.txt",
+    timeout_sec=120,
+    min_leaks=8,
+):
     """
     Try to run the HNP/LLL/BKZ solver on a set of signatures with partial nonce leaks.
     Expects sig_path to be a JSONL file with fields r, s, z, and known_nonce_bits (if available).
@@ -29,51 +63,64 @@ def try_hnp_lll_bkz_solver(sig_path, bits_known=6, q=None, out_path="hnp_lll_bkz
     if not os.path.exists(solver_path):
         print("[HNP/LLL/BKZ] Solver script not found.")
         return None
-    # Try to import the solver as a module
-    try:
-        spec = importlib.util.spec_from_file_location("hnp_lll_bkz_solver", solver_path)
-        hnp_solver = importlib.util.module_from_spec(spec)
-        _sys.modules["hnp_lll_bkz_solver"] = hnp_solver
-        spec.loader.exec_module(hnp_solver)
-    except Exception as e:
-        print(f"[HNP/LLL/BKZ] Failed to import solver: {e}")
-        return None
     leaks = []
+    total_rows = 0
+    rows_with_known_nonce_bits = 0
     with open(sig_path, "r", encoding="utf-8") as f:
         for line in f:
+            total_rows += 1
             try:
                 obj = json.loads(line.strip())
+                if "known_nonce_bits" not in obj:
+                    continue
                 r = parse_int(obj.get("r"))
                 s = parse_int(obj.get("s"))
                 m = parse_int(obj.get("z"))
-                known_nonce = obj.get("known_nonce_bits", 0)
+                known_nonce = parse_int(obj.get("known_nonce_bits"))
                 leaks.append((r, s, m, known_nonce))
+                rows_with_known_nonce_bits += 1
             except Exception:
                 continue
     if not leaks:
-        print("[HNP/LLL/BKZ] No valid leaks found in input.")
+        print(
+            "[HNP/LLL/BKZ] Skipping: no valid rows with explicit known_nonce_bits "
+            f"(rows={total_rows}, with_known_nonce_bits={rows_with_known_nonce_bits})."
+        )
+        return None
+    if len(leaks) < int(min_leaks):
+        print(
+            "[HNP/LLL/BKZ] Skipping: insufficient leakage samples "
+            f"(valid_leaks={len(leaks)} < min_leaks={int(min_leaks)})."
+        )
         return None
     if q is None:
         q = int("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
-    try:
-        result = hnp_solver.recover_private_key(leaks, q, bits_known)
-    except Exception as e:
-        print(f"[HNP/LLL/BKZ] Solver execution failed: {e}")
+
+    qout: mp.Queue = mp.Queue()
+    proc = mp.get_context("spawn").Process(
+        target=_hnp_worker, args=(leaks, int(q), int(bits_known), solver_path, qout)
+    )
+    proc.start()
+    proc.join(timeout=float(timeout_sec))
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(5)
+        print(f"[HNP/LLL/BKZ] Solver timeout after {timeout_sec}s; continuing pipeline.")
         return None
-    # recover_private_key returns (candidates, reduction_metrics, hnp_diag) in current solver.
-    if isinstance(result, tuple):
-        candidates = result[0] if len(result) > 0 else []
-    else:
-        candidates = result
-    if not isinstance(candidates, (list, tuple, set)):
-        print("[HNP/LLL/BKZ] Unexpected candidates type; skipping write.")
+    if proc.exitcode not in (0, None):
+        print(f"[HNP/LLL/BKZ] Solver process failed (exit={proc.exitcode}); continuing pipeline.")
         return None
+    if qout.empty():
+        print("[HNP/LLL/BKZ] Solver returned no result; continuing pipeline.")
+        return None
+    status, payload = qout.get()
+    if status != "ok":
+        print(f"[HNP/LLL/BKZ] Solver execution failed: {payload}")
+        return None
+    candidates = payload
     with open(out_path, "w", encoding="utf-8") as fout:
         for c in candidates:
-            try:
-                fout.write(f"{int(c)}\n")
-            except Exception:
-                continue
+            fout.write(f"{c}\n")
     print(f"[HNP/LLL/BKZ] Candidates written to {out_path}")
     return candidates
 from pathlib import Path
@@ -555,6 +602,10 @@ def main() -> None:
                     help="Disable advanced recovery escalation")
     ap.add_argument("--random-k-budget", type=int, default=0,
                     help="Random-k tries per bucket for final escalation stage (0 disables random-k stage)")
+    ap.add_argument("--hnp-timeout-sec", type=int, default=120,
+                    help="Timeout in seconds for HNP/LLL/BKZ solver subprocess")
+    ap.add_argument("--hnp-min-leaks", type=int, default=8,
+                    help="Minimum rows with explicit known_nonce_bits required to run HNP solver")
     ap.add_argument("--max-invalid-ratio", type=float, default=0.35,
                     help="If verification invalid_ratio exceeds this (and enough verifiable rows), treat dataset as low-quality")
     ap.add_argument("--min-verifiable-for-gate", type=int, default=200,
@@ -774,7 +825,14 @@ def main() -> None:
             print("[HNP/LLL/BKZ] Attempting key recovery from nontrivial duplicate-r group subset...")
     else:
         print("[HNP/LLL/BKZ] Attempting key recovery from selected recovery input...")
-    try_hnp_lll_bkz_solver(hnp_input, bits_known=6, q=None, out_path="hnp_lll_bkz_candidates.txt")
+    try_hnp_lll_bkz_solver(
+        hnp_input,
+        bits_known=6,
+        q=None,
+        out_path="hnp_lll_bkz_candidates.txt",
+        timeout_sec=args.hnp_timeout_sec,
+        min_leaks=args.hnp_min_leaks,
+    )
 
     # Multi-stage recovery:
     # stage1: primary/cheap scan (disable LCG + no random-k)
