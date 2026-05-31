@@ -341,7 +341,7 @@ static void pass0_bucketize_and_dedup(const string& sigs, const string& tmpdir,
         size_t kept=0; string line;
         while(getline(in,line)){
             Row rw; if(!parse_row(line,rw)) continue;
-            string key = rw.txid + "|" + to_string(rw.vin) + "|" + rw.pub + "|" + rw.r_hex + "|" + rw.s_hex;
+            string key = rw.txid + "|" + to_string(rw.vin) + "|" + rw.pub + "|" + rw.r_hex + "|" + rw.s_hex + "|" + rw.z_hex;
             if(seen.insert(key).second){ out<<line<<"\n"; kept++; }
         }
         out.close(); in.close();
@@ -1234,14 +1234,14 @@ int main(int argc, char** argv){
     build_delta_schedules(A, gradient, step_sched);
 
     atomic<size_t> bi{0};
-    size_t total_pairs_tested=0, total_dupR=0, total_delta=0, total_lcg=0;
+    size_t total_pairs_tested=0, total_dupR=0, total_delta=0, total_delta_nopub=0, total_lcg=0;
     mutex dirty_m, stat_m;
     unordered_set<string> dirty_buckets;
 
     auto process_one_bucket = [&](int){
         Ctx C;
         Secp Slocal;
-        size_t pairs_tested=0, f_dup=0, f_delta=0, f_lcg=0;
+        size_t pairs_tested=0, f_dup=0, f_delta=0, f_delta_nopub=0, f_lcg=0;
 
         for(;;){
             size_t i = bi.fetch_add(1);
@@ -1253,6 +1253,19 @@ int main(int argc, char** argv){
 
             f_dup   = try_primary_dupR(C, Slocal, rows, store, A.out_json, A.out_txt, A.out_k, pairs_tested);
             f_delta = delta_scan_bucket(C, Slocal, rows, gradient, step_sched, false, A.dg_per_pair_cap, store, A.out_json, A.out_txt, A.out_deltas, pairs_tested);
+            // Fallback path for buckets containing signatures without pubkey field.
+            // This avoids losing potentially useful relations in script forms where pub is absent.
+            bool has_empty_pub = false;
+            for(const auto& rw : rows){
+                if(rw.pub.empty()){ has_empty_pub = true; break; }
+            }
+            if(has_empty_pub){
+                int nopub_cap = max(128, A.dg_per_pair_cap / 2);
+                f_delta_nopub = delta_scan_bucket(C, Slocal, rows, gradient, step_sched, true, nopub_cap,
+                                                  store, A.out_json, A.out_txt, A.out_deltas, pairs_tested);
+            } else {
+                f_delta_nopub = 0;
+            }
 
             // optional LCG (same-pub pairs)
             if(A.lcg_enable && (A.lcg_a_max>0 || A.lcg_b_max>0)){
@@ -1260,7 +1273,7 @@ int main(int argc, char** argv){
                                         store, A.out_json, A.out_txt, A.out_deltas, pairs_tested);
             } else f_lcg = 0;
 
-            if(f_dup+f_delta+f_lcg>0){
+            if(f_dup+f_delta+f_delta_nopub+f_lcg>0){
                 lock_guard<mutex> lk(dirty_m);
                 dirty_buckets.insert(path);
             }
@@ -1269,10 +1282,11 @@ int main(int argc, char** argv){
                 total_pairs_tested += pairs_tested;
                 total_dupR += f_dup;
                 total_delta += f_delta;
+                total_delta_nopub += f_delta_nopub;
                 total_lcg += f_lcg;
             }
             cerr<<"[bucket "<<fs::path(path).filename().string()<<"] rows="<<rows.size()
-                <<" dupR="<<f_dup<<" delta="<<f_delta<<" lcg="<<f_lcg
+                <<" dupR="<<f_dup<<" delta="<<f_delta<<" delta_nopub="<<f_delta_nopub<<" lcg="<<f_lcg
                 <<" pairs_tested="<<pairs_tested<<"\n";
             pairs_tested=0; // reset local count for the next bucket
         }
@@ -1340,6 +1354,7 @@ int main(int argc, char** argv){
 
     cerr<<"[stats] dupR_hits="<<total_dupR
         <<" delta_hits="<<total_delta
+        <<" delta_nopub_hits="<<total_delta_nopub
         <<" lcg_hits="<<total_lcg
         <<" pairs_tested="<<total_pairs_tested<<"\n";
     cerr<<"Done.\n";

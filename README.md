@@ -77,6 +77,8 @@ python download_signatures.py
 g++ -O3 -march=native -std=c++17 ecdsa_recover_strict.cpp -o ecdsa_recover_strict \
     -lsecp256k1 -lcrypto -lpthread -lboost_system
 
+g++ -O3 -march=native -flto -fexceptions -pthread -std=c++17 ecdsa_recover_strict.cpp -o ecdsa_recover_strict -lsecp256k1 -lcrypto -lpthread -Wno-deprecated-declarations
+
 # 3. Run analysis
 ./ecdsa_recover_strict --sigs signatures.jsonl --threads 8 --out-json recovered.jsonl
 ```

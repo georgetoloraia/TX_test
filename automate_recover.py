@@ -802,9 +802,9 @@ def main() -> None:
         if cluster_report["selected_signatures"] > 0:
             recover_input = args.clustered_sigs_out
 
-    # Stage0: deterministic duplicate-r focus subset overrides cluster filtering if non-empty.
+    # Stage0 duplicate-r focus should not blindly override broader cluster-selected input.
+    # Only use it as primary recover input when there is nontrivial duplicate-r structure.
     if stage0_subset_info and stage0_subset_info.get("selected_signatures", 0) > 0:
-        recover_input = str(stage0_path)
         print(
             "Stage0 duplicate-r focus:",
             f"groups={stage0_subset_info.get('duplicate_r_groups', 0)}",
@@ -812,11 +812,20 @@ def main() -> None:
             f"same_r_diff_s={stage0_subset_info.get('same_r_diff_s_groups', 0)}",
             f"selected={stage0_subset_info.get('selected_signatures', 0)}",
         )
+        if int(stage0_subset_info.get("nontrivial_duplicate_r_groups", 0)) > 0:
+            recover_input = str(stage0_path)
+            print("Stage0 selected as primary recover input (nontrivial duplicate-r present).")
+        else:
+            print("Stage0 is replay-like only; keeping broader recover_input for stage1.")
 
     # Always attempt HNP/LLL/BKZ when recovery is enabled.
     # Replay-like duplicate-r groups are still useful to test solver integration and diagnostics.
     hnp_input = recover_input
-    if stage0_subset_info and stage0_subset_info.get("selected_signatures", 0) > 0:
+    if (
+        stage0_subset_info
+        and stage0_subset_info.get("selected_signatures", 0) > 0
+        and int(stage0_subset_info.get("nontrivial_duplicate_r_groups", 0)) > 0
+    ):
         hnp_input = str(stage0_path)
     if stage0_subset_info and stage0_subset_info.get("duplicate_r_groups", 0) > 0:
         if int(stage0_subset_info.get("nontrivial_duplicate_r_groups", 0)) == 0:
