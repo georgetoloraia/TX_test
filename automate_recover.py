@@ -464,6 +464,7 @@ def verification_quality(report: dict[str, Any]) -> dict[str, Any]:
     verifiable = int(vg.get("verifiable", 0) or 0)
     invalid = int(vg.get("invalid", 0) or 0)
     valid = int(vg.get("valid", 0) or 0)
+    dropped = int(vg.get("dropped", 0) or 0)
     invalid_ratio = (invalid / verifiable) if verifiable > 0 else 0.0
     return {
         "enabled": enabled,
@@ -471,6 +472,7 @@ def verification_quality(report: dict[str, Any]) -> dict[str, Any]:
         "verifiable": verifiable,
         "valid": valid,
         "invalid": invalid,
+        "dropped": dropped,
         "invalid_ratio": invalid_ratio,
         "reason_counts": vg.get("reason_counts", {}) or {},
     }
@@ -669,6 +671,7 @@ def main() -> None:
         vq["enabled"]
         and vq["coincurve_available"]
         and vq["verifiable"] >= args.min_verifiable_for_gate
+        and int(vq.get("dropped", 0) or 0) > 0
         and vq["invalid_ratio"] > args.max_invalid_ratio
     )
 

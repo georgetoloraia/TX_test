@@ -221,7 +221,11 @@ def rolling_feature(values: list[float], window: int, fn) -> list[float]:
     return out
 
 
-def verification_gate(sigs: list[dict[str, Any]], enabled: bool) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def verification_gate(
+    sigs: list[dict[str, Any]],
+    enabled: bool,
+    drop_invalid: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if not enabled:
         return sigs, {"enabled": False, "verifiable": 0, "valid": 0, "invalid": 0, "dropped": 0, "coincurve_available": PublicKey is not None}
     if PublicKey is None:
@@ -237,6 +241,7 @@ def verification_gate(sigs: list[dict[str, Any]], enabled: bool) -> tuple[list[d
 
     kept: list[dict[str, Any]] = []
     verifiable = valid = invalid = 0
+    dropped = 0
     reason_counts: dict[str, int] = defaultdict(int)
     reason_samples: dict[str, list[dict[str, Any]]] = defaultdict(list)
     max_samples_per_reason = 5
@@ -278,6 +283,10 @@ def verification_gate(sigs: list[dict[str, Any]], enabled: bool) -> tuple[list[d
             kept.append(row)
         else:
             invalid += 1
+            if drop_invalid:
+                dropped += 1
+            else:
+                kept.append(row)
             reason_counts[fail_reason] += 1
             if len(reason_samples[fail_reason]) < max_samples_per_reason:
                 reason_samples[fail_reason].append(
@@ -290,7 +299,8 @@ def verification_gate(sigs: list[dict[str, Any]], enabled: bool) -> tuple[list[d
         "verifiable": verifiable,
         "valid": valid,
         "invalid": invalid,
-        "dropped": invalid,
+        "dropped": dropped,
+        "drop_invalid": bool(drop_invalid),
         "reason_counts": dict(reason_counts),
         "reason_samples": dict(reason_samples),
     }
@@ -1544,6 +1554,11 @@ def main() -> None:
     ap.add_argument("input", help="Input signatures .json or .jsonl")
     ap.add_argument("--out", default="ecdsa_audit_report.json", help="Output report JSON path")
     ap.add_argument("--verify-signatures", action="store_true", help="Enable signature verification gate")
+    ap.add_argument(
+        "--verify-drop-invalid",
+        action="store_true",
+        help="Drop rows that fail signature verification (default: keep invalid rows for analytics)",
+    )
     ap.add_argument("--cluster-min-size", type=int, default=25, help="Minimum signatures per cluster for per-cluster report")
     ap.add_argument("--baseline-report", default="", help="Optional previous audit report JSON for delta comparison")
     ap.add_argument("--strict-jsonl", action="store_true", help="Fail on malformed JSONL lines instead of skipping")
@@ -1551,7 +1566,11 @@ def main() -> None:
     args = ap.parse_args()
 
     sigs_raw = load_signatures(args.input, strict_jsonl=args.strict_jsonl, strict_entries=args.strict_entries)
-    sigs, gate_info = verification_gate(sigs_raw, enabled=args.verify_signatures)
+    sigs, gate_info = verification_gate(
+        sigs_raw,
+        enabled=args.verify_signatures,
+        drop_invalid=args.verify_drop_invalid,
+    )
     report = build_core_report(sigs)
     report["verification_gate"] = gate_info
     report["clusters"] = build_cluster_reports(sigs, min_cluster_size=args.cluster_min_size)
