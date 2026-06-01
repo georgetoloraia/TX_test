@@ -250,6 +250,10 @@ def main() -> None:
     ap.add_argument("--no-enable-advanced-recover", action="store_false", dest="enable_advanced_recover")
     ap.add_argument("--random-k-budget", type=int, default=0,
                     help="Random-k tries per bucket for the strongest recovery stage")
+    ap.add_argument("--hnp-timeout-sec", type=int, default=120,
+                    help="Timeout (seconds) for HNP/LLL/BKZ solver subprocess")
+    ap.add_argument("--hnp-min-leaks", type=int, default=8,
+                    help="Minimum leakage rows required to run HNP solver")
 
     ap.add_argument("--signatures", default="signatures.jsonl")
     ap.add_argument("--recovered", default="recovered_keys.jsonl")
@@ -349,6 +353,8 @@ def main() -> None:
             "--max-clusters", str(args.max_clusters),
             "--max-iter", str(args.max_iter),
             "--random-k-budget", str(args.random_k_budget),
+            "--hnp-timeout-sec", str(args.hnp_timeout_sec),
+            "--hnp-min-leaks", str(args.hnp_min_leaks),
         ]
         if args.enable_advanced_recover:
             recover_cmd.append("--enable-advanced-recover")

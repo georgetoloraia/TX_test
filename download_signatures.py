@@ -376,6 +376,31 @@ class BlockWalker:
         # ensure files
         for p in [SIGS_JSONL, R_VALUES_FILE, REPEAT_JSONL, RECOVERED_JSONL, RECOVERED_TXT, SIGSCRIPTS_TXT]:
             if not os.path.exists(p): open(p,"a").close()
+        # warm-start dedup guard from existing signatures.jsonl, so repeated runs
+        # do not keep appending identical rows and inflating replay-like duplicate-r.
+        self._hydrate_seen_lines_from_existing()
+
+    def _hydrate_seen_lines_from_existing(self) -> None:
+        try:
+            with open(SIGS_JSONL, "r", encoding="utf-8") as f:
+                for line in f:
+                    raw = line.strip()
+                    if not raw:
+                        continue
+                    try:
+                        obj = json.loads(raw)
+                        txid = obj.get("txid")
+                        vin = obj.get("vin")
+                        r = parse_int(obj.get("r"))
+                        s = parse_int(obj.get("s"))
+                    except Exception:
+                        continue
+                    if txid is None or vin is None:
+                        continue
+                    self._seen_lines.add((str(txid), int(vin), int(r), int(s)))
+            logger.info(f"Warm-start dedup loaded: {len(self._seen_lines)} seen signature rows")
+        except Exception as e:
+            logger.warning(f"Warm-start dedup load failed: {e}")
 
     @staticmethod
     def _redact_hex(value: str, prefix: int = 6, suffix: int = 4) -> str:

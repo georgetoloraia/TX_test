@@ -66,17 +66,23 @@ def try_hnp_lll_bkz_solver(
     leaks = []
     total_rows = 0
     rows_with_known_nonce_bits = 0
+    nonce_bit_keys = ("known_nonce_bits", "nonce_lsb", "k_lsb", "known_k_lsb")
     with open(sig_path, "r", encoding="utf-8") as f:
         for line in f:
             total_rows += 1
             try:
                 obj = json.loads(line.strip())
-                if "known_nonce_bits" not in obj:
+                known_nonce_raw = None
+                for kf in nonce_bit_keys:
+                    if kf in obj:
+                        known_nonce_raw = obj.get(kf)
+                        break
+                if known_nonce_raw is None:
                     continue
                 r = parse_int(obj.get("r"))
                 s = parse_int(obj.get("s"))
                 m = parse_int(obj.get("z"))
-                known_nonce = parse_int(obj.get("known_nonce_bits"))
+                known_nonce = parse_int(known_nonce_raw)
                 leaks.append((r, s, m, known_nonce))
                 rows_with_known_nonce_bits += 1
             except Exception:
@@ -876,11 +882,17 @@ def main() -> None:
         or sighash_anomaly
         or signer_drift_flagged > 0
     )
-    if allow_advanced and strong_signal and not low_quality_data:
-        stage2_threads = min(max(2, args.threads), 16)
-        stage2_iter = max(args.max_iter, 2)
-        if fusion_tier == "critical":
-            stage2_iter = max(stage2_iter, 3)
+    if allow_advanced and strong_signal:
+        if low_quality_data:
+            # Constrained advanced pass for low-quality datasets:
+            # keep compute bounded but still allow deeper search than stage1-only.
+            stage2_threads = min(max(2, args.threads), 4)
+            stage2_iter = 1
+        else:
+            stage2_threads = min(max(2, args.threads), 16)
+            stage2_iter = max(args.max_iter, 2)
+            if fusion_tier == "critical":
+                stage2_iter = max(stage2_iter, 3)
         stage2_rc = run_recover_stage(
             recover_bin=args.recover_bin,
             recover_input=recover_input,
@@ -893,7 +905,11 @@ def main() -> None:
         if stage2_rc != 0:
             raise RuntimeError(f"Recover stage2 failed with exit code {stage2_rc}")
 
-        if args.random_k_budget > 0 and (cross_pub_dup_r > 0 or drift_flags > 0 or risk >= 120):
+        if (
+            not low_quality_data
+            and args.random_k_budget > 0
+            and (cross_pub_dup_r > 0 or drift_flags > 0 or risk >= 120)
+        ):
             stage3_input = recover_input
             strong_subset = Path("signatures.strong_signal.jsonl")
             selected = build_strong_signal_subset_from_cluster_report(
