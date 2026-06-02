@@ -15,11 +15,24 @@ __pycache__/
 *.jsonl
 signatures.json
 ecdsa_audit_report.json
+ecdsa_audit_report_prev.json
+cluster_risk_report.json
+automate_decision.json
 Sigscript.txt
 r_values.txt
 known_keys2.txt
 recovered_keys.txt
 last_processed_block.txt
+problem-repo.txt
+proc.txt
+proc1.txt
+signatures.jsonl.bak
+test_keys.txt
+test_keys.wif.txt
+
+# Generated run/report directories
+runs/
+reports/
 
 # Binaries
 ecdsa_recover_strict

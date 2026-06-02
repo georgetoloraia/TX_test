@@ -213,9 +213,13 @@ def parse_int(x: Any) -> int:
         return x
     if isinstance(x, str):
         s = x.strip()
+        if not s:
+            raise ValueError("empty integer string")
         if s.startswith(("0x", "0X")):
             return int(s, 16)
-        if all(c in "0123456789abcdefABCDEF" for c in s):
+        # Signature fields are typically hex-encoded fixed-width values (r/s/z).
+        # Treat long hex-like strings as hex even when they happen to contain only digits.
+        if all(c in "0123456789abcdefABCDEF" for c in s) and len(s) > 20:
             return int(s, 16)
         return int(s, 10)
     raise TypeError(f"Unsupported integer type: {type(x)}")

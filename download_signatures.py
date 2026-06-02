@@ -694,10 +694,10 @@ class BlockWalker:
                     continue
             # pub candidates from witnessScript
             pubs = extract_pubs_from_script_hex(witness_script_hex)
-            # compute z once (BIP143) for this input
             if der_sigs:
-                z = bip143_sighash(tx, vin_index, prev_val, witness_script_hex, der_sigs[0][3])
                 for sig_hex, r, s, ht in der_sigs:
+                    # Compute z per-signature because sighash type may differ between signatures.
+                    z = bip143_sighash(tx, vin_index, prev_val, witness_script_hex, ht)
                     # pub UNKNOWN at this point — ვწერთ მხოლოდ სკრიპტებით (recover_max იპოვის)
                     results.append({
                         "type":"witness-wsh",
@@ -725,9 +725,9 @@ class BlockWalker:
                     except Exception:
                         continue
                 if ders:
-                    # legacy sighash: scriptCode = redeemScript
-                    z = legacy_sighash(tx, vin_index, redeem, ders[0][3])
                     for sig_hex, r, s, ht in ders:
+                        # Compute z per-signature because sighash type may differ between signatures.
+                        z = legacy_sighash(tx, vin_index, redeem, ht)
                         results.append({
                             "type":"legacy-p2sh-ms",
                             "sig":sig_hex,"pub":"", "sighash":ht,

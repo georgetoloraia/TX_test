@@ -14,6 +14,23 @@ try:
 except ImportError:
     HAVE_FPYLLL = False
 from hashlib import sha256
+
+
+def _parse_int_csv(raw):
+    vals = []
+    if raw is None:
+        return vals
+    s = str(raw).strip()
+    if not s:
+        return vals
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        vals.append(int(part))
+    return vals
+
+
 def memory_guard(max_mb):
     process = psutil.Process(os.getpid())
     mem = process.memory_info().rss / (1024 * 1024)
@@ -86,41 +103,83 @@ def strict_parse_leaks(leaks, q, bits_known):
 
 
 # --- Mathematically correct HNP lattice for LSB leakage ---
-def build_hnp_lattice(leaks, q, bits_known, leakage_model="LSB"):
+def build_hnp_lattice(leaks, q, bits_known, leakage_model="LSB", lattice_variant="primal", embedding_weight=None):
     """
     Build HNP lattice and target vector for CVP-style decoding.
-    Returns: (M, target) where M is IntegerMatrix (n+1)x(n+1), target is tuple[int].
+    Returns a closure make_matrix(scale_num, scale_den, target_last) -> (M, target).
+        lattice_variant:
+            - "primal": classic (n+1)x(n+1) CVP basis.
+            - "embedding": Kannan-style extra coordinate (n+2)x(n+2).
+            - "dual_normalized": normalize rows by inverse(B_base) mod q before embedding.
     """
     from fpylll import IntegerMatrix
     n = len(leaks)
     B = 1 << int(bits_known)
-    def make_matrix(scale=1, target_last=0):
-        M = IntegerMatrix(n + 1, n + 1)
+    q_int = int(q)
+    if embedding_weight is None:
+        embedding_weight = max(1, q_int // max(1, B))
+
+    def make_matrix(scale_num=1, scale_den=1, target_last=0):
+        if int(scale_num) <= 0 or int(scale_den) <= 0:
+            raise ValueError("scale_num and scale_den must be positive")
+        if lattice_variant in ("primal", "dual_normalized"):
+            dim = n + 1
+        elif lattice_variant == "embedding":
+            dim = n + 2
+        else:
+            raise ValueError(f"Unknown lattice_variant: {lattice_variant}")
+
+        M = IntegerMatrix(dim, dim)
         target = []
         for i, (r, s, m, known_nonce) in enumerate(leaks):
             s_inv = pow(int(s), -1, int(q))
             if leakage_model == "LSB":
                 u = (-int(r) * s_inv) % int(q)
                 t = (int(m) * s_inv - int(known_nonce)) % int(q)
-                B_row = B * scale
+                B_base = B
             elif leakage_model == "MSB":
                 klen = int(q).bit_length()
                 shift = klen - int(bits_known)
                 u = (-int(r) * s_inv) % int(q)
                 t = (int(m) * s_inv - (int(known_nonce) << shift)) % int(q)
-                B_row = (B << shift) * scale
+                B_base = (B << shift)
             else:
                 raise ValueError(f"Unknown leakage_model: {leakage_model}")
+
+            if lattice_variant == "dual_normalized":
+                # Work in an equivalent normalized congruence:
+                # (B_base^-1 * u) * d + x_i ≡ (B_base^-1 * t) (mod q)
+                B_inv = pow(int(B_base), -1, q_int)
+                u = (int(u) * int(B_inv)) % q_int
+                t = (int(t) * int(B_inv)) % q_int
+                B_base = 1
+
+            scaled_num = int(B_base) * int(scale_num)
+            if scaled_num % int(scale_den) != 0:
+                raise ValueError("non-integer scaled B_row")
+            B_row = scaled_num // int(scale_den)
             for j in range(n + 1):
                 M[i, j] = 0
             M[i, i] = int(B_row)
             M[i, n] = int(u)
-            target.append(int(t) * scale)
-        for j in range(n + 1):
+            # Keep target in the original modulus domain; sweep only changes B embedding weight.
+            target.append(int(t))
+
+        # q-anchor row (present in both variants)
+        for j in range(dim):
             M[n, j] = 0
-        M[n, n] = int(q) * scale
+        M[n, n] = int(q_int)
         target.append(int(target_last))
+
+        if lattice_variant == "embedding":
+            # Extra embedding coordinate to stabilize CVP geometry.
+            for j in range(dim):
+                M[n + 1, j] = 0
+            M[n + 1, n + 1] = int(embedding_weight)
+            target.append(int(embedding_weight))
+
         return M, tuple(int(x) for x in target)
+
     return make_matrix
 
 
@@ -168,27 +227,47 @@ def _compute_hnp_residuals(leaks, q, bits_known, d_cand, leakage_model):
     """
     Per-signature congruence diagnostics:
       u_i * d + B_i * x_i ≡ t_i (mod q)
-    We estimate x_i via nearest integer and report residuals.
+    Uses centered modular lift and B-divisibility gap as robustness diagnostics.
     """
+    q_int = int(q)
+
+    def _center_mod(v):
+        r = int(v) % q_int
+        if r > q_int // 2:
+            r -= q_int
+        return int(r)
+
+    def _nearest_multiple_gap(v, mod_base):
+        b = max(1, int(mod_base))
+        rem = abs(int(v)) % b
+        return int(min(rem, b - rem))
+
     rows = []
-    abs_mod_residuals = []
+    centered_abs_residuals = []
+    divisibility_gaps = []
     for idx, (r, s, m, known_nonce) in enumerate(leaks):
-        s_inv = pow(int(s), -1, int(q))
-        u = (-int(r) * s_inv) % int(q)
+        s_inv = pow(int(s), -1, q_int)
+        u = (-int(r) * s_inv) % q_int
         if leakage_model == "LSB":
-            t = (int(m) * s_inv - int(known_nonce)) % int(q)
+            t = (int(m) * s_inv - int(known_nonce)) % q_int
             B_i = 1 << int(bits_known)
         else:
-            klen = int(q).bit_length()
+            klen = q_int.bit_length()
             shift = klen - int(bits_known)
-            t = (int(m) * s_inv - (int(known_nonce) << shift)) % int(q)
+            t = (int(m) * s_inv - (int(known_nonce) << shift)) % q_int
             B_i = (1 << int(bits_known)) << shift
-        num = t - ((u * int(d_cand)) % int(q))
-        x_hat = int(round(num / float(B_i)))
-        lhs = (u * int(d_cand) + B_i * x_hat) % int(q)
-        mod_res = (lhs - t) % int(q)
-        mod_res_alt = min(mod_res, int(q) - mod_res)
-        abs_mod_residuals.append(int(mod_res_alt))
+
+        # Residual of u*d - t in Z_q, then centered to [-q/2, q/2].
+        lhs_ud = (u * int(d_cand)) % q_int
+        mod_res = (lhs_ud - t) % q_int
+        centered_res = _center_mod(mod_res)
+
+        # Heuristic x from centered lift and its B-divisibility quality.
+        x_hat = int(round(-centered_res / float(max(1, B_i))))
+        div_gap = _nearest_multiple_gap(centered_res, B_i)
+        centered_abs_residuals.append(abs(int(centered_res)))
+        divisibility_gaps.append(int(div_gap))
+
         rows.append(
             {
                 "index": idx,
@@ -196,21 +275,68 @@ def _compute_hnp_residuals(leaks, q, bits_known, d_cand, leakage_model):
                 "t": int(t),
                 "B_i": int(B_i),
                 "x_hat": int(x_hat),
-                "lhs_mod_q": int(lhs),
+                "lhs_mod_q": int(lhs_ud),
                 "residual_mod_q": int(mod_res),
-                "residual_mod_q_absmin": int(mod_res_alt),
+                "residual_mod_q_centered": int(centered_res),
+                "residual_mod_q_absmin": int(abs(centered_res)),
+                "divisibility_gap_B": int(div_gap),
             }
         )
     summary = {
         "count": len(rows),
-        "max_absmin_residual_mod_q": max(abs_mod_residuals) if abs_mod_residuals else 0,
-        "avg_absmin_residual_mod_q": (sum(abs_mod_residuals) / len(abs_mod_residuals)) if abs_mod_residuals else 0.0,
+        "max_absmin_residual_mod_q": max(centered_abs_residuals) if centered_abs_residuals else 0,
+        "avg_absmin_residual_mod_q": (sum(centered_abs_residuals) / len(centered_abs_residuals)) if centered_abs_residuals else 0.0,
         "median_absmin_residual_mod_q": (
-            sorted(abs_mod_residuals)[len(abs_mod_residuals) // 2] if abs_mod_residuals else 0
+            sorted(centered_abs_residuals)[len(centered_abs_residuals) // 2] if centered_abs_residuals else 0
         ),
-        "nonzero_absmin_residual_count": sum(1 for x in abs_mod_residuals if x != 0),
+        "nonzero_absmin_residual_count": sum(1 for x in centered_abs_residuals if x != 0),
+        "max_divisibility_gap_B": max(divisibility_gaps) if divisibility_gaps else 0,
+        "avg_divisibility_gap_B": (sum(divisibility_gaps) / len(divisibility_gaps)) if divisibility_gaps else 0.0,
     }
     return {"summary": summary, "rows": rows}
+
+
+def _candidate_concordance_stats(leaks, q, bits_known, d_cand, leakage_model):
+    """
+    Multi-row concordance for a candidate d:
+    counts how many rows satisfy small B-divisibility gap under centered residuals.
+    """
+    q_int = int(q)
+    d_int = int(d_cand)
+    gaps = []
+    support = 0
+    total = 0
+    for (r, s, m, known_nonce) in leaks:
+        s_inv = pow(int(s), -1, q_int)
+        u = (-int(r) * s_inv) % q_int
+        if leakage_model == "LSB":
+            t = (int(m) * s_inv - int(known_nonce)) % q_int
+            B_i = 1 << int(bits_known)
+        else:
+            klen = q_int.bit_length()
+            shift = klen - int(bits_known)
+            t = (int(m) * s_inv - (int(known_nonce) << shift)) % q_int
+            B_i = (1 << int(bits_known)) << shift
+
+        res = (u * d_int - t) % q_int
+        if res > q_int // 2:
+            res -= q_int
+        b = max(1, int(B_i))
+        rem = abs(int(res)) % b
+        gap = min(rem, b - rem)
+        gaps.append(int(gap))
+        # row supports candidate if divisibility gap is tiny compared to B.
+        if gap <= max(1, b // 16):
+            support += 1
+        total += 1
+
+    return {
+        "support_count": int(support),
+        "total_rows": int(total),
+        "support_ratio": (float(support) / float(total)) if total else 0.0,
+        "avg_gap": (sum(gaps) / len(gaps)) if gaps else 0.0,
+        "max_gap": max(gaps) if gaps else 0,
+    }
 
 
 def _top_worst_residuals(hnp_diag_rows, top_k=5):
@@ -226,6 +352,30 @@ def _candidate_neighborhood(cand, q, radius=8):
     return out
 
 
+def _build_perturbed_targets(base_target, row_steps, radius, max_points):
+    """
+    Deterministic target perturbations to widen CVP decoding search.
+    The first entry is always the unmodified target.
+    """
+    base = [int(x) for x in base_target]
+    out = [tuple(base)]
+    if int(max_points) <= 1 or int(radius) <= 0:
+        return out
+    n_rows = min(len(base), len(row_steps))
+    for i in range(n_rows):
+        step = abs(int(row_steps[i]))
+        if step <= 0:
+            step = 1
+        for mul in range(1, int(radius) + 1):
+            for sign in (1, -1):
+                t = list(base)
+                t[i] = int(t[i]) + int(sign * mul * step)
+                out.append(tuple(t))
+                if len(out) >= int(max_points):
+                    return out
+    return out
+
+
 def recover_private_key(leaks, q, bits_known, reduction_mode="LLL", bkz_blocksize=10):
     """
     Run the mathematically correct HNP lattice attack for LSB-known ECDSA nonces.
@@ -235,24 +385,86 @@ def recover_private_key(leaks, q, bits_known, reduction_mode="LLL", bkz_blocksiz
     if not HAVE_FPYLLL:
         raise RuntimeError("fpylll is required for recovery (pip install fpylll).")
     leakage_model = recover_private_key.leakage_model if hasattr(recover_private_key, "leakage_model") else "LSB"
+    lattice_variant = recover_private_key.lattice_variant if hasattr(recover_private_key, "lattice_variant") else "primal"
+    embedding_weight = (
+        recover_private_key.embedding_weight if hasattr(recover_private_key, "embedding_weight") else None
+    )
     debug_algo = bool(getattr(recover_private_key, "debug_algo", False))
+    decode_mode = str(getattr(recover_private_key, "decode_mode", "cvp_single") or "cvp_single")
+    decode_k = max(1, int(getattr(recover_private_key, "decode_k", 1) or 1))
+    decode_perturb_radius = max(0, int(getattr(recover_private_key, "decode_perturb_radius", 0) or 0))
     if debug_algo:
         _log_lattice_inputs(leaks, q, bits_known, leakage_model, limit=5)
-    make_matrix = build_hnp_lattice(leaks, q, bits_known, leakage_model=leakage_model)
-    scaling_factors = [1, 2, 0.5]
+    make_matrix = build_hnp_lattice(
+        leaks,
+        q,
+        bits_known,
+        leakage_model=leakage_model,
+        lattice_variant=lattice_variant,
+        embedding_weight=embedding_weight,
+    )
+    scaling_options = [(1, 1), (2, 1), (1, 2)]
     target_last_options = [0, int(q)//2, -int(q)//2]
     all_candidates = set()
-    reduction_metrics = None
-    hnp_diag = None
+    sweep_metrics = []
     debug_scaling = []
-    for scale in scaling_factors:
-        # Only integer scaling
-        if scale < 1:
-            if (1 << int(bits_known)) % int(1/scale) != 0:
-                continue
-        scale_int = int(scale) if scale >= 1 else int(1/scale)
+    q_int = int(q)
+
+    def _extract_d_candidate(u, t_i, bx_term):
+        # CVP returns a lattice vector in ambient coordinates.
+        # For this basis, coordinate i already equals (B_i * x_i), so decode with bx_term directly.
+        try:
+            u_inv = pow(int(u), -1, q_int)
+        except ValueError:
+            return None
+        bx_mod_q = int(bx_term) % q_int
+        rhs = (int(t_i) - bx_mod_q) % q_int
+        return (rhs * u_inv) % q_int
+
+    def _variant_row_terms(r, s, m, known_nonce, variant_name):
+        s_inv = pow(int(s), -1, q_int)
+        if leakage_model == "LSB":
+            u_raw = (-int(r) * s_inv) % q_int
+            t_raw = (int(m) * s_inv - int(known_nonce)) % q_int
+            B_base_raw = 1 << int(bits_known)
+        else:
+            klen = q_int.bit_length()
+            shift = klen - int(bits_known)
+            u_raw = (-int(r) * s_inv) % q_int
+            t_raw = (int(m) * s_inv - (int(known_nonce) << shift)) % q_int
+            B_base_raw = (1 << int(bits_known)) << shift
+
+        if variant_name == "dual_normalized":
+            B_inv = pow(int(B_base_raw), -1, q_int)
+            return (u_raw * B_inv) % q_int, (t_raw * B_inv) % q_int
+        return u_raw, t_raw
+
+    def _candidate_rank(d):
+        diag = _compute_hnp_residuals(leaks, q_int, bits_known, int(d), leakage_model)
+        sm = diag.get("summary", {})
+        score = candidate_score(int(d), leaks, q_int, bits_known)
+        conc = _candidate_concordance_stats(leaks, q_int, bits_known, int(d), leakage_model)
+        return (
+            -float(score.get("match_ratio", 0.0)),
+            -int(score.get("match_count", 0)),
+            -float(conc.get("support_ratio", 0.0)),
+            -int(conc.get("support_count", 0)),
+            float(conc.get("avg_gap", 1e300)),
+            int(conc.get("max_gap", 10**9)),
+            int(sm.get("max_divisibility_gap_B", 10**9)),
+            float(sm.get("avg_divisibility_gap_B", 1e300)),
+            int(sm.get("nonzero_absmin_residual_count", 10**9)),
+            int(sm.get("max_absmin_residual_mod_q", 10**18)),
+            int(d),
+        )
+
+    for scale_num, scale_den in scaling_options:
+        scale_label = f"{scale_num}/{scale_den}"
         for target_last in target_last_options:
-            M, target = make_matrix(scale=scale_int, target_last=target_last)
+            try:
+                M, target = make_matrix(scale_num=scale_num, scale_den=scale_den, target_last=target_last)
+            except ValueError:
+                continue
             t0 = time.time()
             if reduction_mode == "LLL":
                 LLL.reduction(M)
@@ -260,97 +472,176 @@ def recover_private_key(leaks, q, bits_known, reduction_mode="LLL", bkz_blocksiz
                 BKZ.reduction(M, BKZ.Param(bkz_blocksize))
             else:
                 raise ValueError(f"Unknown reduction_mode: {reduction_mode}")
-            closest = _closest_vector_cvp(M, target)
-            closest = [int(v) for v in closest]
             n = len(leaks)
             d_candidates = set()
-            # Babai solution
+            closest_vectors = []
+            if decode_mode == "cvp_single":
+                c0 = _closest_vector_cvp(M, target)
+                closest_vectors = [tuple(int(v) for v in c0)]
+            elif decode_mode == "cvp_target_perturb":
+                row_steps = [max(1, abs(int(M[i, i]))) for i in range(min(n, M.nrows))]
+                perturbed_targets = _build_perturbed_targets(
+                    target,
+                    row_steps,
+                    decode_perturb_radius,
+                    decode_k,
+                )
+                seen_vecs = set()
+                for t_pert in perturbed_targets:
+                    c_pert = _closest_vector_cvp(M, t_pert)
+                    c_key = tuple(int(v) for v in c_pert)
+                    if c_key in seen_vecs:
+                        continue
+                    seen_vecs.add(c_key)
+                    closest_vectors.append(c_key)
+                    if len(closest_vectors) >= decode_k:
+                        break
+                if not closest_vectors:
+                    c0 = _closest_vector_cvp(M, target)
+                    closest_vectors = [tuple(int(v) for v in c0)]
+            else:
+                raise ValueError(f"Unknown decode_mode: {decode_mode}")
+
             if debug_algo:
-                print(f"[DIAG] scale={scale} target_last={target_last}")
+                print(f"[DIAG] variant={lattice_variant} scale={scale_label} target_last={target_last}")
                 print(f"[DIAG] lattice M (first 4 rows):")
                 for row_idx in range(min(4, M.nrows)):
                     print(f"  {row_idx}: {[int(M[row_idx, j]) for j in range(M.ncols)]}")
                 print(f"[DIAG] target: {list(target)}")
-                print(f"[DIAG] closest_vector: {closest}")
-            for i, (r, s, m, known_nonce) in enumerate(leaks):
-                s_inv = pow(int(s), -1, int(q))
-                if leakage_model == "LSB":
-                    u = (-int(r) * s_inv) % int(q)
-                    t_i = (int(m) * s_inv - int(known_nonce)) % int(q)
-                    B_i = (1 << int(bits_known)) * scale_int
-                else:
-                    klen = int(q).bit_length()
-                    shift = klen - int(bits_known)
-                    u = (-int(r) * s_inv) % int(q)
-                    t_i = (int(m) * s_inv - (int(known_nonce) << shift)) % int(q)
-                    B_i = ((1 << int(bits_known)) << shift) * scale_int
-                x_i = closest[i]
-                try:
-                    u_inv = pow(u, -1, int(q))
-                except ValueError:
-                    if debug_algo:
-                        print(f"[DIAG] row={i} u={u} not invertible mod q")
-                    continue  # skip if u not invertible
-                d_i = ((t_i - B_i * x_i) * u_inv) % int(q)
-                d_candidates.add(d_i)
-                if debug_algo:
-                    print(f"[DIAG] row={i} x_i={x_i} t_i={t_i} u={u} B_i={B_i} u_inv={u_inv} d_i={d_i}")
-            # Basis row candidates (first 4 rows)
-            for row_idx in range(min(4, M.nrows)):
-                basis_vec = [int(M[row_idx, j]) for j in range(M.ncols)]
+                print(f"[DIAG] closest_vector_count={len(closest_vectors)}")
+                if closest_vectors:
+                    print(f"[DIAG] closest_vector[0]: {list(closest_vectors[0])}")
+
+            for cvec in closest_vectors:
                 for i, (r, s, m, known_nonce) in enumerate(leaks):
-                    s_inv = pow(int(s), -1, int(q))
-                    if leakage_model == "LSB":
-                        u = (-int(r) * s_inv) % int(q)
-                        t_i = (int(m) * s_inv - int(known_nonce)) % int(q)
-                        B_i = (1 << int(bits_known)) * scale_int
-                    else:
-                        klen = int(q).bit_length()
-                        shift = klen - int(bits_known)
-                        u = (-int(r) * s_inv) % int(q)
-                        t_i = (int(m) * s_inv - (int(known_nonce) << shift)) % int(q)
-                        B_i = ((1 << int(bits_known)) << shift) * scale_int
-                    x_i = basis_vec[i]
-                    try:
-                        u_inv = pow(u, -1, int(q))
-                    except ValueError:
-                        continue
-                    d_i = ((t_i - B_i * x_i) * u_inv) % int(q)
+                    u, t_i = _variant_row_terms(r, s, m, known_nonce, lattice_variant)
+                    bx_i = int(cvec[i])
+                    d_i = _extract_d_candidate(u, t_i, bx_i)
+                    if d_i is None:
+                        if debug_algo:
+                            print(f"[DIAG] row={i} u={u} not invertible mod q")
+                        continue  # skip if u not invertible
                     d_candidates.add(d_i)
+                    if debug_algo:
+                        print(f"[DIAG] row={i} bx_i={bx_i} t_i={t_i} u={u} d_i={d_i}")
+            # NOTE:
+            # Do not derive candidates directly from reduced-basis rows.
+            # After LLL/BKZ, rows are mixed lattice vectors and no longer represent
+            # per-signature CVP closest coordinates; using them injects unsound noise.
+
+            # Consensus decode: pick per-sweep candidate with best multi-row concordance.
+            if d_candidates:
+                consensus_rows = []
+                for dc in d_candidates:
+                    conc = _candidate_concordance_stats(leaks, q_int, bits_known, int(dc), leakage_model)
+                    sc = candidate_score(int(dc), leaks, q_int, bits_known)
+                    consensus_rows.append((int(dc), conc, sc))
+                consensus_best = min(
+                    consensus_rows,
+                    key=lambda row: (
+                        -float(row[1].get("support_ratio", 0.0)),
+                        -int(row[1].get("support_count", 0)),
+                        float(row[1].get("avg_gap", 1e300)),
+                        -float(row[2].get("match_ratio", 0.0)),
+                        int(row[0]),
+                    ),
+                )
+                d_candidates.add(int(consensus_best[0]))
+
             all_candidates.update(d_candidates)
+
+            base_target_int = [int(x) for x in target]
+            vector_rows = []
+            for cvec in closest_vectors:
+                mv = _matvec(M, cvec)
+                residual_vec = [int(mv[i] - base_target_int[i]) for i in range(len(base_target_int))]
+                vector_rows.append(
+                    {
+                        "closest": [int(x) for x in cvec],
+                        "matvec_minus_target_l1": int(sum(abs(x) for x in residual_vec)),
+                        "matvec_minus_target_linf": int(max((abs(x) for x in residual_vec), default=0)),
+                    }
+                )
+            best_vec_row = min(
+                vector_rows,
+                key=lambda r: (
+                    int(r.get("matvec_minus_target_linf", 10**30)),
+                    int(r.get("matvec_minus_target_l1", 10**30)),
+                ),
+            ) if vector_rows else {"closest": [], "matvec_minus_target_l1": 0, "matvec_minus_target_linf": 0}
+            sweep_metrics.append(
+                {
+                    "scale": scale_label,
+                    "target_last": int(target_last),
+                    "runtime_sec": float(time.time() - t0),
+                    "candidate_count": int(len(d_candidates)),
+                    "closest_vector_count": int(len(closest_vectors)),
+                    "closest_vector": best_vec_row.get("closest", []),
+                    "target_vector": base_target_int,
+                    "matvec_minus_target_l1": int(best_vec_row.get("matvec_minus_target_l1", 0)),
+                    "matvec_minus_target_linf": int(best_vec_row.get("matvec_minus_target_linf", 0)),
+                }
+            )
+
             if debug_algo:
                 debug_scaling.append({
-                    "scale": scale,
+                    "scale": scale_label,
                     "target_last": target_last,
-                    "closest_vector": closest,
+                    "closest_vector_count": int(len(closest_vectors)),
+                    "closest_vector": best_vec_row.get("closest", []),
                     "d_candidates": list(d_candidates)
                 })
-            # For diagnostics, use the first scale/target_last
-            if reduction_metrics is None:
-                d_cand = list(d_candidates)[0] if d_candidates else 0
-                mv = _matvec(M, closest)
-                target_int = [int(x) for x in target]
-                residual_vec = [int(mv[i] - target_int[i]) for i in range(len(target_int))]
-                residual_l1 = int(sum(abs(x) for x in residual_vec))
-                residual_linf = int(max((abs(x) for x in residual_vec), default=0))
-                hnp_diag = _compute_hnp_residuals(leaks, q, bits_known, d_cand, leakage_model)
-                t1 = time.time()
-                reduction_metrics = {
-                    "matrix_dim": M.nrows,
-                    "runtime_sec": t1 - t0,
-                    "candidate_count": len(d_candidates),
-                    "leakage_model": leakage_model,
-                    "reduction_mode": reduction_mode,
-                    "bkz_blocksize": bkz_blocksize if reduction_mode == "BKZ" else None,
-                    "closest_vector": closest,
-                    "target_vector": target_int,
-                    "matvec_minus_target_l1": residual_l1,
-                    "matvec_minus_target_linf": residual_linf,
-                    "hnp_diag_summary": hnp_diag["summary"],
-                }
+
+    ordered_candidates = sorted(all_candidates, key=_candidate_rank)
+    best_candidate = int(ordered_candidates[0]) if ordered_candidates else 0
+    hnp_diag = _compute_hnp_residuals(leaks, q_int, bits_known, best_candidate, leakage_model)
+    best_concordance = _candidate_concordance_stats(leaks, q_int, bits_known, best_candidate, leakage_model)
+
+    best_sweep = None
+    if sweep_metrics:
+        best_sweep = min(
+            sweep_metrics,
+            key=lambda m: (
+                int(m.get("matvec_minus_target_linf", 10**30)),
+                int(m.get("matvec_minus_target_l1", 10**30)),
+                -int(m.get("candidate_count", 0)),
+            ),
+        )
+
+    reduction_metrics = {
+        "matrix_dim": (len(leaks) + 1),
+        "runtime_sec": float(sum(m.get("runtime_sec", 0.0) for m in sweep_metrics)),
+        "candidate_count": int(len(ordered_candidates)),
+        "leakage_model": leakage_model,
+        "lattice_variant": lattice_variant,
+        "decode_mode": decode_mode,
+        "decode_k": int(decode_k),
+        "decode_perturb_radius": int(decode_perturb_radius),
+        "embedding_weight": int(embedding_weight) if embedding_weight is not None else None,
+        "reduction_mode": reduction_mode,
+        "bkz_blocksize": bkz_blocksize if reduction_mode == "BKZ" else None,
+        "selected_best_candidate": best_candidate,
+        "selection_strategy": "nonce_match_then_concordance_then_residual_tiebreak",
+        "selected_concordance": best_concordance,
+        "hnp_diag_summary": hnp_diag.get("summary", {}),
+    }
+    if best_sweep is not None:
+        reduction_metrics.update(
+            {
+                "best_sweep_scale": best_sweep.get("scale"),
+                "best_sweep_target_last": best_sweep.get("target_last"),
+                "closest_vector": best_sweep.get("closest_vector", []),
+                "target_vector": best_sweep.get("target_vector", []),
+                "matvec_minus_target_l1": best_sweep.get("matvec_minus_target_l1", 0),
+                "matvec_minus_target_linf": best_sweep.get("matvec_minus_target_linf", 0),
+            }
+        )
+
     if debug_algo:
         print(f"[ALGO] scaling/target/basis sweep debug: {debug_scaling}")
-    return list(all_candidates), reduction_metrics, hnp_diag
+        print(f"[ALGO] selected_best_candidate={best_candidate}")
+        print(f"[ALGO] selected_hnp_diag_summary={hnp_diag.get('summary', {})}")
+    return ordered_candidates, reduction_metrics, hnp_diag
 def synthetic_fixture_lsb(n=8, bits_known=6, q=DEFAULT_Q):
     # Generate cryptographically correct ECDSA signatures with LSB-known nonces and known d
     from ecdsa import SECP256k1, SigningKey
@@ -478,6 +769,61 @@ def main():
     parser.add_argument("--bkz-blocksize", type=int, default=10, help="BKZ block size (if using BKZ)")
     parser.add_argument("--synthetic-test", action="store_true", help="Run synthetic regression test (CI mode)")
     parser.add_argument("--debug-algo", action="store_true", help="Verbose algorithm-correctness logs")
+    parser.add_argument("--synthetic-n", type=int, default=8, help="Synthetic sample count (default: 8)")
+    parser.add_argument(
+        "--synthetic-n-sweep",
+        type=str,
+        default="",
+        help="Comma-separated synthetic n sweep, e.g. '8,16,32,64'",
+    )
+    parser.add_argument(
+        "--synthetic-bits-sweep",
+        type=str,
+        default="",
+        help="Comma-separated bits-known sweep for synthetic compare, e.g. '6,8,10,12'",
+    )
+    parser.add_argument(
+        "--lattice-variant",
+        type=str,
+        default="primal",
+        choices=["primal", "embedding", "dual_normalized"],
+        help="Lattice formulation variant",
+    )
+    parser.add_argument(
+        "--embedding-weight",
+        type=int,
+        default=0,
+        help="Embedding coordinate weight (0 = auto)",
+    )
+    parser.add_argument(
+        "--compare-lattice-variants",
+        action="store_true",
+        help="Run both primal/embedding and automatically compare (synthetic-friendly)",
+    )
+    parser.add_argument(
+        "--compare-decoders",
+        action="store_true",
+        help="Run both single and perturb decoders and automatically compare (synthetic-friendly)",
+    )
+    parser.add_argument(
+        "--decode-mode",
+        type=str,
+        default="cvp_single",
+        choices=["cvp_single", "cvp_target_perturb"],
+        help="Decoder family: single CVP or multi-target CVP perturb search",
+    )
+    parser.add_argument(
+        "--decode-k",
+        type=int,
+        default=32,
+        help="Max closest vectors to keep in perturb decode mode",
+    )
+    parser.add_argument(
+        "--decode-perturb-radius",
+        type=int,
+        default=2,
+        help="Per-row perturb radius (in row-step multiples) for perturb decode",
+    )
     args = parser.parse_args()
 
     # Config merge
@@ -523,7 +869,10 @@ def main():
     if config.get("synthetic_test"):
         q = int(config["q"], 0) if isinstance(config["q"], str) else int(config["q"])
         bits_known = int(config.get("bits_known", 6))
-        leaks_raw, ground_truth_d = synthetic_fixture_lsb(n=8, bits_known=bits_known, q=q)
+        synthetic_n = int(config.get("synthetic_n", 8) or 8)
+        if synthetic_n < 2:
+            synthetic_n = 2
+        leaks_raw, ground_truth_d = synthetic_fixture_lsb(n=synthetic_n, bits_known=bits_known, q=q)
         leaks, rejected, input_stats = strict_parse_leaks(leaks_raw, q, bits_known)
         save_json(input_stats, os.path.join(out_dir, "input_stats.json"))
         print(f"[SYNTHETIC] Ground-truth d: {ground_truth_d}")
@@ -563,16 +912,323 @@ def main():
 
     t0 = time.time()
     try:
-        # Pass leakage_model to recover_private_key via function attribute
-        recover_private_key.leakage_model = config.get("leakage_model", "LSB")
-        recover_private_key.debug_algo = bool(config.get("debug_algo", False))
-        candidates, reduction_metrics, hnp_diag = recover_private_key(
-            leaks,
-            int(config["q"], 0) if isinstance(config["q"], str) else int(config["q"]),
-            int(config["bits_known"]),
-            reduction_mode=config.get("reduction_mode", "LLL"),
-            bkz_blocksize=config.get("bkz_blocksize", 10)
-        )
+        q_int = int(config["q"], 0) if isinstance(config["q"], str) else int(config["q"])
+        bits_int = int(config["bits_known"])
+
+        def run_variant(variant_name, leaks_local, bits_known_local, decode_mode_local=None):
+            recover_private_key.leakage_model = config.get("leakage_model", "LSB")
+            recover_private_key.debug_algo = bool(config.get("debug_algo", False))
+            recover_private_key.lattice_variant = variant_name
+            ew = int(config.get("embedding_weight", 0) or 0)
+            recover_private_key.embedding_weight = (ew if ew > 0 else None)
+            recover_private_key.decode_mode = str(
+                decode_mode_local if decode_mode_local is not None else config.get("decode_mode", "cvp_single")
+                or "cvp_single"
+            )
+            recover_private_key.decode_k = max(1, int(config.get("decode_k", 32) or 32))
+            recover_private_key.decode_perturb_radius = max(
+                0,
+                int(config.get("decode_perturb_radius", 2) or 2),
+            )
+            return recover_private_key(
+                leaks_local,
+                q_int,
+                int(bits_known_local),
+                reduction_mode=config.get("reduction_mode", "LLL"),
+                bkz_blocksize=config.get("bkz_blocksize", 10),
+            )
+
+        def row_rank_key(row):
+            return (
+                int(bool(row.get("found_ground_truth", False))),
+                float(row.get("top_ratio", 0.0)),
+                int(row.get("top_match", 0)),
+                -int(row.get("metrics", {}).get("hnp_diag_summary", {}).get("max_divisibility_gap_B", 10**9)),
+            )
+
+        def row_to_compact(row):
+            return {
+                "variant": row.get("variant"),
+                "decode_mode": row.get("decode_mode"),
+                "candidate_count": int(row.get("candidate_count", 0)),
+                "top_ratio": float(row.get("top_ratio", 0.0)),
+                "top_match": int(row.get("top_match", 0)),
+                "found_ground_truth": bool(row.get("found_ground_truth", False)),
+            }
+
+        def choose_best_row(rows):
+            return max(rows, key=row_rank_key) if rows else None
+
+        def summarize_decoder_sweep(decoder_sweep_rows):
+            by_decoder = {}
+            for sweep_item in decoder_sweep_rows:
+                rows_local = sweep_item.get("rows", [])
+                if not rows_local:
+                    continue
+                best_local = choose_best_row(rows_local)
+                best_mode_local = best_local.get("decode_mode") if best_local else None
+                for row in rows_local:
+                    mode = row.get("decode_mode")
+                    if not mode:
+                        continue
+                    agg = by_decoder.setdefault(
+                        mode,
+                        {
+                            "decode_mode": mode,
+                            "points_total": 0,
+                            "points_found": 0,
+                            "point_wins": 0,
+                            "sum_top_ratio": 0.0,
+                            "sum_top_match": 0,
+                            "sum_candidate_count": 0,
+                        },
+                    )
+                    agg["points_total"] += 1
+                    agg["points_found"] += int(bool(row.get("found_ground_truth", False)))
+                    agg["point_wins"] += int(mode == best_mode_local)
+                    agg["sum_top_ratio"] += float(row.get("top_ratio", 0.0))
+                    agg["sum_top_match"] += int(row.get("top_match", 0))
+                    agg["sum_candidate_count"] += int(row.get("candidate_count", 0))
+
+            summary = []
+            for mode, agg in by_decoder.items():
+                total = max(1, int(agg["points_total"]))
+                summary.append(
+                    {
+                        "decode_mode": mode,
+                        "points_total": int(agg["points_total"]),
+                        "points_found": int(agg["points_found"]),
+                        "point_wins": int(agg["point_wins"]),
+                        "win_rate": float(agg["point_wins"]) / float(total),
+                        "avg_top_ratio": float(agg["sum_top_ratio"]) / float(total),
+                        "avg_top_match": float(agg["sum_top_match"]) / float(total),
+                        "avg_candidate_count": float(agg["sum_candidate_count"]) / float(total),
+                    }
+                )
+
+            selected = max(
+                summary,
+                key=lambda d: (
+                    int(d.get("points_found", 0)),
+                    float(d.get("win_rate", 0.0)),
+                    float(d.get("avg_top_ratio", 0.0)),
+                    float(d.get("avg_top_match", 0.0)),
+                    float(d.get("avg_candidate_count", 0.0)),
+                ),
+            ) if summary else None
+            return summary, selected
+
+        def evaluate_variant(variant_name, leaks_local, bits_known_local, decode_modes, ground_truth_d_local=None):
+            rows = []
+            for decode_mode_name in decode_modes:
+                vcands, vmetrics, vdiag = run_variant(variant_name, leaks_local, bits_known_local, decode_mode_name)
+                top_ratio = 0.0
+                top_match = 0
+                if vcands:
+                    row_scores = [candidate_score(c, leaks_local, q_int, bits_known_local) for c in vcands[: min(64, len(vcands))]]
+                    if row_scores:
+                        top_ratio = max(float(rs.get("match_ratio", 0.0)) for rs in row_scores)
+                        top_match = max(int(rs.get("match_count", 0)) for rs in row_scores)
+                found_gt = False
+                if config.get("synthetic_test") and ground_truth_d_local is not None:
+                    found_gt = any((int(c) - int(ground_truth_d_local)) % q_int == 0 for c in vcands)
+                rows.append(
+                    {
+                        "variant": variant_name,
+                        "decode_mode": decode_mode_name,
+                        "candidate_count": len(vcands),
+                        "top_ratio": top_ratio,
+                        "top_match": top_match,
+                        "found_ground_truth": bool(found_gt),
+                        "candidates": vcands,
+                        "metrics": vmetrics,
+                        "diag": vdiag,
+                    }
+                )
+            best_row = choose_best_row(rows)
+            return rows, best_row
+
+        def evaluate_decoder_sweep(variant_name, n_val, bits_val, decode_modes):
+            leaks_raw_n, gt_n = synthetic_fixture_lsb(n=int(n_val), bits_known=int(bits_val), q=q_int)
+            leaks_n, _, _ = strict_parse_leaks(leaks_raw_n, q_int, int(bits_val))
+            rows_n, best_n = evaluate_variant(
+                variant_name,
+                leaks_n,
+                int(bits_val),
+                decode_modes,
+                ground_truth_d_local=int(gt_n),
+            )
+            return {
+                "n": int(n_val),
+                "bits_known": int(bits_val),
+                "ground_truth_d": int(gt_n),
+                "rows": rows_n,
+                "selected_variant": best_n.get("variant") if best_n else None,
+                "selected_decoder": best_n.get("decode_mode") if best_n else None,
+            }
+
+        compare_decoders = bool(config.get("compare_decoders", False))
+        decoder_modes = [str(config.get("decode_mode", "cvp_single") or "cvp_single")]
+        if compare_decoders and config.get("synthetic_test"):
+            decoder_modes = ["cvp_single", "cvp_target_perturb"]
+
+        if bool(config.get("compare_lattice_variants", False)):
+            variant_rows = []
+            for variant in ("primal", "embedding", "dual_normalized"):
+                rows, best_row = evaluate_variant(variant, leaks, bits_int, decoder_modes, ground_truth_d_local=ground_truth_d if config.get("synthetic_test") else None)
+                variant_rows.extend(rows)
+
+            best_row = choose_best_row(variant_rows)
+            candidates = best_row["candidates"]
+            reduction_metrics = best_row["metrics"]
+            hnp_diag = best_row["diag"]
+            reduction_metrics["variant_comparison"] = [
+                {
+                    "variant": r["variant"],
+                    "decode_mode": r.get("decode_mode"),
+                    "candidate_count": len(r["candidates"]),
+                    "top_ratio": r["top_ratio"],
+                    "top_match": r["top_match"],
+                    "found_ground_truth": r["found_ground_truth"],
+                }
+                for r in variant_rows
+            ]
+            reduction_metrics["selected_variant"] = best_row["variant"]
+            if compare_decoders and config.get("synthetic_test"):
+                reduction_metrics["decoder_comparison"] = [
+                    {
+                        "decode_mode": r["decode_mode"],
+                        "candidate_count": r["candidate_count"],
+                        "top_ratio": r["top_ratio"],
+                        "top_match": r["top_match"],
+                        "found_ground_truth": r["found_ground_truth"],
+                    }
+                    for r in variant_rows if r["variant"] == reduction_metrics["selected_variant"]
+                ]
+                reduction_metrics["selected_decoder"] = best_row["decode_mode"]
+
+            # Optional synthetic n-sweep for cross-variant comparison stability.
+            sweep_ns = _parse_int_csv(config.get("synthetic_n_sweep", ""))
+            sweep_bits = _parse_int_csv(config.get("synthetic_bits_sweep", ""))
+            if config.get("synthetic_test") and (sweep_ns or sweep_bits):
+                if not sweep_ns:
+                    sweep_ns = [int(config.get("synthetic_n", 8) or 8)]
+                if not sweep_bits:
+                    sweep_bits = [bits_int]
+                sweep_report = []
+                for n_val in sweep_ns:
+                    n_int = int(n_val)
+                    if n_int < 2:
+                        continue
+                    for bits_val in sweep_bits:
+                        bits_local = int(bits_val)
+                        if bits_local <= 0 or bits_local >= 256:
+                            continue
+                        leaks_raw_n, gt_n = synthetic_fixture_lsb(n=n_int, bits_known=bits_local, q=q_int)
+                        leaks_n, _, _ = strict_parse_leaks(leaks_raw_n, q_int, bits_local)
+                        rows_n = []
+                        for variant in ("primal", "embedding", "dual_normalized"):
+                            variant_rows_n, _ = evaluate_variant(
+                                variant,
+                                leaks_n,
+                                bits_local,
+                                decoder_modes,
+                                ground_truth_d_local=int(gt_n),
+                            )
+                            rows_n.extend(variant_rows_n)
+                        best_n = choose_best_row(rows_n)
+                        sweep_report.append(
+                            {
+                                "n": n_int,
+                                "bits_known": bits_local,
+                                "ground_truth_d": int(gt_n),
+                                "rows": rows_n,
+                                "selected_variant": best_n.get("variant") if best_n else None,
+                                "selected_decoder": best_n.get("decode_mode") if best_n else None,
+                            }
+                        )
+
+                if sweep_report:
+                    reduction_metrics["variant_n_sweep"] = sweep_report
+                    save_json(sweep_report, os.path.join(out_dir, "lattice_variant_sweep.json"))
+        elif compare_decoders and config.get("synthetic_test") and (_parse_int_csv(config.get("synthetic_n_sweep", "")) or _parse_int_csv(config.get("synthetic_bits_sweep", ""))):
+            sweep_ns = _parse_int_csv(config.get("synthetic_n_sweep", ""))
+            sweep_bits = _parse_int_csv(config.get("synthetic_bits_sweep", ""))
+            if not sweep_ns:
+                sweep_ns = [int(config.get("synthetic_n", 8) or 8)]
+            if not sweep_bits:
+                sweep_bits = [bits_int]
+            decoder_sweep_report = []
+            for n_val in sweep_ns:
+                n_int = int(n_val)
+                if n_int < 2:
+                    continue
+                for bits_val in sweep_bits:
+                    bits_local = int(bits_val)
+                    if bits_local <= 0 or bits_local >= 256:
+                        continue
+                    decoder_sweep_report.append(
+                        evaluate_decoder_sweep(config.get("lattice_variant", "primal"), n_int, bits_local, decoder_modes)
+                    )
+            if decoder_sweep_report:
+                decoder_sweep_summary, selected_decoder_stats = summarize_decoder_sweep(decoder_sweep_report)
+                selected_decoder_mode = selected_decoder_stats.get("decode_mode") if selected_decoder_stats else None
+
+                best_decoder_sweep = None
+                for sweep_item in decoder_sweep_report:
+                    for row in sweep_item.get("rows", []):
+                        if selected_decoder_mode and row.get("decode_mode") != selected_decoder_mode:
+                            continue
+                        if best_decoder_sweep is None or row_rank_key(row) > row_rank_key(best_decoder_sweep):
+                            best_decoder_sweep = dict(row)
+                            best_decoder_sweep["n"] = sweep_item.get("n")
+                            best_decoder_sweep["bits_known"] = sweep_item.get("bits_known")
+
+                reduction_metrics = {
+                    "decoder_n_sweep": decoder_sweep_report,
+                    "decoder_sweep_summary": decoder_sweep_summary,
+                    "selected_decoder": selected_decoder_mode,
+                    "selected_variant": best_decoder_sweep.get("variant") if best_decoder_sweep else None,
+                }
+                if best_decoder_sweep:
+                    reduction_metrics["selected_decoder_sweep"] = row_to_compact(best_decoder_sweep)
+                    reduction_metrics["selected_decoder_sweep"]["n"] = best_decoder_sweep.get("n")
+                    reduction_metrics["selected_decoder_sweep"]["bits_known"] = best_decoder_sweep.get("bits_known")
+                    candidates = best_decoder_sweep.get("candidates", [])
+                    hnp_diag = best_decoder_sweep.get("diag", {"summary": {"count": 0}, "rows": []})
+                else:
+                    candidates = []
+                    hnp_diag = {"summary": {"count": 0}, "rows": []}
+                save_json(decoder_sweep_report, os.path.join(out_dir, "decoder_variant_sweep.json"))
+        else:
+            if compare_decoders and config.get("synthetic_test"):
+                decoder_rows, best_decoder_row = evaluate_variant(
+                    config.get("lattice_variant", "primal"),
+                    leaks,
+                    bits_int,
+                    ["cvp_single", "cvp_target_perturb"],
+                    ground_truth_d_local=ground_truth_d,
+                )
+                candidates = best_decoder_row["candidates"] if best_decoder_row else []
+                reduction_metrics = best_decoder_row["metrics"] if best_decoder_row else {"error": "no decoder rows"}
+                hnp_diag = best_decoder_row["diag"] if best_decoder_row else {"summary": {"count": 0}, "rows": []}
+                reduction_metrics["decoder_comparison"] = [
+                    {
+                        "decode_mode": r["decode_mode"],
+                        "candidate_count": r["candidate_count"],
+                        "top_ratio": r["top_ratio"],
+                        "top_match": r["top_match"],
+                        "found_ground_truth": r["found_ground_truth"],
+                    }
+                    for r in decoder_rows
+                ]
+                reduction_metrics["selected_decoder"] = best_decoder_row["decode_mode"] if best_decoder_row else None
+            else:
+                candidates, reduction_metrics, hnp_diag = run_variant(
+                    config.get("lattice_variant", "primal"),
+                    leaks,
+                    bits_int,
+                )
     except Exception as e:
         reduction_metrics = {"error": str(e)}
         candidates = []
