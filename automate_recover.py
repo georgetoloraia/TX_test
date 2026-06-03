@@ -23,6 +23,94 @@ import os
 import multiprocessing as mp
 
 
+def _flag_provided(argv: list[str], flag: str) -> bool:
+    return any(a == flag or a.startswith(flag + "=") for a in argv)
+
+
+def _detect_mem_gib(default_gib: float = 8.0) -> float:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        kib = int(parts[1])
+                        return max(1.0, kib / (1024.0 * 1024.0))
+    except Exception:
+        pass
+    return default_gib
+
+
+def auto_tune_params(args: argparse.Namespace, argv: list[str], sig_rows: int) -> None:
+    cpu = max(1, os.cpu_count() or 1)
+    mem_gib = _detect_mem_gib()
+
+    if mem_gib < 4:
+        thr_auto = min(2, cpu)
+    elif mem_gib < 8:
+        thr_auto = min(4, max(1, cpu - 1))
+    elif mem_gib < 16:
+        thr_auto = min(8, max(1, cpu - 1))
+    else:
+        thr_auto = min(16, max(1, cpu - 1))
+
+    if mem_gib < 8:
+        cluster_min_auto = 40
+        cluster_risk_auto = 25
+        max_iter_auto = 1
+        rk_auto = 0
+    elif mem_gib < 16:
+        cluster_min_auto = 30
+        cluster_risk_auto = 20
+        max_iter_auto = 2
+        rk_auto = 0
+    elif mem_gib < 32:
+        cluster_min_auto = 20
+        cluster_risk_auto = 15
+        max_iter_auto = 2
+        rk_auto = 1024
+    else:
+        cluster_min_auto = 12
+        cluster_risk_auto = 10
+        max_iter_auto = 3
+        rk_auto = 4096
+
+    if sig_rows > 1_000_000:
+        cluster_min_auto += 5
+    elif sig_rows > 500_000:
+        cluster_min_auto += 2
+
+    cluster_budget = int(max(30, min(300, mem_gib * 10)))
+    cpu_budget = max(30, cpu * 12)
+    max_clusters_auto = min(cluster_budget, cpu_budget)
+
+    if not _flag_provided(argv, "--threads"):
+        args.threads = thr_auto
+    if not _flag_provided(argv, "--cluster-min-sigs"):
+        args.cluster_min_sigs = cluster_min_auto
+    if not _flag_provided(argv, "--cluster-risk-threshold"):
+        args.cluster_risk_threshold = cluster_risk_auto
+    if not _flag_provided(argv, "--max-clusters"):
+        args.max_clusters = max_clusters_auto
+    if not _flag_provided(argv, "--max-iter"):
+        args.max_iter = max_iter_auto
+    if not _flag_provided(argv, "--random-k-budget"):
+        args.random_k_budget = rk_auto
+
+    print(
+        "[auto-tune]",
+        f"cpu={cpu}",
+        f"mem_gib={mem_gib:.1f}",
+        f"sig_rows={sig_rows}",
+        f"threads={args.threads}",
+        f"cluster_min_sigs={args.cluster_min_sigs}",
+        f"cluster_risk_threshold={args.cluster_risk_threshold}",
+        f"max_clusters={args.max_clusters}",
+        f"max_iter={args.max_iter}",
+        f"random_k_budget={args.random_k_budget}",
+    )
+
+
 def _hnp_worker(leaks, q, bits_known, solver_path, qout):
     try:
         spec = importlib.util.spec_from_file_location("hnp_lll_bkz_solver_worker", solver_path)
@@ -634,6 +722,10 @@ def main() -> None:
                     help="Minimum verifiable signatures before invalid-ratio quality gate is enforced")
     ap.add_argument("--fusion-min-confidence", type=float, default=0.45,
                     help="Minimum signal_fusion confidence to allow recovery without hard signal")
+    ap.add_argument("--auto-tune", action="store_true", default=True,
+                    help="Auto-tune resource-sensitive parameters from machine CPU/RAM (default: enabled)")
+    ap.add_argument("--no-auto-tune", action="store_false", dest="auto_tune",
+                    help="Disable machine-aware auto-tuning")
 
     args = ap.parse_args()
 
@@ -644,6 +736,9 @@ def main() -> None:
     if sig_rows == 0:
         print("No signatures available yet; skipping audit/recover for this cycle.")
         return
+
+    if args.auto_tune:
+        auto_tune_params(args, sys.argv[1:], sig_rows)
 
     py_exec = resolve_python_executable()
     print(f"[python] using interpreter: {py_exec}")
@@ -839,8 +934,7 @@ def main() -> None:
             f"selected={stage0_subset_info.get('selected_signatures', 0)}",
         )
         if int(stage0_subset_info.get("nontrivial_duplicate_r_groups", 0)) > 0:
-            recover_input = str(stage0_path)
-            print("Stage0 selected as primary recover input (nontrivial duplicate-r present).")
+            print("Stage0 has nontrivial duplicate-r; keeping broader recover_input to avoid missing candidates.")
         else:
             print("Stage0 is replay-like only; keeping broader recover_input for stage1.")
 

