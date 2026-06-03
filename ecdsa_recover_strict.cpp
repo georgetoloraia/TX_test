@@ -331,6 +331,15 @@ static void pass0_bucketize_and_dedup(const string& sigs, const string& tmpdir,
         }
         cerr<<"[pass0] done. lines="<<cnt<<"\n";
     }
+
+    // Ensure all raw bucket files are flushed before reading them back for dedup.
+    for (auto& kv : writers) {
+        if (kv.second && kv.second->f.is_open()) {
+            kv.second->f.flush();
+            kv.second->f.close();
+        }
+    }
+
     for(auto& kv: writers){
         string b = kv.first;
         string inpath  = tmpdir+"/"+b+".raw.jsonl";
@@ -363,6 +372,31 @@ struct RecStore {
     bool get_kset(const string& r, vector<string>& out){ lock_guard<mutex> lk(m); auto it=k_by_r.find(r); if(it==k_by_r.end()) return false; out.assign(it->second.begin(), it->second.end()); return true; }
     bool empty_k(const string& r){ lock_guard<mutex> lk(m); return !k_by_r.count(r); }
 };
+
+struct OutputSink {
+    mutex m;
+    unordered_set<string> seen_keys; // pub|priv
+
+    bool emit_unique_key(const string& out_json, const string& out_txt,
+                         const string& pub, const string& priv,
+                         const string& json_line, const string& txt_line)
+    {
+        string id = pub + "|" + priv;
+        lock_guard<mutex> lk(m);
+        if(!seen_keys.insert(id).second) return false;
+        ofstream(out_json, ios::app) << json_line << "\n";
+        ofstream(out_txt, ios::app)  << txt_line  << "\n";
+        return true;
+    }
+};
+
+static OutputSink GOUT;
+static mutex GLOG_M;
+
+static void log_line(const string& s){
+    lock_guard<mutex> lk(GLOG_M);
+    cerr << s << "\n";
+}
 
 // ------------------------------- Primary dup-R -------------------------------
 static int try_primary_dupR(Ctx& C, Secp& S, const vector<Row>& rows,
@@ -406,8 +440,15 @@ static int try_primary_dupR(Ctx& C, Secp& S, const vector<Row>& rows,
                     if(R1.pub==pubs.first || R1.pub==pubs.second){
                         string wif = priv_to_wif(dhex,true,true);
                         store.add_priv(R1.pub, dhex);
-                        ofstream(out_json, ios::app) << "{\"pubkey\":\""<<R1.pub<<"\",\"priv_hex\":\""<<dhex<<"\",\"wif\":\""<<wif<<"\",\"r\":\""<<R1.r_hex<<"\",\"method\":\"primary\"}\n";
-                        ofstream(out_txt, ios::app)  << "PUB="<<R1.pub<<" PRIV="<<dhex<<" WIF="<<wif<<" R="<<R1.r_hex<<" (primary)\n";
+                        GOUT.emit_unique_key(
+                            out_json,
+                            out_txt,
+                            R1.pub,
+                            dhex,
+                            string("{\"pubkey\":\"") + R1.pub + "\",\"priv_hex\":\"" + dhex +
+                            "\",\"wif\":\"" + wif + "\",\"r\":\"" + R1.r_hex + "\",\"method\":\"primary\"}",
+                            string("PUB=") + R1.pub + " PRIV=" + dhex + " WIF=" + wif + " R=" + R1.r_hex + " (primary)"
+                        );
                         string khex=bn_hex(k.n);
                         store.add_k(R1.r_hex, khex);
                         BNWrap nk; BN_mod_sub(nk.n, C.N, k.n, C.N, C.ctx);
@@ -501,13 +542,17 @@ static int delta_scan_bucket(Ctx& C, Secp& S, const vector<Row>& rows,
                     }
                     string wif = priv_to_wif(dhex,true,true);
                     store.add_priv(pub_out, dhex);
-                    ofstream(out_json, ios::app)
-                        << "{\"pubkey\":\""<<pub_out<<"\",\"priv_hex\":\""<<dhex<<"\",\"wif\":\""<<wif<<"\","
-                        << "\"method\":\"delta\",\"delta\":\""<<bn_hex(delta.n)<<"\"}\n";
-                    ofstream(out_txt, ios::app)
-                        << "PUB="<<pub_out<<" PRIV="<<dhex<<" WIF="<<wif
-                        << " via "<<R1.txid<<":"<<R1.vin<<" & "<<R2.txid<<":"<<R2.vin
-                        << " (delta="<<bn_hex(delta.n)<<")\n";
+                    GOUT.emit_unique_key(
+                        out_json,
+                        out_txt,
+                        pub_out,
+                        dhex,
+                        string("{\"pubkey\":\"") + pub_out + "\",\"priv_hex\":\"" + dhex +
+                        "\",\"wif\":\"" + wif + "\",\"method\":\"delta\",\"delta\":\"" + bn_hex(delta.n) + "\"}",
+                        string("PUB=") + pub_out + " PRIV=" + dhex + " WIF=" + wif +
+                        " via " + R1.txid + ":" + to_string(R1.vin) + " & " + R2.txid + ":" + to_string(R2.vin) +
+                        " (delta=" + bn_hex(delta.n) + ")"
+                    );
                     ofstream(out_delta, ios::app)
                         << "{\"pubkey\":\""<<pub_out<<"\",\"delta_hex\":\""<<bn_hex(delta.n)<<"\","
                         << "\"pair\":[{\"r\":\""<<R1.r_hex<<"\",\"s\":\""<<R1.s_hex<<"\",\"z\":\""<<R1.z_hex<<"\"},"
@@ -624,13 +669,18 @@ static int lcg_scan_bucket(Ctx& C, Secp& S, const vector<Row>& rows,
 
                     string wif = priv_to_wif(dhex,true,true);
                     store.add_priv(R1.pub, dhex);
-                    ofstream(out_json, ios::app)
-                        << "{\"pubkey\":\""<<R1.pub<<"\",\"priv_hex\":\""<<dhex<<"\",\"wif\":\""<<wif<<"\","
-                        << "\"method\":\"affine-lcg\",\"a\":\""<<bn_hex(a_bn.n)<<"\",\"b\":\""<<bn_hex(b_bn.n)<<"\"}\n";
-                    ofstream(out_txt, ios::app)
-                        << "PUB="<<R1.pub<<" PRIV="<<dhex<<" WIF="<<wif
-                        << " via "<<R1.txid<<":"<<R1.vin<<" & "<<R2.txid<<":"<<R2.vin
-                        << " (affine-lcg a="<<bn_hex(a_bn.n)<<", b="<<bn_hex(b_bn.n)<<")\n";
+                    GOUT.emit_unique_key(
+                        out_json,
+                        out_txt,
+                        R1.pub,
+                        dhex,
+                        string("{\"pubkey\":\"") + R1.pub + "\",\"priv_hex\":\"" + dhex +
+                        "\",\"wif\":\"" + wif + "\",\"method\":\"affine-lcg\",\"a\":\"" +
+                        bn_hex(a_bn.n) + "\",\"b\":\"" + bn_hex(b_bn.n) + "\"}",
+                        string("PUB=") + R1.pub + " PRIV=" + dhex + " WIF=" + wif +
+                        " via " + R1.txid + ":" + to_string(R1.vin) + " & " + R2.txid + ":" + to_string(R2.vin) +
+                        " (affine-lcg a=" + bn_hex(a_bn.n) + ", b=" + bn_hex(b_bn.n) + ")"
+                    );
                     ofstream(out_delta, ios::app)
                         << "{\"pubkey\":\""<<R1.pub<<"\",\"why\":\"affine-lcg\","
                         << "\"pair\":[{\"r\":\""<<R1.r_hex<<"\",\"s\":\""<<R1.s_hex<<"\",\"z\":\""<<R1.z_hex<<"\"},"
@@ -703,11 +753,15 @@ static pair<int,int> propagate_on_bucket(Ctx& C, Secp& S,
                 if(!R.pub.empty() && R.pub!=pubs.first && R.pub!=pubs.second) continue;
                 string wif=priv_to_wif(dhex,true,true);
                 store.add_priv(pub_out, dhex);
-                ofstream(out_json, ios::app)
-                    << "{\"pubkey\":\""<<pub_out<<"\",\"priv_hex\":\""<<dhex<<"\",\"wif\":\""<<wif<<"\","
-                    << "\"r\":\""<<R.r_hex<<"\",\"method\":\"propagate\"}\n";
-                ofstream(out_txt, ios::app)
-                    << "PUB="<<pub_out<<" PRIV="<<dhex<<" WIF="<<wif<<" R="<<R.r_hex<<" (propagate)\n";
+                GOUT.emit_unique_key(
+                    out_json,
+                    out_txt,
+                    pub_out,
+                    dhex,
+                    string("{\"pubkey\":\"") + pub_out + "\",\"priv_hex\":\"" + dhex +
+                    "\",\"wif\":\"" + wif + "\",\"r\":\"" + R.r_hex + "\",\"method\":\"propagate\"}",
+                    string("PUB=") + pub_out + " PRIV=" + dhex + " WIF=" + wif + " R=" + R.r_hex + " (propagate)"
+                );
                 new_d++;
             }
         }
@@ -906,6 +960,7 @@ static size_t seed_from_known_privs(const std::string& sigs_path,
                                     const std::string& keys_path,
                                     const std::string& out_k_path,
                                     const std::string& out_json_path,
+                                    const std::string& out_txt_path,
                                     secp256k1_context* ctx)
 {
     // 1) read keys
@@ -1011,10 +1066,16 @@ static size_t seed_from_known_privs(const std::string& sigs_path,
             if(!wrote_pub.count(pub)){
                 wrote_pub.insert(pub);
                 std::string wif = make_wif(pe.d, true, true);
-                std::ofstream fj(out_json_path, std::ios::app);
-                fj << "{\"pubkey\":\""<<pub<<"\",\"priv_hex\":\""
-                   << hex_lower(pe.d.data(),32)
-                   << "\",\"wif\":\""<< wif << "\",\"method\":\"seed-from-known-priv\"}\n";
+                std::string priv_hex = hex_lower(pe.d.data(),32);
+                GOUT.emit_unique_key(
+                    out_json_path,
+                    out_txt_path,
+                    pub,
+                    priv_hex,
+                    std::string("{\"pubkey\":\"") + pub + "\",\"priv_hex\":\"" + priv_hex +
+                    "\",\"wif\":\"" + wif + "\",\"method\":\"seed-from-known-priv\"}",
+                    std::string("PUB=") + pub + " PRIV=" + priv_hex + " WIF=" + wif + " (seed-from-known-priv)"
+                );
             }
             BN_free(br); BN_free(bs); BN_free(bz); BN_free(bd);
             BN_free(tmp); BN_free(k); BN_free(invS); BN_free(nk);
@@ -1217,7 +1278,7 @@ int main(int argc, char** argv){
     if(!A.preload_priv.empty()){
         std::string seed_outk = A.out_k.empty() ? std::string("recovered_k_from_priv.jsonl") : A.out_k;
         Secp secp; // context for pub derivation
-        size_t seeded = seed_from_known_privs(A.sigs, A.preload_priv, seed_outk, A.out_json, secp.ctx);
+        size_t seeded = seed_from_known_privs(A.sigs, A.preload_priv, seed_outk, A.out_json, A.out_txt, secp.ctx);
         std::cerr << "[preload-priv] r-buckets seeded from known privs: " << seeded 
                   << " -> " << seed_outk << std::endl;
         // load into RAM store too
@@ -1285,9 +1346,14 @@ int main(int argc, char** argv){
                 total_delta_nopub += f_delta_nopub;
                 total_lcg += f_lcg;
             }
-            cerr<<"[bucket "<<fs::path(path).filename().string()<<"] rows="<<rows.size()
-                <<" dupR="<<f_dup<<" delta="<<f_delta<<" delta_nopub="<<f_delta_nopub<<" lcg="<<f_lcg
-                <<" pairs_tested="<<pairs_tested<<"\n";
+            log_line(
+                string("[bucket ") + fs::path(path).filename().string() + "] rows=" + to_string(rows.size()) +
+                " dupR=" + to_string(f_dup) +
+                " delta=" + to_string(f_delta) +
+                " delta_nopub=" + to_string(f_delta_nopub) +
+                " lcg=" + to_string(f_lcg) +
+                " pairs_tested=" + to_string(pairs_tested)
+            );
             pairs_tested=0; // reset local count for the next bucket
         }
     };

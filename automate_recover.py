@@ -133,6 +133,16 @@ from pathlib import Path
 from typing import Any
 
 
+def resolve_python_executable() -> str:
+    """Prefer active virtualenv interpreter when available for subprocess parity."""
+    venv = os.environ.get("VIRTUAL_ENV", "").strip()
+    if venv:
+        cand = Path(venv) / "bin" / "python3"
+        if cand.exists() and os.access(cand, os.X_OK):
+            return str(cand)
+    return sys.executable
+
+
 def run_cmd(cmd: list[str]) -> int:
     print("$", " ".join(shlex.quote(x) for x in cmd))
     p = subprocess.run(cmd)
@@ -635,8 +645,11 @@ def main() -> None:
         print("No signatures available yet; skipping audit/recover for this cycle.")
         return
 
+    py_exec = resolve_python_executable()
+    print(f"[python] using interpreter: {py_exec}")
+
     audit_cmd = [
-        sys.executable,
+        py_exec,
         "ecdsa_signature_audit.py",
         str(sigs),
         "--out",
