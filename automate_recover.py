@@ -248,18 +248,24 @@ def run_recover_stage(
     threads: int,
     max_iter: int,
     stage_name: str,
+    recover_json_out: str,
+    recover_txt_out: str,
+    recover_k_out: str,
+    recover_deltas_out: str,
+    recover_collisions_out: str,
+    recover_clusters_out: str,
     extra_args: list[str],
 ) -> int:
     rec_cmd = [
         recover_bin,
         "--sigs", recover_input,
         "--threads", str(threads),
-        "--out-json", "recovered_keys.jsonl",
-        "--out-txt", "recovered_keys.txt",
-        "--out-k", "recovered_k.jsonl",
-        "--out-deltas", "delta_insights.jsonl",
-        "--report-collisions", "r_collisions.jsonl",
-        "--export-clusters", "dupR_clusters.jsonl",
+        "--out-json", recover_json_out,
+        "--out-txt", recover_txt_out,
+        "--out-k", recover_k_out,
+        "--out-deltas", recover_deltas_out,
+        "--report-collisions", recover_collisions_out,
+        "--export-clusters", recover_clusters_out,
         "--max-iter", str(max_iter),
     ] + extra_args
     print(f"[recover-stage] {stage_name}")
@@ -704,6 +710,24 @@ def main() -> None:
                     help="Filtered signature file for recover")
     ap.add_argument("--cluster-report", default="cluster_risk_report.json",
                     help="Cluster risk report JSON")
+    ap.add_argument("--recover-json-out", default="recovered_keys.jsonl",
+                    help="Recovery output JSONL path")
+    ap.add_argument("--recover-txt-out", default="recovered_keys.txt",
+                    help="Recovery output TXT path")
+    ap.add_argument("--recover-k-out", default="recovered_k.jsonl",
+                    help="Recovered k output JSONL path")
+    ap.add_argument("--recover-deltas-out", default="delta_insights.jsonl",
+                    help="Delta insights JSONL path")
+    ap.add_argument("--recover-collisions-out", default="r_collisions.jsonl",
+                    help="Collision report JSONL path")
+    ap.add_argument("--recover-clusters-out", default="dupR_clusters.jsonl",
+                    help="Exported duplicate-R cluster JSONL path")
+    ap.add_argument("--hnp-candidates-out", default="hnp_lll_bkz_candidates.txt",
+                    help="HNP solver candidate output path")
+    ap.add_argument("--stage0-subset-out", default="signatures.dup_r_focus.jsonl",
+                    help="Path for the duplicate-r focus subset")
+    ap.add_argument("--strong-signal-out", default="signatures.strong_signal.jsonl",
+                    help="Path for the strongest-signal subset used by random-k stage")
     ap.add_argument("--disable-cluster-gating", action="store_true",
                     help="Recover on full signature file (legacy behavior)")
     ap.add_argument("--enable-advanced-recover", action="store_true", default=True,
@@ -722,6 +746,14 @@ def main() -> None:
                     help="Minimum verifiable signatures before invalid-ratio quality gate is enforced")
     ap.add_argument("--fusion-min-confidence", type=float, default=0.45,
                     help="Minimum signal_fusion confidence to allow recovery without hard signal")
+    ap.add_argument("--full-scan-fallback", action="store_true", default=True,
+                    help="If filtered recovery yields no new valid rows, automatically retry on the full signature file")
+    ap.add_argument("--no-full-scan-fallback", action="store_false", dest="full_scan_fallback",
+                    help="Disable automatic retry on the full signature file")
+    ap.add_argument("--fallback-max-iter", type=int, default=3,
+                    help="max-iter used by the automatic full-input fallback pass")
+    ap.add_argument("--fallback-random-k-budget", type=int, default=4096,
+                    help="Random-k budget for the automatic full-input fallback pass")
     ap.add_argument("--auto-tune", action="store_true", default=True,
                     help="Auto-tune resource-sensitive parameters from machine CPU/RAM (default: enabled)")
     ap.add_argument("--no-auto-tune", action="store_false", dest="auto_tune",
@@ -732,6 +764,23 @@ def main() -> None:
     sigs = Path(args.sigs)
     if not sigs.exists():
         raise FileNotFoundError(f"Missing signatures file: {sigs}")
+    for out_path in (
+        args.audit_report,
+        args.decision_out,
+        args.clustered_sigs_out,
+        args.cluster_report,
+        args.recover_json_out,
+        args.recover_txt_out,
+        args.recover_k_out,
+        args.recover_deltas_out,
+        args.recover_collisions_out,
+        args.recover_clusters_out,
+        args.hnp_candidates_out,
+        args.stage0_subset_out,
+        args.strong_signal_out,
+        args.baseline_report,
+    ):
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     sig_rows = count_nonempty_lines(sigs)
     if sig_rows == 0:
         print("No signatures available yet; skipping audit/recover for this cycle.")
@@ -878,7 +927,7 @@ def main() -> None:
         effective_cluster_threshold = max(0, effective_cluster_threshold - 10)
     # Stage0 is built from the full input before any cluster filtering.
     stage0_subset_info = None
-    stage0_path = Path("signatures.dup_r_focus.jsonl")
+    stage0_path = Path(args.stage0_subset_out)
     if dup_r > 0:
         stage0_subset_info = build_duplicate_r_focus_subset(sigs, stage0_path)
 
@@ -958,7 +1007,7 @@ def main() -> None:
         hnp_input,
         bits_known=6,
         q=None,
-        out_path="hnp_lll_bkz_candidates.txt",
+        out_path=args.hnp_candidates_out,
         timeout_sec=args.hnp_timeout_sec,
         min_leaks=args.hnp_min_leaks,
     )
@@ -968,6 +1017,15 @@ def main() -> None:
     # stage2: enable LCG/delta if anomaly signal is strong
     # stage3: optional random-k budget, only on strongest signals
     stage_runs = []
+    pre_recover_validation = post_validate_recovered(Path(args.recover_json_out))
+    strong_signal = (
+        risk >= max(args.risk_threshold, 80)
+        or cross_pub_dup_r > 0
+        or dup_r > 0
+        or drift_flags > 0
+        or sighash_anomaly
+        or signer_drift_flagged > 0
+    )
     stage1_threads = args.threads
     stage1_iter = max(1, args.max_iter)
     if low_quality_data:
@@ -982,20 +1040,18 @@ def main() -> None:
         threads=stage1_threads,
         max_iter=stage1_iter,
         stage_name="stage1-primary",
+        recover_json_out=args.recover_json_out,
+        recover_txt_out=args.recover_txt_out,
+        recover_k_out=args.recover_k_out,
+        recover_deltas_out=args.recover_deltas_out,
+        recover_collisions_out=args.recover_collisions_out,
+        recover_clusters_out=args.recover_clusters_out,
         extra_args=stage1_extra,
     )
     stage_runs.append({"name": "stage1-primary", "rc": stage1_rc})
     if stage1_rc != 0:
         raise RuntimeError(f"Recover stage1 failed with exit code {stage1_rc}")
 
-    strong_signal = (
-        risk >= max(args.risk_threshold, 80)
-        or cross_pub_dup_r > 0
-        or dup_r > 0
-        or drift_flags > 0
-        or sighash_anomaly
-        or signer_drift_flagged > 0
-    )
     if allow_advanced and strong_signal:
         if low_quality_data:
             # Constrained advanced pass for low-quality datasets:
@@ -1013,6 +1069,12 @@ def main() -> None:
             threads=stage2_threads,
             max_iter=stage2_iter,
             stage_name="stage2-lcg-delta",
+            recover_json_out=args.recover_json_out,
+            recover_txt_out=args.recover_txt_out,
+            recover_k_out=args.recover_k_out,
+            recover_deltas_out=args.recover_deltas_out,
+            recover_collisions_out=args.recover_collisions_out,
+            recover_clusters_out=args.recover_clusters_out,
             extra_args=["--scan-random-k", "0"],
         )
         stage_runs.append({"name": "stage2-lcg-delta", "rc": stage2_rc})
@@ -1025,7 +1087,7 @@ def main() -> None:
             and (cross_pub_dup_r > 0 or drift_flags > 0 or risk >= 120)
         ):
             stage3_input = recover_input
-            strong_subset = Path("signatures.strong_signal.jsonl")
+            strong_subset = Path(args.strong_signal_out)
             selected = build_strong_signal_subset_from_cluster_report(
                 sig_path=Path(recover_input),
                 cluster_report_path=Path(args.cluster_report),
@@ -1039,13 +1101,71 @@ def main() -> None:
                 threads=min(max(2, args.threads), 16),
                 max_iter=max(args.max_iter, 3 if fusion_tier == "critical" else 2),
                 stage_name="stage3-random-k",
+                recover_json_out=args.recover_json_out,
+                recover_txt_out=args.recover_txt_out,
+                recover_k_out=args.recover_k_out,
+                recover_deltas_out=args.recover_deltas_out,
+                recover_collisions_out=args.recover_collisions_out,
+                recover_clusters_out=args.recover_clusters_out,
                 extra_args=["--scan-random-k", str(args.random_k_budget)],
             )
             stage_runs.append({"name": "stage3-random-k", "rc": stage3_rc})
             if stage3_rc != 0:
                 raise RuntimeError(f"Recover stage3 failed with exit code {stage3_rc}")
 
-    post_validation = post_validate_recovered(Path("recovered_keys.jsonl"))
+    post_validation = post_validate_recovered(Path(args.recover_json_out))
+    if (
+        args.full_scan_fallback
+        and recover_input != str(sigs)
+        and strong_signal
+        and post_validation["valid_rows"] <= pre_recover_validation["valid_rows"]
+    ):
+        print("Filtered recovery yielded no new valid rows; escalating to full-input fallback.")
+        fallback_iter = max(args.max_iter, args.fallback_max_iter)
+        fallback_threads = min(max(2, args.threads), 16)
+        if fusion_tier == "critical":
+            fallback_iter = max(fallback_iter, 4)
+        fallback_rc = run_recover_stage(
+            recover_bin=args.recover_bin,
+            recover_input=str(sigs),
+            threads=fallback_threads,
+            max_iter=fallback_iter,
+            stage_name="fallback-full-lcg-delta",
+            recover_json_out=args.recover_json_out,
+            recover_txt_out=args.recover_txt_out,
+            recover_k_out=args.recover_k_out,
+            recover_deltas_out=args.recover_deltas_out,
+            recover_collisions_out=args.recover_collisions_out,
+            recover_clusters_out=args.recover_clusters_out,
+            extra_args=[],
+        )
+        stage_runs.append({"name": "fallback-full-lcg-delta", "rc": fallback_rc})
+        if fallback_rc != 0:
+            raise RuntimeError(f"Recover full-input fallback failed with exit code {fallback_rc}")
+
+        fallback_random_budget = max(0, int(args.fallback_random_k_budget))
+        if fallback_random_budget > 0:
+            fallback_random_rc = run_recover_stage(
+                recover_bin=args.recover_bin,
+                recover_input=str(sigs),
+                threads=fallback_threads,
+                max_iter=max(fallback_iter, 4 if fusion_tier == "critical" else 3),
+                stage_name="fallback-full-random-k",
+                recover_json_out=args.recover_json_out,
+                recover_txt_out=args.recover_txt_out,
+                recover_k_out=args.recover_k_out,
+                recover_deltas_out=args.recover_deltas_out,
+                recover_collisions_out=args.recover_collisions_out,
+                recover_clusters_out=args.recover_clusters_out,
+                extra_args=["--scan-random-k", str(fallback_random_budget)],
+            )
+            stage_runs.append({"name": "fallback-full-random-k", "rc": fallback_random_rc})
+            if fallback_random_rc != 0:
+                raise RuntimeError(
+                    f"Recover full-input random-k fallback failed with exit code {fallback_random_rc}"
+                )
+        post_validation = post_validate_recovered(Path(args.recover_json_out))
+
     print(f"Recovery automation complete. input={recover_input}")
     write_decision(args.decision_out, {
         "should_recover": True,

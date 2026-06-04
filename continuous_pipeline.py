@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import shlex
+import re
 import subprocess
 import sys
 import urllib.parse
@@ -80,6 +81,7 @@ def apply_live_backoff(args: argparse.Namespace, sample: dict[str, float]) -> tu
     cpu = max(1, int(sample["cpu_count"]))
     mem_avail = float(sample["mem_available_gib"])
     load_ratio = float(sample["load_ratio"])
+    max_discovery = getattr(args, "discovery_mode", "balanced") == "max"
 
     level = 0
     if mem_avail < 0.75 or load_ratio >= 2.0:
@@ -107,14 +109,14 @@ def apply_live_backoff(args: argparse.Namespace, sample: dict[str, float]) -> tu
         eff_threads = max(1, min(eff_threads, max(1, cpu // 3)))
         eff_max_clusters = max(15, min(eff_max_clusters, 50))
         eff_max_iter = 1
-        eff_random_k = 0
+        eff_random_k = min(eff_random_k, 1024) if max_discovery else 0
         eff_cluster_min_sigs = max(eff_cluster_min_sigs, 30)
         eff_cluster_risk = max(eff_cluster_risk, 20)
     elif level == 3:
         eff_threads = max(1, min(eff_threads, max(1, cpu // 4)))
         eff_max_clusters = max(10, min(eff_max_clusters, 30))
         eff_max_iter = 1
-        eff_random_k = 0
+        eff_random_k = min(eff_random_k, 256) if max_discovery else 0
         eff_cluster_min_sigs = max(eff_cluster_min_sigs, 40)
         eff_cluster_risk = max(eff_cluster_risk, 25)
 
@@ -132,6 +134,7 @@ def apply_live_backoff(args: argparse.Namespace, sample: dict[str, float]) -> tu
 def auto_tune_pipeline_args(args: argparse.Namespace, argv: list[str]) -> None:
     cpu = max(1, os.cpu_count() or 1)
     mem_gib = _detect_mem_gib()
+    max_discovery = getattr(args, "discovery_mode", "balanced") == "max"
 
     if mem_gib < 4:
         thr_auto = min(2, cpu)
@@ -167,10 +170,23 @@ def auto_tune_pipeline_args(args: argparse.Namespace, argv: list[str]) -> None:
     if not _flag_provided(argv, "--random-k-budget"):
         args.random_k_budget = rk_auto
 
+    if max_discovery:
+        if not _flag_provided(argv, "--cluster-min-sigs"):
+            args.cluster_min_sigs = max(8, min(int(args.cluster_min_sigs), 15 if mem_gib < 16 else 12))
+        if not _flag_provided(argv, "--cluster-risk-threshold"):
+            args.cluster_risk_threshold = max(5, min(int(args.cluster_risk_threshold), 10))
+        if not _flag_provided(argv, "--max-clusters"):
+            args.max_clusters = max(int(args.max_clusters), 80 if mem_gib < 16 else 150)
+        if not _flag_provided(argv, "--max-iter"):
+            args.max_iter = max(int(args.max_iter), 2 if mem_gib < 16 else 3)
+        if not _flag_provided(argv, "--random-k-budget"):
+            args.random_k_budget = max(int(args.random_k_budget), 1024 if mem_gib < 16 else 4096)
+
     print(
         "[auto-tune]",
         f"cpu={cpu}",
         f"mem_gib={mem_gib:.1f}",
+        f"discovery_mode={getattr(args, 'discovery_mode', 'balanced')}",
         f"threads={args.threads}",
         f"cluster_min_sigs={args.cluster_min_sigs}",
         f"cluster_risk_threshold={args.cluster_risk_threshold}",
@@ -379,6 +395,45 @@ def count_lines(path: Path) -> int:
         return sum(1 for line in f if line.strip())
 
 
+def _safe_name(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    return cleaned or "artifact"
+
+
+def _resolve_artifact_path(configured: str, default_name: str, cycle_dir: Path) -> Path:
+    p = Path(configured)
+    # Keep default names run/cycle-local, but honor explicit custom paths.
+    if p == Path(default_name):
+        return cycle_dir / default_name
+    return p
+
+
+def build_cycle_artifact_paths(run_dir: Path, cycle: int, cycle_start: int, args: argparse.Namespace) -> dict[str, Path]:
+    cycle_dir = run_dir / f"cycle_{cycle:04d}_h{cycle_start}"
+    cycle_dir.mkdir(parents=True, exist_ok=True)
+    audit_report = _resolve_artifact_path(args.audit_report, "ecdsa_audit_report.json", cycle_dir)
+    decision_report = _resolve_artifact_path(args.decision_report, "automate_decision.json", cycle_dir)
+    recovered_json = _resolve_artifact_path(args.recovered, "recovered_keys.jsonl", cycle_dir)
+    for p in (audit_report, decision_report, recovered_json):
+        p.parent.mkdir(parents=True, exist_ok=True)
+    return {
+        "dir": cycle_dir,
+        "audit_report": audit_report,
+        "decision_report": decision_report,
+        "recovered_json": recovered_json,
+        "recovered_txt": cycle_dir / "recovered_keys.txt",
+        "recovered_k": cycle_dir / "recovered_k.jsonl",
+        "recover_deltas": cycle_dir / "delta_insights.jsonl",
+        "recover_collisions": cycle_dir / "r_collisions.jsonl",
+        "recover_clusters": cycle_dir / "dupR_clusters.jsonl",
+        "clustered_sigs": cycle_dir / "signatures.clustered.jsonl",
+        "cluster_report": cycle_dir / "cluster_risk_report.json",
+        "hnp_candidates": cycle_dir / "hnp_lll_bkz_candidates.txt",
+        "stage0_subset": cycle_dir / "signatures.dup_r_focus.jsonl",
+        "strong_signal": cycle_dir / "signatures.strong_signal.jsonl",
+    }
+
+
 def tail_nonempty_lines(path: Path, limit: int) -> list[str]:
     if limit <= 0 or not path.exists():
         return []
@@ -424,6 +479,8 @@ def main() -> None:
     ap.add_argument("--cluster-risk-threshold", type=int, default=20)
     ap.add_argument("--max-clusters", type=int, default=50)
     ap.add_argument("--max-iter", type=int, default=2)
+    ap.add_argument("--discovery-mode", choices=("balanced", "max"), default="max",
+                    help="balanced = cheaper selective recovery, max = wider automatic search and fallback")
     ap.add_argument("--enable-advanced-recover", action="store_true", default=True)
     ap.add_argument("--no-enable-advanced-recover", action="store_false", dest="enable_advanced_recover")
     ap.add_argument("--random-k-budget", type=int, default=0,
@@ -449,6 +506,8 @@ def main() -> None:
                     help="Append-only timeline log for per-cycle events")
     ap.add_argument("--reports-dir", default="reports",
                     help="Directory for nightly summary JSON/MD")
+    ap.add_argument("--runs-dir", default="runs",
+                    help="Directory for per-run and per-cycle isolated artifacts")
     ap.add_argument("--alert-state", default="reports/alert_state.json",
                     help="Alert dedup/rate-limit state file")
     ap.add_argument("--alert-cooldown-minutes", type=int, default=180,
@@ -490,6 +549,20 @@ def main() -> None:
     bot_token = args.telegram_bot_token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id = args.telegram_chat_id or os.environ.get("TELEGRAM_CHAT_ID", "")
     alert_state_path = Path(args.alert_state)
+    run_stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_id = f"{run_stamp}_pipeline_h{args.start_height}_p{os.getpid()}"
+    run_dir = Path(args.runs_dir) / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    save_json(run_dir / "run_manifest.json", {
+        "run_id": run_id,
+        "started_at_utc": now_utc_iso(),
+        "start_height": args.start_height,
+        "batch_size": args.batch_size,
+        "max_cycles": args.max_cycles,
+        "discovery_mode": args.discovery_mode,
+        "python": args.python,
+    })
+    print(f"[run] run_id={run_id} artifacts_dir={run_dir}")
 
     if args.telegram_startup_test and bot_token and telegram_chat_id:
         startup_msg = (
@@ -510,6 +583,7 @@ def main() -> None:
 
         cycle_start = current_start
         print(f"\\n=== Cycle {cycle} | start={cycle_start} | batch={args.batch_size} ===")
+        cycle_artifacts = build_cycle_artifact_paths(run_dir, cycle, cycle_start, args)
 
         effective = {
             "threads": int(args.threads),
@@ -536,7 +610,7 @@ def main() -> None:
             f"random_k_budget={effective['random_k_budget']}",
         )
 
-        before_recovered = count_lines(Path(args.recovered))
+        before_recovered = count_lines(cycle_artifacts["recovered_json"])
 
         download_cmd = [
             args.python,
@@ -551,15 +625,16 @@ def main() -> None:
 
         # Reset HNP candidates file per cycle to avoid stale counts in alerts.
         try:
-            Path("hnp_lll_bkz_candidates.txt").unlink(missing_ok=True)
+            cycle_artifacts["hnp_candidates"].unlink(missing_ok=True)
         except Exception:
             pass
         recover_cmd = [
             args.python,
             "automate_recover.py",
             "--sigs", args.signatures,
-            "--audit-report", args.audit_report,
-            "--decision-out", args.decision_report,
+            "--audit-report", str(cycle_artifacts["audit_report"]),
+            "--decision-out", str(cycle_artifacts["decision_report"]),
+            "--baseline-report", str(run_dir / "ecdsa_audit_report_prev.json"),
             "--threads", str(effective["threads"]),
             "--risk-threshold", str(args.risk_threshold),
             "--cluster-min-sigs", str(effective["cluster_min_sigs"]),
@@ -569,7 +644,22 @@ def main() -> None:
             "--random-k-budget", str(effective["random_k_budget"]),
             "--hnp-timeout-sec", str(args.hnp_timeout_sec),
             "--hnp-min-leaks", str(args.hnp_min_leaks),
+            "--clustered-sigs-out", str(cycle_artifacts["clustered_sigs"]),
+            "--cluster-report", str(cycle_artifacts["cluster_report"]),
+            "--recover-json-out", str(cycle_artifacts["recovered_json"]),
+            "--recover-txt-out", str(cycle_artifacts["recovered_txt"]),
+            "--recover-k-out", str(cycle_artifacts["recovered_k"]),
+            "--recover-deltas-out", str(cycle_artifacts["recover_deltas"]),
+            "--recover-collisions-out", str(cycle_artifacts["recover_collisions"]),
+            "--recover-clusters-out", str(cycle_artifacts["recover_clusters"]),
+            "--hnp-candidates-out", str(cycle_artifacts["hnp_candidates"]),
+            "--stage0-subset-out", str(cycle_artifacts["stage0_subset"]),
+            "--strong-signal-out", str(cycle_artifacts["strong_signal"]),
+            "--fallback-max-iter", str(max(4 if args.discovery_mode == "max" else 3, effective["max_iter"])),
+            "--fallback-random-k-budget", str(max(effective["random_k_budget"], 4096 if args.discovery_mode == "max" else 1024)),
         ]
+        if args.discovery_mode == "max":
+            recover_cmd.append("--full-scan-fallback")
         if args.auto_tune:
             recover_cmd.append("--auto-tune")
         else:
@@ -584,16 +674,16 @@ def main() -> None:
             current_start += args.batch_size
             continue
 
-        after_recovered = count_lines(Path(args.recovered))
+        after_recovered = count_lines(cycle_artifacts["recovered_json"])
         new_rows = max(0, after_recovered - before_recovered)
         print(f"Cycle {cycle} complete: recovered_new_rows={new_rows}")
 
         anomaly_alert = None
         anomaly_fingerprint_value = None
         decision_obj = {}
-        decision_path = Path(args.decision_report)
-        audit_path = Path(args.audit_report)
-        hnp_candidates_path = Path("hnp_lll_bkz_candidates.txt")
+        decision_path = cycle_artifacts["decision_report"]
+        audit_path = cycle_artifacts["audit_report"]
+        hnp_candidates_path = cycle_artifacts["hnp_candidates"]
         hnp_candidate_count = count_lines(hnp_candidates_path)
         if decision_path.exists():
             try:
@@ -666,10 +756,11 @@ def main() -> None:
 
         if new_rows > 0:
             if bot_token and telegram_chat_id:
-                key_lines = format_recovered_rows_for_telegram(Path(args.recovered), min(new_rows, 3))
+                key_lines = format_recovered_rows_for_telegram(cycle_artifacts["recovered_json"], min(new_rows, 3))
                 key_block = "\n\n".join(key_lines) if key_lines else "n/a"
                 msg = (
                     "Recovered new rows.\n"
+                    f"run_id={run_id}\n"
                     f"cycle={cycle}\n"
                     f"start_height={cycle_start}\n"
                     f"batch_size={args.batch_size}\n"
@@ -702,9 +793,11 @@ def main() -> None:
         event = {
             "ts_utc": now_utc_iso(),
             "day": dt.datetime.now().date().isoformat(),
+            "run_id": run_id,
             "cycle": cycle,
             "start_height": cycle_start,
             "batch_size": args.batch_size,
+            "artifacts_dir": str(cycle_artifacts["dir"]),
             "new_recovered_rows": new_rows,
             "anomaly_detected": bool(anomaly_alert),
             "risk_score": decision_obj.get("risk_score"),
