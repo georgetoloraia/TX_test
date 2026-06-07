@@ -768,6 +768,11 @@ def main():
     parser.add_argument("--reduction-mode", type=str, default="LLL", choices=["LLL", "BKZ"], help="Lattice reduction mode")
     parser.add_argument("--bkz-blocksize", type=int, default=10, help="BKZ block size (if using BKZ)")
     parser.add_argument("--synthetic-test", action="store_true", help="Run synthetic regression test (CI mode)")
+    parser.add_argument(
+        "--allow-synthetic-failure",
+        action="store_true",
+        help="Diagnostic mode: keep exit code 0 even when --synthetic-test fails",
+    )
     parser.add_argument("--debug-algo", action="store_true", help="Verbose algorithm-correctness logs")
     parser.add_argument("--synthetic-n", type=int, default=8, help="Synthetic sample count (default: 8)")
     parser.add_argument(
@@ -1288,6 +1293,10 @@ def main():
         with open(os.path.join(out_dir, "bench_results.json"), "w", encoding="utf-8") as f:
             json.dump({"ground_truth_d": ground_truth_d, "found": found, "candidates": candidates}, f, indent=2)
         print(f"[SYNTHETIC] Success: {found}")
+        if not found and not config.get("allow_synthetic_failure"):
+            print("[E_SYNTHETIC_FAIL] HNP solver did not recover the synthetic ground-truth key.")
+            print("[E_SYNTHETIC_FAIL] Treat HNP output as diagnostic only until this regression passes.")
+            sys.exit(5)
 
     # Stop condition: candidate cap
     if len(candidates) > config.get("max_candidates", 1000):

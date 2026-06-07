@@ -127,7 +127,16 @@ def _hnp_worker(leaks, q, bits_known, solver_path, qout):
         clean = []
         for c in candidates:
             try:
-                clean.append(int(c))
+                d = int(c)
+            except Exception:
+                continue
+            # Treat the HNP solver as untrusted until its synthetic regression is
+            # consistently green. Only return candidates that satisfy the
+            # explicit nonce-bit leakage model on almost every row.
+            try:
+                verdict = hnp_solver.validate_candidate(d, leaks, q, bits_known)
+                if verdict.get("confidence") == "high":
+                    clean.append(d)
             except Exception:
                 continue
         qout.put(("ok", clean))
@@ -169,7 +178,10 @@ def try_hnp_lll_bkz_solver(
                     continue
                 r = parse_int(obj.get("r"))
                 s = parse_int(obj.get("s"))
-                m = parse_int(obj.get("z"))
+                z_raw = obj.get("z")
+                if z_raw is None:
+                    z_raw = obj.get("m")
+                m = parse_int(z_raw)
                 known_nonce = parse_int(known_nonce_raw)
                 leaks.append((r, s, m, known_nonce))
                 rows_with_known_nonce_bits += 1
@@ -219,6 +231,49 @@ def try_hnp_lll_bkz_solver(
     return candidates
 from pathlib import Path
 from typing import Any
+
+
+def count_known_nonce_rows(sig_path: Path) -> int:
+    keys = ("known_nonce_bits", "nonce_lsb", "k_lsb", "known_k_lsb")
+    count = 0
+    with sig_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(obj, dict) and any(k in obj for k in keys):
+                count += 1
+    return count
+
+
+def recovery_viability_label(
+    *,
+    stage0_subset_info: dict[str, Any] | None,
+    known_nonce_rows: int,
+    min_hnp_leaks: int,
+    dup_r: int,
+    cross_pub_dup_r: int,
+    strong_signal: bool,
+    external_candidate_requested: bool,
+) -> str:
+    """Classify whether the current evidence is recovery-grade or only anomalous."""
+    if external_candidate_requested:
+        return "external_candidate_validation"
+    if stage0_subset_info and int(stage0_subset_info.get("same_r_diff_s_groups", 0) or 0) > 0:
+        return "direct_nonce_reuse"
+    if known_nonce_rows >= int(min_hnp_leaks):
+        return "partial_nonce_leak"
+    if cross_pub_dup_r > 0:
+        return "cross_pub_duplicate_r_investigate"
+    if dup_r > 0:
+        return "replay_like_duplicate_r"
+    if strong_signal:
+        return "weak_anomaly_only"
+    return "none"
 
 
 def resolve_python_executable() -> str:
@@ -334,6 +389,73 @@ def count_nonempty_lines(path: Path) -> int:
         return 0
     with path.open("r", encoding="utf-8") as f:
         return sum(1 for line in f if line.strip())
+
+
+def sha256_file(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def build_external_candidate_args(args: argparse.Namespace) -> tuple[list[str], dict[str, Any]]:
+    extra: list[str] = []
+    report: dict[str, Any] = {
+        "enabled": False,
+        "preload_k_candidates": None,
+        "preload_priv_candidates": None,
+    }
+
+    if args.preload_k_candidates:
+        p = Path(args.preload_k_candidates)
+        if not p.exists():
+            raise FileNotFoundError(f"Missing --preload-k-candidates file: {p}")
+        extra += ["--preload-k", str(p)]
+        report["enabled"] = True
+        report["preload_k_candidates"] = {
+            "path": str(p),
+            "rows": count_nonempty_lines(p),
+            "sha256": sha256_file(p),
+        }
+
+    if args.preload_priv_candidates:
+        p = Path(args.preload_priv_candidates)
+        if not p.exists():
+            raise FileNotFoundError(f"Missing --preload-priv-candidates file: {p}")
+        extra += ["--preload-priv", str(p)]
+        report["enabled"] = True
+        # Do not inspect or echo candidate private material. Only artifact metadata.
+        report["preload_priv_candidates"] = {
+            "path": str(p),
+            "rows": count_nonempty_lines(p),
+            "sha256": sha256_file(p),
+        }
+
+    return extra, report
+
+
+def write_candidate_validation_report(
+    path: Path,
+    candidate_report: dict[str, Any],
+    pre_validation: dict[str, Any],
+    post_validation: dict[str, Any],
+) -> None:
+    if not candidate_report.get("enabled"):
+        return
+    new_valid_rows = int(post_validation.get("valid_rows", 0)) - int(pre_validation.get("valid_rows", 0))
+    payload = {
+        "external_candidates": candidate_report,
+        "pre_recover_validation": pre_validation,
+        "post_recover_validation": post_validation,
+        "key_recovered": new_valid_rows > 0,
+        "new_local_recovered_rows": max(0, new_valid_rows),
+        "priv_material": "LOCAL_ARTIFACT_ONLY",
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def build_duplicate_r_focus_subset(sig_path: Path, out_path: Path) -> dict[str, Any]:
@@ -724,6 +846,12 @@ def main() -> None:
                     help="Exported duplicate-R cluster JSONL path")
     ap.add_argument("--hnp-candidates-out", default="hnp_lll_bkz_candidates.txt",
                     help="HNP solver candidate output path")
+    ap.add_argument("--preload-k-candidates", default="",
+                    help="Local JSONL file with r plus 64-hex k candidates; passed to ecdsa_recover_strict --preload-k")
+    ap.add_argument("--preload-priv-candidates", default="",
+                    help="Local WIF/hex/decimal private-key candidate file; passed to ecdsa_recover_strict --preload-priv")
+    ap.add_argument("--candidate-validation-report", default="candidate_validation_report.json",
+                    help="Local metadata-only report for external candidate validation")
     ap.add_argument("--stage0-subset-out", default="signatures.dup_r_focus.jsonl",
                     help="Path for the duplicate-r focus subset")
     ap.add_argument("--strong-signal-out", default="signatures.strong_signal.jsonl",
@@ -776,6 +904,7 @@ def main() -> None:
         args.recover_collisions_out,
         args.recover_clusters_out,
         args.hnp_candidates_out,
+        args.candidate_validation_report,
         args.stage0_subset_out,
         args.strong_signal_out,
         args.baseline_report,
@@ -828,6 +957,7 @@ def main() -> None:
     fusion_tier = str(fusion.get("tier", "low") or "low")
     fusion_reco = str(fusion.get("recommendation", "monitor_only") or "monitor_only")
     vq = verification_quality(report)
+    external_candidate_requested = bool(args.preload_k_candidates or args.preload_priv_candidates)
     low_quality_data = (
         vq["enabled"]
         and vq["coincurve_available"]
@@ -850,6 +980,7 @@ def main() -> None:
 
     should_recover = (
         args.force_recover
+        or external_candidate_requested
         or risk >= args.risk_threshold
         or fusion_conf >= args.fusion_min_confidence
         or dup_r > 0
@@ -864,8 +995,10 @@ def main() -> None:
         or signer_drift_flagged > 0
         or sighash_anomaly
     )
-    if low_quality_data and not (hard_signal or args.force_recover):
+    if low_quality_data and not (hard_signal or args.force_recover or external_candidate_requested):
         should_recover = False
+
+    cluster_fallback_used = False
 
     if not should_recover:
         print("Recovery skipped by policy (low anomaly signal).")
@@ -883,6 +1016,7 @@ def main() -> None:
             "signal_fusion_recommendation": fusion_reco,
             "verification_quality": vq,
             "low_quality_data": low_quality_data,
+            "cluster_fallback_used": cluster_fallback_used,
             "recover_input": None,
             "cluster_gating_used": not args.disable_cluster_gating,
         })
@@ -894,7 +1028,7 @@ def main() -> None:
 
     recover_input = str(sigs)
     allow_advanced = args.enable_advanced_recover
-    if fusion_reco == "monitor_only" and not (hard_signal or args.force_recover):
+    if fusion_reco == "monitor_only" and not (hard_signal or args.force_recover or external_candidate_requested):
         print("Fusion recommendation is monitor_only; recovery skipped.")
         write_decision(args.decision_out, {
             "should_recover": False,
@@ -910,6 +1044,7 @@ def main() -> None:
             "signal_fusion_recommendation": fusion_reco,
             "verification_quality": vq,
             "low_quality_data": low_quality_data,
+            "cluster_fallback_used": cluster_fallback_used,
             "recover_input": None,
             "cluster_gating_used": not args.disable_cluster_gating,
         })
@@ -948,27 +1083,42 @@ def main() -> None:
             f"selected_signatures={cluster_report['selected_signatures']}",
         )
         if cluster_report["selected_signatures"] == 0 and not args.force_recover:
-            print("No suspicious clusters selected; recovery skipped.")
-            write_decision(args.decision_out, {
-                "should_recover": True,
-                "recover_executed": False,
-                "risk_score": risk,
-                "risk_verdict": verdict,
-                "duplicate_r": dup_r,
-                "cross_pub_duplicate_r": cross_pub_dup_r,
-                "drift_flags": drift_flags,
-                "sighash_anomaly": sighash_anomaly,
-                "signal_fusion_tier": fusion_tier,
-                "signal_fusion_confidence": fusion_conf,
-                "signal_fusion_recommendation": fusion_reco,
-                "verification_quality": vq,
-                "low_quality_data": low_quality_data,
-                "recover_input": None,
-                "cluster_gating_used": not args.disable_cluster_gating,
-                "effective_cluster_risk_threshold": effective_cluster_threshold,
-                "cluster_report": cluster_report,
-            })
-            return
+            strong_no_cluster_signal = (
+                fusion_tier in {"high", "critical"}
+                or risk >= args.risk_threshold + 20
+                or dup_r > 0
+                or cross_pub_dup_r > 0
+                or drift_flags > 0
+                or sighash_anomaly
+                or external_candidate_requested
+            )
+            if strong_no_cluster_signal:
+                cluster_fallback_used = True
+                recover_input = str(sigs)
+                print("No suspicious clusters selected, but strong signal is present; falling back to full-input recovery.")
+            else:
+                print("No suspicious clusters selected; recovery skipped.")
+                write_decision(args.decision_out, {
+                    "should_recover": True,
+                    "recover_executed": False,
+                    "risk_score": risk,
+                    "risk_verdict": verdict,
+                    "duplicate_r": dup_r,
+                    "cross_pub_duplicate_r": cross_pub_dup_r,
+                    "drift_flags": drift_flags,
+                    "sighash_anomaly": sighash_anomaly,
+                    "signal_fusion_tier": fusion_tier,
+                    "signal_fusion_confidence": fusion_conf,
+                    "signal_fusion_recommendation": fusion_reco,
+                    "verification_quality": vq,
+                    "low_quality_data": low_quality_data,
+                    "cluster_fallback_used": cluster_fallback_used,
+                    "recover_input": None,
+                    "cluster_gating_used": not args.disable_cluster_gating,
+                    "effective_cluster_risk_threshold": effective_cluster_threshold,
+                    "cluster_report": cluster_report,
+                })
+                return
         if cluster_report["selected_signatures"] > 0:
             recover_input = args.clustered_sigs_out
 
@@ -1003,7 +1153,7 @@ def main() -> None:
             print("[HNP/LLL/BKZ] Attempting key recovery from nontrivial duplicate-r group subset...")
     else:
         print("[HNP/LLL/BKZ] Attempting key recovery from selected recovery input...")
-    try_hnp_lll_bkz_solver(
+    hnp_candidates = try_hnp_lll_bkz_solver(
         hnp_input,
         bits_known=6,
         q=None,
@@ -1011,6 +1161,7 @@ def main() -> None:
         timeout_sec=args.hnp_timeout_sec,
         min_leaks=args.hnp_min_leaks,
     )
+    external_candidate_args, external_candidate_report = build_external_candidate_args(args)
 
     # Multi-stage recovery:
     # stage1: primary/cheap scan (disable LCG + no random-k)
@@ -1026,12 +1177,22 @@ def main() -> None:
         or sighash_anomaly
         or signer_drift_flagged > 0
     )
+    known_nonce_rows = count_known_nonce_rows(sigs)
+    recovery_viability = recovery_viability_label(
+        stage0_subset_info=stage0_subset_info,
+        known_nonce_rows=known_nonce_rows,
+        min_hnp_leaks=args.hnp_min_leaks,
+        dup_r=dup_r,
+        cross_pub_dup_r=cross_pub_dup_r,
+        strong_signal=strong_signal,
+        external_candidate_requested=external_candidate_requested,
+    )
     stage1_threads = args.threads
     stage1_iter = max(1, args.max_iter)
     if low_quality_data:
         stage1_threads = max(1, min(args.threads, 4))
         stage1_iter = 1
-    stage1_extra = ["--no-lcg", "--scan-random-k", "0"]
+    stage1_extra = ["--no-lcg", "--scan-random-k", "0"] + external_candidate_args
     if dup_r > 0:
         stage1_extra += ["--min-count", "1"]
     stage1_rc = run_recover_stage(
@@ -1075,7 +1236,7 @@ def main() -> None:
             recover_deltas_out=args.recover_deltas_out,
             recover_collisions_out=args.recover_collisions_out,
             recover_clusters_out=args.recover_clusters_out,
-            extra_args=["--scan-random-k", "0"],
+            extra_args=["--scan-random-k", "0"] + external_candidate_args,
         )
         stage_runs.append({"name": "stage2-lcg-delta", "rc": stage2_rc})
         if stage2_rc != 0:
@@ -1107,13 +1268,14 @@ def main() -> None:
                 recover_deltas_out=args.recover_deltas_out,
                 recover_collisions_out=args.recover_collisions_out,
                 recover_clusters_out=args.recover_clusters_out,
-                extra_args=["--scan-random-k", str(args.random_k_budget)],
+                extra_args=["--scan-random-k", str(args.random_k_budget)] + external_candidate_args,
             )
             stage_runs.append({"name": "stage3-random-k", "rc": stage3_rc})
             if stage3_rc != 0:
                 raise RuntimeError(f"Recover stage3 failed with exit code {stage3_rc}")
 
     post_validation = post_validate_recovered(Path(args.recover_json_out))
+    new_valid_rows = int(post_validation["valid_rows"]) - int(pre_recover_validation["valid_rows"])
     if (
         args.full_scan_fallback
         and recover_input != str(sigs)
@@ -1137,7 +1299,7 @@ def main() -> None:
             recover_deltas_out=args.recover_deltas_out,
             recover_collisions_out=args.recover_collisions_out,
             recover_clusters_out=args.recover_clusters_out,
-            extra_args=[],
+            extra_args=external_candidate_args,
         )
         stage_runs.append({"name": "fallback-full-lcg-delta", "rc": fallback_rc})
         if fallback_rc != 0:
@@ -1157,7 +1319,7 @@ def main() -> None:
                 recover_deltas_out=args.recover_deltas_out,
                 recover_collisions_out=args.recover_collisions_out,
                 recover_clusters_out=args.recover_clusters_out,
-                extra_args=["--scan-random-k", str(fallback_random_budget)],
+                extra_args=["--scan-random-k", str(fallback_random_budget)] + external_candidate_args,
             )
             stage_runs.append({"name": "fallback-full-random-k", "rc": fallback_random_rc})
             if fallback_random_rc != 0:
@@ -1165,11 +1327,26 @@ def main() -> None:
                     f"Recover full-input random-k fallback failed with exit code {fallback_random_rc}"
                 )
         post_validation = post_validate_recovered(Path(args.recover_json_out))
+        new_valid_rows = int(post_validation["valid_rows"]) - int(pre_recover_validation["valid_rows"])
+
+    write_candidate_validation_report(
+        Path(args.candidate_validation_report),
+        external_candidate_report,
+        pre_recover_validation,
+        post_validation,
+    )
 
     print(f"Recovery automation complete. input={recover_input}")
     write_decision(args.decision_out, {
         "should_recover": True,
         "recover_executed": True,
+        "search_attempted": True,
+        "recovery_viability": recovery_viability,
+        "known_nonce_rows": known_nonce_rows,
+        "hnp_candidate_rows": len(hnp_candidates or []),
+        "external_candidate_validation": external_candidate_report,
+        "key_recovered": new_valid_rows > 0,
+        "new_local_recovered_rows": max(0, new_valid_rows),
         "risk_score": risk,
         "risk_verdict": verdict,
         "duplicate_r": dup_r,
@@ -1181,6 +1358,7 @@ def main() -> None:
         "signal_fusion_recommendation": fusion_reco,
         "verification_quality": vq,
         "low_quality_data": low_quality_data,
+        "cluster_fallback_used": cluster_fallback_used,
         "effective_cluster_risk_threshold": effective_cluster_threshold,
         "recover_input": recover_input,
         "cluster_gating_used": not args.disable_cluster_gating,

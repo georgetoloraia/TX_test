@@ -1347,7 +1347,23 @@ int main(int argc, char** argv){
                                         store, A.out_json, A.out_txt, A.out_deltas, pairs_tested);
             } else f_lcg = 0;
 
-            if(f_dup+f_delta+f_delta_nopub+f_lcg>0){
+            bool has_preloaded_seed = false;
+            for(const auto& rw : rows){
+                if(!rw.pub.empty()){
+                    string priv;
+                    if(store.get_priv_pub(rw.pub, priv)){
+                        has_preloaded_seed = true;
+                        break;
+                    }
+                }
+                vector<string> ks;
+                if(store.get_kset(rw.r_hex, ks) && !ks.empty()){
+                    has_preloaded_seed = true;
+                    break;
+                }
+            }
+
+            if(f_dup+f_delta+f_delta_nopub+f_lcg>0 || has_preloaded_seed){
                 lock_guard<mutex> lk(dirty_m);
                 dirty_buckets.insert(path);
             }
@@ -1365,6 +1381,7 @@ int main(int argc, char** argv){
                 " delta=" + to_string(f_delta) +
                 " delta_nopub=" + to_string(f_delta_nopub) +
                 " lcg=" + to_string(f_lcg) +
+                " preload_seed=" + string(has_preloaded_seed ? "1" : "0") +
                 " pairs_tested=" + to_string(pairs_tested)
             );
             pairs_tested=0; // reset local count for the next bucket
