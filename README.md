@@ -9,6 +9,7 @@ This project is intended for defensive cryptographic audit work. Recovered mater
 Implemented and verified:
 
 - Direct duplicate-`r` / nonce-reuse recovery.
+- Dedicated Stage0 direct duplicate-`r` recovery on `signatures.dup_r_focus.jsonl` before broader clustered recovery.
 - Delta / small linear nonce-relation search.
 - Affine LCG relation search.
 - Known private-key propagation through local candidate files.
@@ -464,6 +465,7 @@ key_recovered
 new_local_recovered_rows
 recover_input
 recover_stages
+stage0_subset
 post_recover_validation
 ```
 
@@ -473,6 +475,7 @@ Important interpretation:
 recover_executed=true means a local search/validation stage ran.
 key_recovered=true means new local recovered rows appeared.
 recovery_viability tells whether the evidence was direct nonce reuse, external candidate validation, partial nonce leakage, weak anomaly only, or none.
+stage0_subset shows full-input duplicate-r focus counts; if nontrivial_duplicate_r_groups > 0, recover_stages should include stage0-dup-r-direct.
 ```
 
 ## Useful Inspection Commands

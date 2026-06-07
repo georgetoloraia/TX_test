@@ -1133,7 +1133,7 @@ def main() -> None:
             f"selected={stage0_subset_info.get('selected_signatures', 0)}",
         )
         if int(stage0_subset_info.get("nontrivial_duplicate_r_groups", 0)) > 0:
-            print("Stage0 has nontrivial duplicate-r; keeping broader recover_input to avoid missing candidates.")
+            print("Stage0 has nontrivial duplicate-r; running dedicated duplicate-r recovery before broader input.")
         else:
             print("Stage0 is replay-like only; keeping broader recover_input for stage1.")
 
@@ -1192,6 +1192,34 @@ def main() -> None:
     if low_quality_data:
         stage1_threads = max(1, min(args.threads, 4))
         stage1_iter = 1
+
+    # Direct duplicate-r recovery is algebraically stronger than cluster heuristics.
+    # Run it on the full duplicate-r focus subset before any broader clustered stage,
+    # because cluster gating can legitimately omit the exact same-r/different-s rows.
+    if (
+        stage0_subset_info
+        and int(stage0_subset_info.get("nontrivial_duplicate_r_groups", 0) or 0) > 0
+        and int(stage0_subset_info.get("selected_signatures", 0) or 0) > 0
+    ):
+        stage0_extra = ["--no-lcg", "--scan-random-k", "0", "--min-count", "1"] + external_candidate_args
+        stage0_rc = run_recover_stage(
+            recover_bin=args.recover_bin,
+            recover_input=str(stage0_path),
+            threads=stage1_threads,
+            max_iter=1,
+            stage_name="stage0-dup-r-direct",
+            recover_json_out=args.recover_json_out,
+            recover_txt_out=args.recover_txt_out,
+            recover_k_out=args.recover_k_out,
+            recover_deltas_out=args.recover_deltas_out,
+            recover_collisions_out=args.recover_collisions_out,
+            recover_clusters_out=args.recover_clusters_out,
+            extra_args=stage0_extra,
+        )
+        stage_runs.append({"name": "stage0-dup-r-direct", "rc": stage0_rc})
+        if stage0_rc != 0:
+            raise RuntimeError(f"Recover stage0 duplicate-r failed with exit code {stage0_rc}")
+
     stage1_extra = ["--no-lcg", "--scan-random-k", "0"] + external_candidate_args
     if dup_r > 0:
         stage1_extra += ["--min-count", "1"]
