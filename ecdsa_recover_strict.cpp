@@ -830,6 +830,7 @@ static void randk_scan_bucket(Ctx& C, const vector<Row>& rows, RecStore& store,
                 }
                 if(range_bits<256){ BN_mask_bits(k.n, range_bits); if(BN_is_zero(k.n)) BN_add_word(k.n, 1); }
                 bn_mod(Ct, k.n);
+                if(BN_is_zero(k.n)) continue;
                 for(const Row* pr: vec){
                     if(!bn_invm(Ct, pr->r.n, rinv.n)) continue;
                     BN_mod_mul(tmp.n, pr->s.n, k.n, Ct.N, Ct.ctx);
@@ -1120,6 +1121,7 @@ static void load_k_jsonl_into_store(const string& path, RecStore& store){
     ifstream f(path);
     if(!f.good()) return;
     string line;
+    Ctx C;
     while(getline(f,line)){
         string r; if(!jsonl_get(line,"r",r)) continue;
         size_t p=0;
@@ -1130,7 +1132,18 @@ static void load_k_jsonl_into_store(const string& path, RecStore& store){
             if(q2==string::npos) break;
             string val=line.substr(q+1,q2-q-1);
             if(val.size()==64 && is_hexlike(val)){
-                store.add_k(hexlower(r), hexlower(val));
+                string rr = hexlower(r);
+                string kk = hexlower(val);
+                BNWrap kbn;
+                if(bn_from_hex(kk, kbn.n)){
+                    bn_mod(C, kbn.n);
+                    if(!BN_is_zero(kbn.n)){
+                        store.add_k(rr, bn_hex(kbn.n));
+                        BNWrap nk;
+                        BN_mod_sub(nk.n, C.N, kbn.n, C.N, C.ctx);
+                        if(!BN_is_zero(nk.n)) store.add_k(rr, bn_hex(nk.n));
+                    }
+                }
             }
             p=q2+1;
         }
