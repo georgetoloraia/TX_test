@@ -289,6 +289,10 @@ def anomaly_fingerprint(decision: dict) -> str:
     stage0 = decision.get("stage0_subset", {}) or {}
     core["stage0_selected_signatures"] = int(stage0.get("selected_signatures", 0) or 0)
     core["stage0_nontrivial_groups"] = int(stage0.get("nontrivial_duplicate_r_groups", 0) or 0)
+    target = decision.get("target_filter", {}) or {}
+    if target.get("enabled"):
+        core["target_pubkey"] = target.get("target_pubkey")
+        core["target_matched_rows"] = int(target.get("matched_rows", 0) or 0)
     raw = json.dumps(core, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -433,6 +437,7 @@ def build_cycle_artifact_paths(run_dir: Path, cycle: int, cycle_start: int, args
         "clustered_sigs": cycle_dir / "signatures.clustered.jsonl",
         "cluster_report": cycle_dir / "cluster_risk_report.json",
         "hnp_candidates": cycle_dir / "hnp_lll_bkz_candidates.txt",
+        "target_sigs": cycle_dir / "signatures.target.jsonl",
         "stage0_subset": cycle_dir / "signatures.dup_r_focus.jsonl",
         "strong_signal": cycle_dir / "signatures.strong_signal.jsonl",
     }
@@ -498,6 +503,10 @@ def main() -> None:
                     help="Timeout (seconds) for HNP/LLL/BKZ solver subprocess")
     ap.add_argument("--hnp-min-leaks", type=int, default=8,
                     help="Minimum leakage rows required to run HNP solver")
+    ap.add_argument("--stage0-only", action="store_true",
+                    help="Forward to automate_recover.py: run only direct duplicate-r Stage0 recovery")
+    ap.add_argument("--stop-after-stage0-hit", action="store_true",
+                    help="Forward to automate_recover.py: skip heavier stages if Stage0 recovered new rows")
     ap.add_argument("--auto-tune", action="store_true", default=True,
                     help="Auto-tune resource-sensitive parameters from machine CPU/RAM (default: enabled)")
     ap.add_argument("--no-auto-tune", action="store_false", dest="auto_tune",
@@ -515,6 +524,8 @@ def main() -> None:
                     help="Local r->k candidate JSONL passed through to automate_recover.py")
     ap.add_argument("--preload-priv-candidates", default="",
                     help="Local WIF/hex/decimal candidate file passed through to automate_recover.py")
+    ap.add_argument("--target-pubkey", default="",
+                    help="Optional compressed/uncompressed SEC pubkey hex; run accumulated audit/recovery only for this signer")
     ap.add_argument("--timeline-log", default="reports/timeline.jsonl",
                     help="Append-only timeline log for per-cycle events")
     ap.add_argument("--reports-dir", default="reports",
@@ -675,6 +686,7 @@ def main() -> None:
             "--recover-clusters-out", str(cycle_artifacts["recover_clusters"]),
             "--hnp-candidates-out", str(cycle_artifacts["hnp_candidates"]),
             "--candidate-validation-report", str(cycle_artifacts["candidate_validation_report"]),
+            "--target-sigs-out", str(cycle_artifacts["target_sigs"]),
             "--stage0-subset-out", str(cycle_artifacts["stage0_subset"]),
             "--strong-signal-out", str(cycle_artifacts["strong_signal"]),
             "--fallback-max-iter", str(max(4 if args.discovery_mode == "max" else 3, effective["max_iter"])),
@@ -686,6 +698,12 @@ def main() -> None:
             recover_cmd += ["--preload-k-candidates", args.preload_k_candidates]
         if args.preload_priv_candidates:
             recover_cmd += ["--preload-priv-candidates", args.preload_priv_candidates]
+        if args.target_pubkey:
+            recover_cmd += ["--target-pubkey", args.target_pubkey]
+        if args.stage0_only:
+            recover_cmd.append("--stage0-only")
+        if args.stop_after_stage0_hit:
+            recover_cmd.append("--stop-after-stage0-hit")
         if args.auto_tune:
             recover_cmd.append("--auto-tune")
         else:
@@ -724,6 +742,7 @@ def main() -> None:
                     anomaly_fingerprint_value = anomaly_fingerprint(d)
                     vq = d.get("verification_quality", {}) or {}
                     stage0 = d.get("stage0_subset", {}) or {}
+                    target = d.get("target_filter", {}) or {}
                     external_candidates = d.get("external_candidate_validation", {}) or {}
                     stage_runs = d.get("recover_stages", []) or []
                     stage_names = ",".join(str(s.get("name", "?")) for s in stage_runs) if stage_runs else "none"
@@ -746,6 +765,8 @@ def main() -> None:
                         f"invalid={vq.get('invalid')}\n"
                         f"invalid_ratio={invalid_ratio_str}\n"
                         f"recover_executed={d.get('recover_executed')}\n"
+                        f"target_enabled={target.get('enabled')}\n"
+                        f"target_matched_rows={target.get('matched_rows')}\n"
                         f"recovery_viability={d.get('recovery_viability')}\n"
                         f"key_recovered={d.get('key_recovered')}\n"
                         f"new_local_recovered_rows={d.get('new_local_recovered_rows')}\n"

@@ -458,6 +458,67 @@ def write_candidate_validation_report(
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def normalize_pubkey_hex(value: str) -> str:
+    s = (value or "").strip().lower()
+    if s.startswith("0x"):
+        s = s[2:]
+    return s
+
+
+def build_target_pubkey_subset(sig_path: Path, target_pubkey: str, out_path: Path) -> dict[str, Any]:
+    target = normalize_pubkey_hex(target_pubkey)
+    if not target:
+        return {"enabled": False}
+    if len(target) not in {66, 130} or any(c not in "0123456789abcdef" for c in target):
+        raise ValueError("--target-pubkey must be a compressed or uncompressed SEC pubkey hex string")
+
+    total_rows = 0
+    matched_rows = 0
+    skipped_bad_json = 0
+    missing_pubkey = 0
+    unique_tx_inputs: set[tuple[str, str]] = set()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with sig_path.open("r", encoding="utf-8") as src, out_path.open("w", encoding="utf-8") as out:
+        for line in src:
+            raw = line.strip()
+            if not raw:
+                continue
+            total_rows += 1
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                skipped_bad_json += 1
+                continue
+            if not isinstance(obj, dict):
+                skipped_bad_json += 1
+                continue
+            pub = normalize_pubkey_hex(str(obj.get("pubkey_hex") or obj.get("pub") or ""))
+            if not pub:
+                missing_pubkey += 1
+                continue
+            if pub != target:
+                continue
+            out.write(raw + "\n")
+            matched_rows += 1
+            txid = str(obj.get("txid") or "")
+            vin = str(obj.get("vin") if obj.get("vin") is not None else obj.get("input_index") or "")
+            if txid:
+                unique_tx_inputs.add((txid, vin))
+
+    return {
+        "enabled": True,
+        "target_pubkey": target,
+        "source": str(sig_path),
+        "output": str(out_path),
+        "total_rows": total_rows,
+        "matched_rows": matched_rows,
+        "unique_tx_inputs": len(unique_tx_inputs),
+        "missing_pubkey_rows": missing_pubkey,
+        "skipped_bad_json_rows": skipped_bad_json,
+    }
+
+
 def build_duplicate_r_focus_subset(sig_path: Path, out_path: Path) -> dict[str, Any]:
     rows_by_r: dict[int, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
     with sig_path.open("r", encoding="utf-8") as f:
@@ -821,6 +882,10 @@ def main() -> None:
                     help="Run advanced recover only if global risk.score >= threshold")
     ap.add_argument("--force-recover", action="store_true", help="Run recover regardless of risk score")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--stage0-only", action="store_true",
+                    help="Run only the direct duplicate-r Stage0 recovery when nontrivial duplicate-r exists")
+    ap.add_argument("--stop-after-stage0-hit", action="store_true",
+                    help="Stop after Stage0 direct duplicate-r recovery if it produced new valid local rows")
 
     ap.add_argument("--cluster-min-sigs", type=int, default=25,
                     help="Minimum signatures required in a cluster to evaluate risk")
@@ -852,6 +917,10 @@ def main() -> None:
                     help="Local WIF/hex/decimal private-key candidate file; passed to ecdsa_recover_strict --preload-priv")
     ap.add_argument("--candidate-validation-report", default="candidate_validation_report.json",
                     help="Local metadata-only report for external candidate validation")
+    ap.add_argument("--target-pubkey", default="",
+                    help="Optional compressed/uncompressed SEC pubkey hex; audit/recover only signatures for this pubkey")
+    ap.add_argument("--target-sigs-out", default="signatures.target.jsonl",
+                    help="Output JSONL path for --target-pubkey filtered signatures")
     ap.add_argument("--stage0-subset-out", default="signatures.dup_r_focus.jsonl",
                     help="Path for the duplicate-r focus subset")
     ap.add_argument("--strong-signal-out", default="signatures.strong_signal.jsonl",
@@ -905,14 +974,36 @@ def main() -> None:
         args.recover_clusters_out,
         args.hnp_candidates_out,
         args.candidate_validation_report,
+        args.target_sigs_out,
         args.stage0_subset_out,
         args.strong_signal_out,
         args.baseline_report,
     ):
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+
+    target_filter_info: dict[str, Any] = {"enabled": False}
+    original_sigs = sigs
+    if args.target_pubkey:
+        target_filter_info = build_target_pubkey_subset(sigs, args.target_pubkey, Path(args.target_sigs_out))
+        sigs = Path(args.target_sigs_out)
+        print(
+            "Target pubkey filter:",
+            f"matched={target_filter_info.get('matched_rows', 0)}",
+            f"unique_tx_inputs={target_filter_info.get('unique_tx_inputs', 0)}",
+            f"output={sigs}",
+        )
+
     sig_rows = count_nonempty_lines(sigs)
     if sig_rows == 0:
         print("No signatures available yet; skipping audit/recover for this cycle.")
+        write_decision(args.decision_out, {
+            "should_recover": False,
+            "recover_executed": False,
+            "search_attempted": False,
+            "target_filter": target_filter_info,
+            "source_sigs": str(original_sigs),
+            "recover_input": None,
+        })
         return
 
     if args.auto_tune:
@@ -1017,6 +1108,8 @@ def main() -> None:
             "verification_quality": vq,
             "low_quality_data": low_quality_data,
             "cluster_fallback_used": cluster_fallback_used,
+            "target_filter": target_filter_info,
+            "source_sigs": str(original_sigs),
             "recover_input": None,
             "cluster_gating_used": not args.disable_cluster_gating,
         })
@@ -1045,6 +1138,8 @@ def main() -> None:
             "verification_quality": vq,
             "low_quality_data": low_quality_data,
             "cluster_fallback_used": cluster_fallback_used,
+            "target_filter": target_filter_info,
+            "source_sigs": str(original_sigs),
             "recover_input": None,
             "cluster_gating_used": not args.disable_cluster_gating,
         })
@@ -1113,6 +1208,8 @@ def main() -> None:
                     "verification_quality": vq,
                     "low_quality_data": low_quality_data,
                     "cluster_fallback_used": cluster_fallback_used,
+                    "target_filter": target_filter_info,
+                    "source_sigs": str(original_sigs),
                     "recover_input": None,
                     "cluster_gating_used": not args.disable_cluster_gating,
                     "effective_cluster_risk_threshold": effective_cluster_threshold,
@@ -1219,6 +1316,64 @@ def main() -> None:
         stage_runs.append({"name": "stage0-dup-r-direct", "rc": stage0_rc})
         if stage0_rc != 0:
             raise RuntimeError(f"Recover stage0 duplicate-r failed with exit code {stage0_rc}")
+        stage0_post_validation = post_validate_recovered(Path(args.recover_json_out))
+        stage0_new_valid_rows = (
+            int(stage0_post_validation["valid_rows"]) - int(pre_recover_validation["valid_rows"])
+        )
+        if args.stage0_only or (args.stop_after_stage0_hit and stage0_new_valid_rows > 0):
+            write_candidate_validation_report(
+                Path(args.candidate_validation_report),
+                external_candidate_report,
+                pre_recover_validation,
+                stage0_post_validation,
+            )
+            stop_reason = "stage0_only" if args.stage0_only else "stage0_hit"
+            print(
+                "Recovery automation stopped after Stage0.",
+                f"reason={stop_reason}",
+                f"new_valid_rows={max(0, stage0_new_valid_rows)}",
+            )
+            write_decision(args.decision_out, {
+                "should_recover": True,
+                "recover_executed": True,
+                "search_attempted": True,
+                "stopped_after_stage0": True,
+                "stage0_stop_reason": stop_reason,
+                "recovery_viability": recovery_viability,
+                "known_nonce_rows": known_nonce_rows,
+                "hnp_candidate_rows": len(hnp_candidates or []),
+                "external_candidate_validation": external_candidate_report,
+                "key_recovered": stage0_new_valid_rows > 0,
+                "new_local_recovered_rows": max(0, stage0_new_valid_rows),
+                "risk_score": risk,
+                "risk_verdict": verdict,
+                "duplicate_r": dup_r,
+                "cross_pub_duplicate_r": cross_pub_dup_r,
+                "drift_flags": drift_flags,
+                "sighash_anomaly": sighash_anomaly,
+                "signal_fusion_tier": fusion_tier,
+                "signal_fusion_confidence": fusion_conf,
+                "signal_fusion_recommendation": fusion_reco,
+                "verification_quality": vq,
+                "low_quality_data": low_quality_data,
+                "cluster_fallback_used": cluster_fallback_used,
+                "target_filter": target_filter_info,
+                "source_sigs": str(original_sigs),
+                "effective_cluster_risk_threshold": effective_cluster_threshold,
+                "recover_input": str(stage0_path),
+                "cluster_gating_used": not args.disable_cluster_gating,
+                "recover_stages": stage_runs,
+                "stage0_subset": stage0_subset_info,
+                "post_recover_validation": stage0_post_validation,
+            })
+            try:
+                Path(args.baseline_report).write_text(
+                    Path(args.audit_report).read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+            return
 
     stage1_extra = ["--no-lcg", "--scan-random-k", "0"] + external_candidate_args
     if dup_r > 0:
@@ -1387,6 +1542,8 @@ def main() -> None:
         "verification_quality": vq,
         "low_quality_data": low_quality_data,
         "cluster_fallback_used": cluster_fallback_used,
+        "target_filter": target_filter_info,
+        "source_sigs": str(original_sigs),
         "effective_cluster_risk_threshold": effective_cluster_threshold,
         "recover_input": recover_input,
         "cluster_gating_used": not args.disable_cluster_gating,

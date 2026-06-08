@@ -221,6 +221,44 @@ venv/bin/python automate_recover.py \
   --enable-advanced-recover
 ```
 
+Fast direct duplicate-`r` verification only. Use this on very large datasets when you only need to confirm the algebraic nonce-reuse path and write `automate_decision.json` without running the heavy clustered stages:
+
+```bash
+venv/bin/python automate_recover.py \
+  --sigs signatures.jsonl \
+  --audit-report ecdsa_audit_report.json \
+  --decision-out automate_decision.json \
+  --recover-bin ./ecdsa_recover_strict \
+  --threads 8 \
+  --risk-threshold 40 \
+  --cluster-min-sigs 25 \
+  --cluster-risk-threshold 20 \
+  --max-clusters 50 \
+  --max-iter 1 \
+  --random-k-budget 0 \
+  --hnp-timeout-sec 30 \
+  --hnp-min-leaks 8 \
+  --stage0-only
+```
+
+Target one public key. This does not derive a key from the public key alone; it filters existing signatures for that signer, then runs the bounded audit/recovery paths on the target-only JSONL:
+
+```bash
+venv/bin/python automate_recover.py \
+  --sigs signatures.jsonl \
+  --target-pubkey 02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16 \
+  --target-sigs-out signatures.target.jsonl \
+  --audit-report ecdsa_audit_report.json \
+  --decision-out automate_decision.json \
+  --recover-bin ./ecdsa_recover_strict \
+  --threads 8 \
+  --max-iter 1 \
+  --random-k-budget 0 \
+  --hnp-timeout-sec 30 \
+  --hnp-min-leaks 8 \
+  --stage0-only
+```
+
 More aggressive local search on a machine with enough headroom:
 
 ```bash
@@ -290,6 +328,51 @@ venv/bin/python continuous_pipeline.py \
   --python venv/bin/python \
   --random-k-budget 0 \
   --no-telegram-startup-test
+```
+
+One-cycle fast Stage0 duplicate-`r` verification. This is the bounded mode for huge accumulated datasets:
+
+```bash
+venv/bin/python continuous_pipeline.py \
+  --start-height "$(cat last_processed_block.txt)" \
+  --batch-size 1 \
+  --max-cycles 1 \
+  --threads 8 \
+  --python venv/bin/python \
+  --random-k-budget 0 \
+  --hnp-timeout-sec 30 \
+  --hnp-min-leaks 8 \
+  --stage0-only \
+  --no-telegram-startup-test
+```
+
+Continuous mode that skips heavier stages only when Stage0 already produced new valid local rows:
+
+```bash
+venv/bin/python continuous_pipeline.py \
+  --start-height "$(cat last_processed_block.txt)" \
+  --batch-size 100 \
+  --threads 8 \
+  --python venv/bin/python \
+  --random-k-budget 2048 \
+  --hnp-timeout-sec 90 \
+  --hnp-min-leaks 8 \
+  --stop-after-stage0-hit
+```
+
+Continuous target-pubkey mode:
+
+```bash
+venv/bin/python continuous_pipeline.py \
+  --start-height "$(cat last_processed_block.txt)" \
+  --batch-size 100 \
+  --threads 8 \
+  --python venv/bin/python \
+  --target-pubkey <COMPRESSED_OR_UNCOMPRESSED_PUBKEY_HEX> \
+  --random-k-budget 0 \
+  --hnp-timeout-sec 30 \
+  --hnp-min-leaks 8 \
+  --stage0-only
 ```
 
 Maximum discovery mode:
