@@ -438,6 +438,9 @@ def build_cycle_artifact_paths(run_dir: Path, cycle: int, cycle_start: int, args
         "cluster_report": cycle_dir / "cluster_risk_report.json",
         "hnp_candidates": cycle_dir / "hnp_lll_bkz_candidates.txt",
         "target_sigs": cycle_dir / "signatures.target.jsonl",
+        "nonce_hypothesis_k": cycle_dir / "nonce_hypothesis_k.jsonl",
+        "nonce_hypothesis_report": cycle_dir / "nonce_hypothesis_report.json",
+        "combined_preload_k": cycle_dir / "combined_preload_k.jsonl",
         "stage0_subset": cycle_dir / "signatures.dup_r_focus.jsonl",
         "strong_signal": cycle_dir / "signatures.strong_signal.jsonl",
     }
@@ -526,6 +529,17 @@ def main() -> None:
                     help="Local WIF/hex/decimal candidate file passed through to automate_recover.py")
     ap.add_argument("--target-pubkey", default="",
                     help="Optional compressed/uncompressed SEC pubkey hex; run accumulated audit/recovery only for this signer")
+    ap.add_argument("--enable-nonce-hypotheses", action="store_true",
+                    help="Forward to automate_recover.py: generate bounded weak-nonce r->k candidates")
+    ap.add_argument("--nonce-hypothesis-models",
+                    default="timestamp-direct,timestamp-sha256,height-direct,height-sha256",
+                    help="Comma-separated candidate_hypotheses.py models")
+    ap.add_argument("--nonce-time-window-sec", type=int, default=0)
+    ap.add_argument("--nonce-time-step-sec", type=int, default=1)
+    ap.add_argument("--nonce-counter-max", type=int, default=0)
+    ap.add_argument("--nonce-small-k-start", type=int, default=1)
+    ap.add_argument("--nonce-small-k-end", type=int, default=0)
+    ap.add_argument("--nonce-max-candidates", type=int, default=200000)
     ap.add_argument("--timeline-log", default="reports/timeline.jsonl",
                     help="Append-only timeline log for per-cycle events")
     ap.add_argument("--reports-dir", default="reports",
@@ -687,6 +701,9 @@ def main() -> None:
             "--hnp-candidates-out", str(cycle_artifacts["hnp_candidates"]),
             "--candidate-validation-report", str(cycle_artifacts["candidate_validation_report"]),
             "--target-sigs-out", str(cycle_artifacts["target_sigs"]),
+            "--nonce-hypothesis-out", str(cycle_artifacts["nonce_hypothesis_k"]),
+            "--nonce-hypothesis-report", str(cycle_artifacts["nonce_hypothesis_report"]),
+            "--combined-preload-k-out", str(cycle_artifacts["combined_preload_k"]),
             "--stage0-subset-out", str(cycle_artifacts["stage0_subset"]),
             "--strong-signal-out", str(cycle_artifacts["strong_signal"]),
             "--fallback-max-iter", str(max(4 if args.discovery_mode == "max" else 3, effective["max_iter"])),
@@ -700,6 +717,17 @@ def main() -> None:
             recover_cmd += ["--preload-priv-candidates", args.preload_priv_candidates]
         if args.target_pubkey:
             recover_cmd += ["--target-pubkey", args.target_pubkey]
+        if args.enable_nonce_hypotheses:
+            recover_cmd += [
+                "--enable-nonce-hypotheses",
+                "--nonce-hypothesis-models", args.nonce_hypothesis_models,
+                "--nonce-time-window-sec", str(args.nonce_time_window_sec),
+                "--nonce-time-step-sec", str(args.nonce_time_step_sec),
+                "--nonce-counter-max", str(args.nonce_counter_max),
+                "--nonce-small-k-start", str(args.nonce_small_k_start),
+                "--nonce-small-k-end", str(args.nonce_small_k_end),
+                "--nonce-max-candidates", str(args.nonce_max_candidates),
+            ]
         if args.stage0_only:
             recover_cmd.append("--stage0-only")
         if args.stop_after_stage0_hit:

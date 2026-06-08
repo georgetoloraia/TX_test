@@ -259,6 +259,33 @@ venv/bin/python automate_recover.py \
   --stage0-only
 ```
 
+Generate bounded nonce-hypothesis candidates, then validate them through the strict recovery engine. This only emits `r -> k` candidates when the generated nonce produces an `r` already present in the observed signatures:
+
+```bash
+venv/bin/python candidate_hypotheses.py \
+  --sigs signatures.target.jsonl \
+  --out nonce_hypothesis_k.jsonl \
+  --report nonce_hypothesis_report.json \
+  --models timestamp-direct,timestamp-sha256,height-direct,height-sha256 \
+  --time-window-sec 2 \
+  --counter-max 0 \
+  --max-candidates 200000
+```
+
+Run recovery with bounded nonce hypotheses enabled:
+
+```bash
+venv/bin/python automate_recover.py \
+  --sigs signatures.jsonl \
+  --target-pubkey <COMPRESSED_OR_UNCOMPRESSED_PUBKEY_HEX> \
+  --recover-bin ./ecdsa_recover_strict \
+  --enable-nonce-hypotheses \
+  --nonce-hypothesis-models timestamp-direct,timestamp-sha256,height-direct,height-sha256 \
+  --nonce-time-window-sec 2 \
+  --nonce-max-candidates 200000 \
+  --stage0-only
+```
+
 More aggressive local search on a machine with enough headroom:
 
 ```bash
@@ -375,6 +402,22 @@ venv/bin/python continuous_pipeline.py \
   --stage0-only
 ```
 
+Continuous target mode with bounded nonce hypotheses:
+
+```bash
+venv/bin/python continuous_pipeline.py \
+  --start-height "$(cat last_processed_block.txt)" \
+  --batch-size 100 \
+  --threads 8 \
+  --python venv/bin/python \
+  --target-pubkey <COMPRESSED_OR_UNCOMPRESSED_PUBKEY_HEX> \
+  --enable-nonce-hypotheses \
+  --nonce-hypothesis-models timestamp-direct,timestamp-sha256,height-direct,height-sha256 \
+  --nonce-time-window-sec 2 \
+  --nonce-max-candidates 200000 \
+  --stop-after-stage0-hit
+```
+
 Maximum discovery mode:
 
 ```bash
@@ -387,6 +430,29 @@ venv/bin/python continuous_pipeline.py \
   --random-k-budget 2048 \
   --hnp-timeout-sec 120 \
   --hnp-min-leaks 12
+```
+
+Full discovery/recovery mode with external `k` candidates and bounded nonce hypotheses:
+
+```bash
+.venv/bin/python continuous_pipeline.py \
+  --start-height "$(cat last_processed_block.txt)" \
+  --batch-size 100 \
+  --threads 8 \
+  --python .venv/bin/python \
+  --discovery-mode max \
+  --random-k-budget 1024 \
+  --hnp-timeout-sec 120 \
+  --hnp-min-leaks 8 \
+  --preload-k-candidates candidate_k.jsonl \
+  --enable-nonce-hypotheses \
+  --nonce-hypothesis-models timestamp-direct,timestamp-sha256,height-direct,height-sha256,timestamp-counter-sha256,height-counter-sha256 \
+  --nonce-time-window-sec 2 \
+  --nonce-time-step-sec 1 \
+  --nonce-counter-max 3 \
+  --nonce-max-candidates 200000 \
+  --stop-after-stage0-hit \
+  --stop-on-found
 ```
 
 Stop when a new local recovered row appears:

@@ -229,6 +229,59 @@ def try_hnp_lll_bkz_solver(
             fout.write(f"{c}\n")
     print(f"[HNP/LLL/BKZ] Candidates written to {out_path}")
     return candidates
+
+
+def run_nonce_hypothesis_generator(args: argparse.Namespace, sig_path: str) -> dict[str, Any]:
+    if not args.enable_nonce_hypotheses:
+        return {"enabled": False}
+    script = Path(__file__).with_name("candidate_hypotheses.py")
+    if not script.exists():
+        return {"enabled": True, "error": "candidate_hypotheses.py missing"}
+    cmd = [
+        resolve_python_executable(),
+        str(script),
+        "--sigs", sig_path,
+        "--out", args.nonce_hypothesis_out,
+        "--report", args.nonce_hypothesis_report,
+        "--models", args.nonce_hypothesis_models,
+        "--time-window-sec", str(args.nonce_time_window_sec),
+        "--time-step-sec", str(args.nonce_time_step_sec),
+        "--counter-max", str(args.nonce_counter_max),
+        "--small-k-start", str(args.nonce_small_k_start),
+        "--small-k-end", str(args.nonce_small_k_end),
+        "--max-candidates", str(args.nonce_max_candidates),
+    ]
+    if args.target_pubkey:
+        cmd += ["--target-pubkey", args.target_pubkey]
+    rc = run_cmd(cmd)
+    report: dict[str, Any] = {"enabled": True, "rc": rc, "output": args.nonce_hypothesis_out}
+    try:
+        p = Path(args.nonce_hypothesis_report)
+        if p.exists():
+            report.update(json.loads(p.read_text(encoding="utf-8")))
+    except Exception as e:
+        report["report_error"] = str(e)
+    return report
+
+
+def merge_preload_k_files(paths: list[Path], out_path: Path) -> Path | None:
+    existing = [p for p in paths if p and p.exists() and count_nonempty_lines(p) > 0]
+    if not existing:
+        return None
+    if len(existing) == 1:
+        return existing[0]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    seen = set()
+    with out_path.open("w", encoding="utf-8") as out:
+        for p in existing:
+            with p.open("r", encoding="utf-8", errors="ignore") as src:
+                for line in src:
+                    raw = line.strip()
+                    if not raw or raw in seen:
+                        continue
+                    seen.add(raw)
+                    out.write(raw + "\n")
+    return out_path
 from pathlib import Path
 from typing import Any
 
@@ -917,6 +970,29 @@ def main() -> None:
                     help="Local WIF/hex/decimal private-key candidate file; passed to ecdsa_recover_strict --preload-priv")
     ap.add_argument("--candidate-validation-report", default="candidate_validation_report.json",
                     help="Local metadata-only report for external candidate validation")
+    ap.add_argument("--enable-nonce-hypotheses", action="store_true",
+                    help="Generate bounded weak-nonce r->k candidates and validate them locally")
+    ap.add_argument("--nonce-hypothesis-models",
+                    default="timestamp-direct,timestamp-sha256,height-direct,height-sha256",
+                    help="Comma-separated candidate_hypotheses.py models")
+    ap.add_argument("--nonce-hypothesis-out", default="nonce_hypothesis_k.jsonl",
+                    help="Generated r->k candidate JSONL path")
+    ap.add_argument("--nonce-hypothesis-report", default="nonce_hypothesis_report.json",
+                    help="Generated nonce hypothesis report JSON path")
+    ap.add_argument("--nonce-time-window-sec", type=int, default=0,
+                    help="Timestamp hypothesis +/- window in seconds")
+    ap.add_argument("--nonce-time-step-sec", type=int, default=1,
+                    help="Timestamp hypothesis step in seconds")
+    ap.add_argument("--nonce-counter-max", type=int, default=0,
+                    help="Counter upper bound for timestamp/height counter hash models")
+    ap.add_argument("--nonce-small-k-start", type=int, default=1,
+                    help="Small-k model inclusive start")
+    ap.add_argument("--nonce-small-k-end", type=int, default=0,
+                    help="Small-k model inclusive end; 0 disables small-k unless set")
+    ap.add_argument("--nonce-max-candidates", type=int, default=200000,
+                    help="Maximum nonce hypothesis candidates to test before stopping")
+    ap.add_argument("--combined-preload-k-out", default="combined_preload_k.jsonl",
+                    help="Merged preload-k path when external and generated k candidates both exist")
     ap.add_argument("--target-pubkey", default="",
                     help="Optional compressed/uncompressed SEC pubkey hex; audit/recover only signatures for this pubkey")
     ap.add_argument("--target-sigs-out", default="signatures.target.jsonl",
@@ -974,6 +1050,9 @@ def main() -> None:
         args.recover_clusters_out,
         args.hnp_candidates_out,
         args.candidate_validation_report,
+        args.nonce_hypothesis_out,
+        args.nonce_hypothesis_report,
+        args.combined_preload_k_out,
         args.target_sigs_out,
         args.stage0_subset_out,
         args.strong_signal_out,
@@ -1258,7 +1337,18 @@ def main() -> None:
         timeout_sec=args.hnp_timeout_sec,
         min_leaks=args.hnp_min_leaks,
     )
+    nonce_hypothesis_report = run_nonce_hypothesis_generator(args, hnp_input)
+    preload_k_paths = []
+    if args.preload_k_candidates:
+        preload_k_paths.append(Path(args.preload_k_candidates))
+    if nonce_hypothesis_report.get("enabled"):
+        preload_k_paths.append(Path(args.nonce_hypothesis_out))
+    merged_preload_k = merge_preload_k_files(preload_k_paths, Path(args.combined_preload_k_out))
+    if merged_preload_k is not None:
+        args.preload_k_candidates = str(merged_preload_k)
     external_candidate_args, external_candidate_report = build_external_candidate_args(args)
+    if nonce_hypothesis_report.get("enabled"):
+        external_candidate_report["nonce_hypotheses"] = nonce_hypothesis_report
 
     # Multi-stage recovery:
     # stage1: primary/cheap scan (disable LCG + no random-k)
