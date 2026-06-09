@@ -498,6 +498,8 @@ def main() -> None:
     ap.add_argument("--max-iter", type=int, default=2)
     ap.add_argument("--discovery-mode", choices=("balanced", "max"), default="max",
                     help="balanced = cheaper selective recovery, max = wider automatic search and fallback")
+    ap.add_argument("--exhaustive-recover", action="store_true",
+                    help="Forward to automate_recover.py: run all enabled recovery stages and full-input fallback")
     ap.add_argument("--enable-advanced-recover", action="store_true", default=True)
     ap.add_argument("--no-enable-advanced-recover", action="store_false", dest="enable_advanced_recover")
     ap.add_argument("--random-k-budget", type=int, default=0,
@@ -711,6 +713,8 @@ def main() -> None:
         ]
         if args.discovery_mode == "max":
             recover_cmd.append("--full-scan-fallback")
+        if args.exhaustive_recover:
+            recover_cmd.append("--exhaustive-recover")
         if args.preload_k_candidates:
             recover_cmd += ["--preload-k-candidates", args.preload_k_candidates]
         if args.preload_priv_candidates:

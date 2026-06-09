@@ -465,27 +465,41 @@ def build_external_candidate_args(args: argparse.Namespace) -> tuple[list[str], 
     if args.preload_k_candidates:
         p = Path(args.preload_k_candidates)
         if not p.exists():
-            raise FileNotFoundError(f"Missing --preload-k-candidates file: {p}")
-        extra += ["--preload-k", str(p)]
-        report["enabled"] = True
-        report["preload_k_candidates"] = {
-            "path": str(p),
-            "rows": count_nonempty_lines(p),
-            "sha256": sha256_file(p),
-        }
+            print(f"[warn] skipping missing --preload-k-candidates file: {p}")
+            report["preload_k_candidates"] = {
+                "path": str(p),
+                "missing": True,
+                "rows": 0,
+                "sha256": None,
+            }
+        else:
+            extra += ["--preload-k", str(p)]
+            report["enabled"] = True
+            report["preload_k_candidates"] = {
+                "path": str(p),
+                "rows": count_nonempty_lines(p),
+                "sha256": sha256_file(p),
+            }
 
     if args.preload_priv_candidates:
         p = Path(args.preload_priv_candidates)
         if not p.exists():
-            raise FileNotFoundError(f"Missing --preload-priv-candidates file: {p}")
-        extra += ["--preload-priv", str(p)]
-        report["enabled"] = True
-        # Do not inspect or echo candidate private material. Only artifact metadata.
-        report["preload_priv_candidates"] = {
-            "path": str(p),
-            "rows": count_nonempty_lines(p),
-            "sha256": sha256_file(p),
-        }
+            print(f"[warn] skipping missing --preload-priv-candidates file: {p}")
+            report["preload_priv_candidates"] = {
+                "path": str(p),
+                "missing": True,
+                "rows": 0,
+                "sha256": None,
+            }
+        else:
+            extra += ["--preload-priv", str(p)]
+            report["enabled"] = True
+            # Do not inspect or echo candidate private material. Only artifact metadata.
+            report["preload_priv_candidates"] = {
+                "path": str(p),
+                "rows": count_nonempty_lines(p),
+                "sha256": sha256_file(p),
+            }
 
     return extra, report
 
@@ -499,12 +513,17 @@ def write_candidate_validation_report(
     if not candidate_report.get("enabled"):
         return
     new_valid_rows = int(post_validation.get("valid_rows", 0)) - int(pre_validation.get("valid_rows", 0))
+    pre_valid_rows = int(pre_validation.get("valid_rows", 0))
+    post_valid_rows = int(post_validation.get("valid_rows", 0))
     payload = {
         "external_candidates": candidate_report,
         "pre_recover_validation": pre_validation,
         "post_recover_validation": post_validation,
         "key_recovered": new_valid_rows > 0,
         "new_local_recovered_rows": max(0, new_valid_rows),
+        "key_material_present": post_valid_rows > 0,
+        "pre_existing_valid_recovered_rows": pre_valid_rows,
+        "total_valid_recovered_rows": post_valid_rows,
         "priv_material": "LOCAL_ARTIFACT_ONLY",
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -934,6 +953,8 @@ def main() -> None:
     ap.add_argument("--risk-threshold", type=int, default=40,
                     help="Run advanced recover only if global risk.score >= threshold")
     ap.add_argument("--force-recover", action="store_true", help="Run recover regardless of risk score")
+    ap.add_argument("--exhaustive-recover", action="store_true",
+                    help="Do not stop at selective/cheap paths; run all enabled recovery stages and full-input fallback")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--stage0-only", action="store_true",
                     help="Run only the direct duplicate-r Stage0 recovery when nontrivial duplicate-r exists")
@@ -1127,7 +1148,13 @@ def main() -> None:
     fusion_tier = str(fusion.get("tier", "low") or "low")
     fusion_reco = str(fusion.get("recommendation", "monitor_only") or "monitor_only")
     vq = verification_quality(report)
-    external_candidate_requested = bool(args.preload_k_candidates or args.preload_priv_candidates)
+    known_nonce_rows_all = count_known_nonce_rows(sigs)
+    external_candidate_requested = bool(
+        args.preload_k_candidates
+        or args.preload_priv_candidates
+        or args.enable_nonce_hypotheses
+        or known_nonce_rows_all >= int(args.hnp_min_leaks)
+    )
     low_quality_data = (
         vq["enabled"]
         and vq["coincurve_available"]
@@ -1150,6 +1177,7 @@ def main() -> None:
 
     should_recover = (
         args.force_recover
+        or args.exhaustive_recover
         or external_candidate_requested
         or risk >= args.risk_threshold
         or fusion_conf >= args.fusion_min_confidence
@@ -1165,7 +1193,7 @@ def main() -> None:
         or signer_drift_flagged > 0
         or sighash_anomaly
     )
-    if low_quality_data and not (hard_signal or args.force_recover or external_candidate_requested):
+    if low_quality_data and not (hard_signal or args.force_recover or args.exhaustive_recover or external_candidate_requested):
         should_recover = False
 
     cluster_fallback_used = False
@@ -1200,7 +1228,9 @@ def main() -> None:
 
     recover_input = str(sigs)
     allow_advanced = args.enable_advanced_recover
-    if fusion_reco == "monitor_only" and not (hard_signal or args.force_recover or external_candidate_requested):
+    if fusion_reco == "monitor_only" and not (
+        hard_signal or args.force_recover or args.exhaustive_recover or external_candidate_requested
+    ):
         print("Fusion recommendation is monitor_only; recovery skipped.")
         write_decision(args.decision_out, {
             "should_recover": False,
@@ -1223,7 +1253,7 @@ def main() -> None:
             "cluster_gating_used": not args.disable_cluster_gating,
         })
         return
-    if fusion_reco == "run_clustered_recovery":
+    if fusion_reco == "run_clustered_recovery" and not args.exhaustive_recover:
         allow_advanced = False
 
     effective_cluster_threshold = args.cluster_risk_threshold
@@ -1258,7 +1288,8 @@ def main() -> None:
         )
         if cluster_report["selected_signatures"] == 0 and not args.force_recover:
             strong_no_cluster_signal = (
-                fusion_tier in {"high", "critical"}
+                args.exhaustive_recover
+                or fusion_tier in {"high", "critical"}
                 or risk >= args.risk_threshold + 20
                 or dup_r > 0
                 or cross_pub_dup_r > 0
@@ -1364,7 +1395,7 @@ def main() -> None:
         or sighash_anomaly
         or signer_drift_flagged > 0
     )
-    known_nonce_rows = count_known_nonce_rows(sigs)
+    known_nonce_rows = known_nonce_rows_all
     recovery_viability = recovery_viability_label(
         stage0_subset_info=stage0_subset_info,
         known_nonce_rows=known_nonce_rows,
@@ -1376,7 +1407,7 @@ def main() -> None:
     )
     stage1_threads = args.threads
     stage1_iter = max(1, args.max_iter)
-    if low_quality_data:
+    if low_quality_data and not args.exhaustive_recover:
         stage1_threads = max(1, min(args.threads, 4))
         stage1_iter = 1
 
@@ -1410,6 +1441,8 @@ def main() -> None:
         stage0_new_valid_rows = (
             int(stage0_post_validation["valid_rows"]) - int(pre_recover_validation["valid_rows"])
         )
+        stage0_pre_valid_rows = int(pre_recover_validation.get("valid_rows", 0))
+        stage0_post_valid_rows = int(stage0_post_validation.get("valid_rows", 0))
         if args.stage0_only or (args.stop_after_stage0_hit and stage0_new_valid_rows > 0):
             write_candidate_validation_report(
                 Path(args.candidate_validation_report),
@@ -1431,10 +1464,14 @@ def main() -> None:
                 "stage0_stop_reason": stop_reason,
                 "recovery_viability": recovery_viability,
                 "known_nonce_rows": known_nonce_rows,
+                "exhaustive_recover": args.exhaustive_recover,
                 "hnp_candidate_rows": len(hnp_candidates or []),
                 "external_candidate_validation": external_candidate_report,
                 "key_recovered": stage0_new_valid_rows > 0,
                 "new_local_recovered_rows": max(0, stage0_new_valid_rows),
+                "key_material_present": stage0_post_valid_rows > 0,
+                "pre_existing_valid_recovered_rows": stage0_pre_valid_rows,
+                "total_valid_recovered_rows": stage0_post_valid_rows,
                 "risk_score": risk,
                 "risk_verdict": verdict,
                 "duplicate_r": dup_r,
@@ -1487,7 +1524,7 @@ def main() -> None:
         raise RuntimeError(f"Recover stage1 failed with exit code {stage1_rc}")
 
     if allow_advanced and strong_signal:
-        if low_quality_data:
+        if low_quality_data and not args.exhaustive_recover:
             # Constrained advanced pass for low-quality datasets:
             # keep compute bounded but still allow deeper search than stage1-only.
             stage2_threads = min(max(2, args.threads), 4)
@@ -1516,9 +1553,14 @@ def main() -> None:
             raise RuntimeError(f"Recover stage2 failed with exit code {stage2_rc}")
 
         if (
-            not low_quality_data
-            and args.random_k_budget > 0
-            and (cross_pub_dup_r > 0 or drift_flags > 0 or risk >= 120)
+            args.random_k_budget > 0
+            and (
+                args.exhaustive_recover
+                or (
+                    not low_quality_data
+                    and (cross_pub_dup_r > 0 or drift_flags > 0 or risk >= 120)
+                )
+            )
         ):
             stage3_input = recover_input
             strong_subset = Path(args.strong_signal_out)
@@ -1552,10 +1594,13 @@ def main() -> None:
     if (
         args.full_scan_fallback
         and recover_input != str(sigs)
-        and strong_signal
-        and post_validation["valid_rows"] <= pre_recover_validation["valid_rows"]
+        and (strong_signal or args.exhaustive_recover)
+        and (args.exhaustive_recover or post_validation["valid_rows"] <= pre_recover_validation["valid_rows"])
     ):
-        print("Filtered recovery yielded no new valid rows; escalating to full-input fallback.")
+        if args.exhaustive_recover:
+            print("Exhaustive recovery enabled; running full-input fallback even after filtered-stage hits.")
+        else:
+            print("Filtered recovery yielded no new valid rows; escalating to full-input fallback.")
         fallback_iter = max(args.max_iter, args.fallback_max_iter)
         fallback_threads = min(max(2, args.threads), 16)
         if fusion_tier == "critical":
@@ -1602,6 +1647,9 @@ def main() -> None:
         post_validation = post_validate_recovered(Path(args.recover_json_out))
         new_valid_rows = int(post_validation["valid_rows"]) - int(pre_recover_validation["valid_rows"])
 
+    pre_valid_rows = int(pre_recover_validation.get("valid_rows", 0))
+    post_valid_rows = int(post_validation.get("valid_rows", 0))
+
     write_candidate_validation_report(
         Path(args.candidate_validation_report),
         external_candidate_report,
@@ -1616,10 +1664,14 @@ def main() -> None:
         "search_attempted": True,
         "recovery_viability": recovery_viability,
         "known_nonce_rows": known_nonce_rows,
+        "exhaustive_recover": args.exhaustive_recover,
         "hnp_candidate_rows": len(hnp_candidates or []),
         "external_candidate_validation": external_candidate_report,
         "key_recovered": new_valid_rows > 0,
         "new_local_recovered_rows": max(0, new_valid_rows),
+        "key_material_present": post_valid_rows > 0,
+        "pre_existing_valid_recovered_rows": pre_valid_rows,
+        "total_valid_recovered_rows": post_valid_rows,
         "risk_score": risk,
         "risk_verdict": verdict,
         "duplicate_r": dup_r,

