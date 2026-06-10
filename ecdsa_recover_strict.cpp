@@ -1376,8 +1376,8 @@ struct Args {
     int dg_per_pair_cap=4096;
 
     // affine-LCG
-    long long lcg_a_max=0;       // 0 -> გამორთულია (default ქვემოთ ჩავრთავ 4-ზე)
-    long long lcg_b_max=0;
+    long long lcg_a_max=4;
+    long long lcg_b_max=4096;
     int       lcg_per_pair_cap=2048;
     bool      lcg_enable=true;
 
@@ -1458,8 +1458,6 @@ static bool parse_args(int argc,char**argv, Args& A){
     }
     if(A.dg_seeds.empty()) A.dg_seeds={1,2,4,8,16,32,64,128,256,512,1024};
     if(A.step_seeds.empty()) A.step_seeds={3,5,7,9,17};
-    if(A.lcg_a_max==0) A.lcg_a_max = 4;
-    if(A.lcg_b_max==0) A.lcg_b_max = 4096;
     return true;
 }
 static void build_delta_schedules(const Args& A, vector<uint64_t>& gradient, vector<uint64_t>& step_sched){

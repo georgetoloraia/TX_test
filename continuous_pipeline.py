@@ -437,6 +437,7 @@ def build_cycle_artifact_paths(run_dir: Path, cycle: int, cycle_start: int, args
         "clustered_sigs": cycle_dir / "signatures.clustered.jsonl",
         "cluster_report": cycle_dir / "cluster_risk_report.json",
         "hnp_candidates": cycle_dir / "hnp_lll_bkz_candidates.txt",
+        "hnp_report": cycle_dir / "hnp_lll_bkz_report.json",
         "target_sigs": cycle_dir / "signatures.target.jsonl",
         "nonce_hypothesis_k": cycle_dir / "nonce_hypothesis_k.jsonl",
         "nonce_hypothesis_report": cycle_dir / "nonce_hypothesis_report.json",
@@ -504,6 +505,16 @@ def main() -> None:
     ap.add_argument("--no-enable-advanced-recover", action="store_false", dest="enable_advanced_recover")
     ap.add_argument("--random-k-budget", type=int, default=0,
                     help="Random-k tries per bucket for the strongest recovery stage")
+    ap.add_argument("--delta-max", type=int, default=4096,
+                    help="Forward to automate_recover.py: maximum delta for k2 = k1 +/- delta")
+    ap.add_argument("--delta-per-pair-cap", type=int, default=4096,
+                    help="Forward to automate_recover.py: per-pair delta scan cap")
+    ap.add_argument("--lcg-a-max", type=int, default=4,
+                    help="Forward to automate_recover.py: affine nonce recurrence |a-1| bound")
+    ap.add_argument("--lcg-b-max", type=int, default=4096,
+                    help="Forward to automate_recover.py: affine nonce recurrence |b| bound")
+    ap.add_argument("--lcg-per-pair-cap", type=int, default=2048,
+                    help="Forward to automate_recover.py: per-pair affine-LCG scan cap")
     ap.add_argument("--hnp-timeout-sec", type=int, default=120,
                     help="Timeout (seconds) for HNP/LLL/BKZ solver subprocess")
     ap.add_argument("--hnp-min-leaks", type=int, default=8,
@@ -534,7 +545,10 @@ def main() -> None:
     ap.add_argument("--enable-nonce-hypotheses", action="store_true",
                     help="Forward to automate_recover.py: generate bounded weak-nonce r->k candidates")
     ap.add_argument("--nonce-hypothesis-models",
-                    default="timestamp-direct,timestamp-sha256,height-direct,height-sha256",
+                    default=(
+                        "timestamp-direct,timestamp-sha256,height-direct,height-sha256,"
+                        "txid-sha256,txid-vin-sha256,txid-vin-sighash-sha256"
+                    ),
                     help="Comma-separated candidate_hypotheses.py models")
     ap.add_argument("--nonce-time-window-sec", type=int, default=0)
     ap.add_argument("--nonce-time-step-sec", type=int, default=1)
@@ -690,6 +704,11 @@ def main() -> None:
             "--max-clusters", str(effective["max_clusters"]),
             "--max-iter", str(effective["max_iter"]),
             "--random-k-budget", str(effective["random_k_budget"]),
+            "--delta-max", str(args.delta_max),
+            "--delta-per-pair-cap", str(args.delta_per_pair_cap),
+            "--lcg-a-max", str(args.lcg_a_max),
+            "--lcg-b-max", str(args.lcg_b_max),
+            "--lcg-per-pair-cap", str(args.lcg_per_pair_cap),
             "--hnp-timeout-sec", str(args.hnp_timeout_sec),
             "--hnp-min-leaks", str(args.hnp_min_leaks),
             "--clustered-sigs-out", str(cycle_artifacts["clustered_sigs"]),
@@ -701,6 +720,7 @@ def main() -> None:
             "--recover-collisions-out", str(cycle_artifacts["recover_collisions"]),
             "--recover-clusters-out", str(cycle_artifacts["recover_clusters"]),
             "--hnp-candidates-out", str(cycle_artifacts["hnp_candidates"]),
+            "--hnp-report-out", str(cycle_artifacts["hnp_report"]),
             "--candidate-validation-report", str(cycle_artifacts["candidate_validation_report"]),
             "--target-sigs-out", str(cycle_artifacts["target_sigs"]),
             "--nonce-hypothesis-out", str(cycle_artifacts["nonce_hypothesis_k"]),

@@ -149,6 +149,7 @@ def try_hnp_lll_bkz_solver(
     bits_known=6,
     q=None,
     out_path="hnp_lll_bkz_candidates.txt",
+    report_path="hnp_lll_bkz_report.json",
     timeout_sec=120,
     min_leaks=8,
 ):
@@ -157,8 +158,26 @@ def try_hnp_lll_bkz_solver(
     Expects sig_path to be a JSONL file with fields r, s, z, and known_nonce_bits (if available).
     """
     solver_path = os.path.join(os.path.dirname(__file__), "hnp_lll_bkz_solver.py")
+    report = {
+        "input": str(sig_path),
+        "output": str(out_path),
+        "bits_known": int(bits_known),
+        "min_leaks": int(min_leaks),
+        "timeout_sec": int(timeout_sec),
+        "ran": False,
+        "candidates": 0,
+    }
+    def write_hnp_report(reason: str, **extra: Any) -> None:
+        report.update({"reason": reason, **extra})
+        try:
+            Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(report_path).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
     if not os.path.exists(solver_path):
         print("[HNP/LLL/BKZ] Solver script not found.")
+        write_hnp_report("solver_missing")
         return None
     leaks = []
     total_rows = 0
@@ -192,11 +211,23 @@ def try_hnp_lll_bkz_solver(
             "[HNP/LLL/BKZ] Skipping: no valid rows with explicit known_nonce_bits "
             f"(rows={total_rows}, with_known_nonce_bits={rows_with_known_nonce_bits})."
         )
+        write_hnp_report(
+            "no_explicit_nonce_leaks",
+            total_rows=total_rows,
+            rows_with_known_nonce_bits=rows_with_known_nonce_bits,
+            valid_leaks=0,
+        )
         return None
     if len(leaks) < int(min_leaks):
         print(
             "[HNP/LLL/BKZ] Skipping: insufficient leakage samples "
             f"(valid_leaks={len(leaks)} < min_leaks={int(min_leaks)})."
+        )
+        write_hnp_report(
+            "insufficient_nonce_leaks",
+            total_rows=total_rows,
+            rows_with_known_nonce_bits=rows_with_known_nonce_bits,
+            valid_leaks=len(leaks),
         )
         return None
     if q is None:
@@ -207,27 +238,40 @@ def try_hnp_lll_bkz_solver(
         target=_hnp_worker, args=(leaks, int(q), int(bits_known), solver_path, qout)
     )
     proc.start()
+    report.update(
+        {
+            "ran": True,
+            "total_rows": total_rows,
+            "rows_with_known_nonce_bits": rows_with_known_nonce_bits,
+            "valid_leaks": len(leaks),
+        }
+    )
     proc.join(timeout=float(timeout_sec))
     if proc.is_alive():
         proc.terminate()
         proc.join(5)
         print(f"[HNP/LLL/BKZ] Solver timeout after {timeout_sec}s; continuing pipeline.")
+        write_hnp_report("timeout")
         return None
     if proc.exitcode not in (0, None):
         print(f"[HNP/LLL/BKZ] Solver process failed (exit={proc.exitcode}); continuing pipeline.")
+        write_hnp_report("process_failed", exitcode=proc.exitcode)
         return None
     if qout.empty():
         print("[HNP/LLL/BKZ] Solver returned no result; continuing pipeline.")
+        write_hnp_report("empty_result")
         return None
     status, payload = qout.get()
     if status != "ok":
         print(f"[HNP/LLL/BKZ] Solver execution failed: {payload}")
+        write_hnp_report("solver_error", error=str(payload))
         return None
     candidates = payload
     with open(out_path, "w", encoding="utf-8") as fout:
         for c in candidates:
             fout.write(f"{c}\n")
     print(f"[HNP/LLL/BKZ] Candidates written to {out_path}")
+    write_hnp_report("ok", candidates=len(candidates))
     return candidates
 
 
@@ -395,9 +439,15 @@ def build_strong_signal_subset_from_cluster_report(
     strong_clusters = {
         x.get("cluster")
         for x in tops
-        if int(x.get("dup_r_values", 0)) > 0
-        or int(x.get("dup_r_events", 0)) > 0
-        or float(x.get("tiny_r_ratio", 0.0)) >= 0.01
+        if (
+            int(x.get("dup_r_values", 0) or 0) > 0
+            or int(x.get("dup_r_events", 0) or 0) > 0
+            or int(x.get("fdr_bits_r", 0) or 0) > 0
+            or float(x.get("tiny_r_ratio", 0.0) or 0.0) >= 0.01
+            or int(x.get("cluster_risk_score_v2", x.get("cluster_risk_score", 0)) or 0) >= int(
+                ((crep.get("policy", {}) or {}).get("cluster_risk_threshold", 0) or 0)
+            )
+        )
     }
     if not strong_clusters:
         return 0
@@ -502,6 +552,17 @@ def build_external_candidate_args(args: argparse.Namespace) -> tuple[list[str], 
             }
 
     return extra, report
+
+
+def structured_relation_args(args: argparse.Namespace) -> list[str]:
+    """Bounded nonce-relation scan knobs passed through to ecdsa_recover_strict."""
+    return [
+        "--dg-max-delta", str(max(0, int(args.delta_max))),
+        "--dg-per-pair-cap", str(max(0, int(args.delta_per_pair_cap))),
+        "--lcg-a-max", str(max(0, int(args.lcg_a_max))),
+        "--lcg-b-max", str(max(0, int(args.lcg_b_max))),
+        "--lcg-per-pair-cap", str(max(0, int(args.lcg_per_pair_cap))),
+    ]
 
 
 def write_candidate_validation_report(
@@ -994,7 +1055,10 @@ def main() -> None:
     ap.add_argument("--enable-nonce-hypotheses", action="store_true",
                     help="Generate bounded weak-nonce r->k candidates and validate them locally")
     ap.add_argument("--nonce-hypothesis-models",
-                    default="timestamp-direct,timestamp-sha256,height-direct,height-sha256",
+                    default=(
+                        "timestamp-direct,timestamp-sha256,height-direct,height-sha256,"
+                        "txid-sha256,txid-vin-sha256,txid-vin-sighash-sha256"
+                    ),
                     help="Comma-separated candidate_hypotheses.py models")
     ap.add_argument("--nonce-hypothesis-out", default="nonce_hypothesis_k.jsonl",
                     help="Generated r->k candidate JSONL path")
@@ -1030,10 +1094,22 @@ def main() -> None:
                     help="Disable advanced recovery escalation")
     ap.add_argument("--random-k-budget", type=int, default=0,
                     help="Random-k tries per bucket for final escalation stage (0 disables random-k stage)")
+    ap.add_argument("--delta-max", type=int, default=4096,
+                    help="Maximum absolute delta tested for k2 = k1 +/- delta relation")
+    ap.add_argument("--delta-per-pair-cap", type=int, default=4096,
+                    help="Per-pair cap for delta-gradient relation testing")
+    ap.add_argument("--lcg-a-max", type=int, default=4,
+                    help="Affine nonce recurrence bound: test |a-1| <= this value")
+    ap.add_argument("--lcg-b-max", type=int, default=4096,
+                    help="Affine nonce recurrence bound: test |b| <= this value")
+    ap.add_argument("--lcg-per-pair-cap", type=int, default=2048,
+                    help="Per-pair cap for affine-LCG relation testing")
     ap.add_argument("--hnp-timeout-sec", type=int, default=120,
                     help="Timeout in seconds for HNP/LLL/BKZ solver subprocess")
     ap.add_argument("--hnp-min-leaks", type=int, default=8,
                     help="Minimum rows with explicit known_nonce_bits required to run HNP solver")
+    ap.add_argument("--hnp-report-out", default="hnp_lll_bkz_report.json",
+                    help="Metadata-only HNP gating/solver diagnostics report")
     ap.add_argument("--max-invalid-ratio", type=float, default=0.35,
                     help="If verification invalid_ratio exceeds this (and enough verifiable rows), treat dataset as low-quality")
     ap.add_argument("--min-verifiable-for-gate", type=int, default=200,
@@ -1070,6 +1146,7 @@ def main() -> None:
         args.recover_collisions_out,
         args.recover_clusters_out,
         args.hnp_candidates_out,
+        args.hnp_report_out,
         args.candidate_validation_report,
         args.nonce_hypothesis_out,
         args.nonce_hypothesis_report,
@@ -1365,6 +1442,7 @@ def main() -> None:
         bits_known=6,
         q=None,
         out_path=args.hnp_candidates_out,
+        report_path=args.hnp_report_out,
         timeout_sec=args.hnp_timeout_sec,
         min_leaks=args.hnp_min_leaks,
     )
@@ -1546,7 +1624,7 @@ def main() -> None:
             recover_deltas_out=args.recover_deltas_out,
             recover_collisions_out=args.recover_collisions_out,
             recover_clusters_out=args.recover_clusters_out,
-            extra_args=["--scan-random-k", "0"] + external_candidate_args,
+            extra_args=["--scan-random-k", "0"] + structured_relation_args(args) + external_candidate_args,
         )
         stage_runs.append({"name": "stage2-lcg-delta", "rc": stage2_rc})
         if stage2_rc != 0:
@@ -1583,7 +1661,9 @@ def main() -> None:
                 recover_deltas_out=args.recover_deltas_out,
                 recover_collisions_out=args.recover_collisions_out,
                 recover_clusters_out=args.recover_clusters_out,
-                extra_args=["--scan-random-k", str(args.random_k_budget)] + external_candidate_args,
+                extra_args=[
+                    "--scan-random-k", str(args.random_k_budget),
+                ] + structured_relation_args(args) + external_candidate_args,
             )
             stage_runs.append({"name": "stage3-random-k", "rc": stage3_rc})
             if stage3_rc != 0:
@@ -1617,7 +1697,7 @@ def main() -> None:
             recover_deltas_out=args.recover_deltas_out,
             recover_collisions_out=args.recover_collisions_out,
             recover_clusters_out=args.recover_clusters_out,
-            extra_args=external_candidate_args,
+            extra_args=structured_relation_args(args) + external_candidate_args,
         )
         stage_runs.append({"name": "fallback-full-lcg-delta", "rc": fallback_rc})
         if fallback_rc != 0:
@@ -1625,24 +1705,68 @@ def main() -> None:
 
         fallback_random_budget = max(0, int(args.fallback_random_k_budget))
         if fallback_random_budget > 0:
-            fallback_random_rc = run_recover_stage(
-                recover_bin=args.recover_bin,
-                recover_input=str(sigs),
-                threads=fallback_threads,
-                max_iter=max(fallback_iter, 4 if fusion_tier == "critical" else 3),
-                stage_name="fallback-full-random-k",
-                recover_json_out=args.recover_json_out,
-                recover_txt_out=args.recover_txt_out,
-                recover_k_out=args.recover_k_out,
-                recover_deltas_out=args.recover_deltas_out,
-                recover_collisions_out=args.recover_collisions_out,
-                recover_clusters_out=args.recover_clusters_out,
-                extra_args=["--scan-random-k", str(fallback_random_budget)] + external_candidate_args,
+            fallback_random_input = ""
+            strong_subset = Path(args.strong_signal_out)
+            strong_subset_source = (
+                Path(recover_input)
+                if recover_input != str(sigs) and Path(recover_input).exists()
+                else sigs
             )
-            stage_runs.append({"name": "fallback-full-random-k", "rc": fallback_random_rc})
-            if fallback_random_rc != 0:
-                raise RuntimeError(
-                    f"Recover full-input random-k fallback failed with exit code {fallback_random_rc}"
+            selected = build_strong_signal_subset_from_cluster_report(
+                sig_path=strong_subset_source,
+                cluster_report_path=Path(args.cluster_report),
+                out_path=strong_subset,
+            )
+            if selected > 0:
+                fallback_random_input = str(strong_subset)
+                print(
+                    "Random-k fallback constrained to strong-signal subset:",
+                    f"selected_signatures={selected}",
+                )
+            elif recover_input != str(sigs) and Path(recover_input).exists():
+                fallback_random_input = recover_input
+                print("Random-k fallback constrained to filtered recovery input.")
+
+            if fallback_random_input:
+                fallback_random_rc = run_recover_stage(
+                    recover_bin=args.recover_bin,
+                    recover_input=fallback_random_input,
+                    threads=fallback_threads,
+                    max_iter=max(fallback_iter, 4 if fusion_tier == "critical" else 3),
+                    stage_name="fallback-targeted-random-k",
+                    recover_json_out=args.recover_json_out,
+                    recover_txt_out=args.recover_txt_out,
+                    recover_k_out=args.recover_k_out,
+                    recover_deltas_out=args.recover_deltas_out,
+                    recover_collisions_out=args.recover_collisions_out,
+                    recover_clusters_out=args.recover_clusters_out,
+                    extra_args=[
+                        "--scan-random-k", str(fallback_random_budget),
+                    ] + structured_relation_args(args) + external_candidate_args,
+                )
+                stage_runs.append(
+                    {
+                        "name": "fallback-targeted-random-k",
+                        "rc": fallback_random_rc,
+                        "input": fallback_random_input,
+                    }
+                )
+                if fallback_random_rc != 0:
+                    raise RuntimeError(
+                        f"Recover targeted random-k fallback failed with exit code {fallback_random_rc}"
+                    )
+            else:
+                print(
+                    "Skipping random-k fallback: no targeted subset available; "
+                    "full-corpus random-k is not cost-effective."
+                )
+                stage_runs.append(
+                    {
+                        "name": "fallback-targeted-random-k",
+                        "rc": None,
+                        "skipped": True,
+                        "reason": "no_targeted_input",
+                    }
                 )
         post_validation = post_validate_recovered(Path(args.recover_json_out))
         new_valid_rows = int(post_validation["valid_rows"]) - int(pre_recover_validation["valid_rows"])

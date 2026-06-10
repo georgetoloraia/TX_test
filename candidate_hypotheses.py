@@ -50,6 +50,24 @@ def sha256_int(data: str) -> int:
     return int.from_bytes(hashlib.sha256(data.encode("utf-8")).digest(), "big") % SECP256K1_N
 
 
+def row_field(row: dict[str, Any], *names: str) -> str:
+    for name in names:
+        value = row.get(name)
+        if value is not None:
+            return str(value).strip()
+    return ""
+
+
+def row_int_field(row: dict[str, Any], *names: str, default: int = 0) -> int:
+    raw = row_field(row, *names)
+    if not raw:
+        return default
+    try:
+        return parse_int(raw)
+    except Exception:
+        return default
+
+
 def load_observed(
     sig_path: Path,
     target_pubkey: str = "",
@@ -61,6 +79,8 @@ def load_observed(
     matched_target = 0
     missing_time = 0
     missing_height = 0
+    missing_txid = 0
+    missing_vin = 0
     skipped_bad = 0
 
     with sig_path.open("r", encoding="utf-8") as f:
@@ -91,6 +111,10 @@ def load_observed(
                 missing_time += 1
             if obj.get("block_height") is None:
                 missing_height += 1
+            if not row_field(obj, "txid"):
+                missing_txid += 1
+            if not row_field(obj, "vin", "input_index"):
+                missing_vin += 1
             observed.setdefault(r, obj)
 
     meta = {
@@ -101,6 +125,8 @@ def load_observed(
         "unique_r": len(observed),
         "missing_block_time_rows": missing_time,
         "missing_block_height_rows": missing_height,
+        "missing_txid_rows": missing_txid,
+        "missing_vin_rows": missing_vin,
         "skipped_bad_rows": skipped_bad,
     }
     return observed, meta
@@ -113,6 +139,28 @@ def candidate_stream_for_row(
     time_step_sec: int,
     counter_max: int,
 ) -> Iterable[tuple[str, int]]:
+    txid = row_field(row, "txid")
+    vin = row_int_field(row, "vin", "input_index", default=0)
+    sighash = row_int_field(row, "sighash", default=1)
+    pubkey = normalize_pubkey_hex(row_field(row, "pubkey_hex", "pub"))
+    prev_txid = row_field(row, "prev_txid")
+    prev_vout = row_int_field(row, "prev_vout", "vout", default=0)
+    height = row_field(row, "block_height")
+    block_time = row_field(row, "block_time")
+
+    if txid:
+        if "txid-sha256" in models:
+            yield "txid-sha256", sha256_int(txid)
+        if "txid-vin-sha256" in models:
+            yield "txid-vin-sha256", sha256_int(f"{txid}:{vin}")
+            yield "txid-vin-sha256", sha256_int(f"{txid}-{vin}")
+        if "txid-vin-sighash-sha256" in models:
+            yield "txid-vin-sighash-sha256", sha256_int(f"{txid}:{vin}:{sighash}")
+        if pubkey and "pubkey-txid-vin-sha256" in models:
+            yield "pubkey-txid-vin-sha256", sha256_int(f"{pubkey}:{txid}:{vin}")
+        if prev_txid and "prevout-txid-vin-sha256" in models:
+            yield "prevout-txid-vin-sha256", sha256_int(f"{prev_txid}:{prev_vout}:{txid}:{vin}")
+
     if "timestamp-direct" in models or "timestamp-sha256" in models or "timestamp-counter-sha256" in models:
         if row.get("block_time") is not None:
             t0 = parse_int(row.get("block_time"))
@@ -128,6 +176,11 @@ def candidate_stream_for_row(
                     for c in range(0, max(0, int(counter_max)) + 1):
                         yield "timestamp-counter-sha256", sha256_int(f"{t}:{c}")
                         yield "timestamp-counter-sha256", sha256_int(f"{t}-{c}")
+                if txid and "timestamp-txid-vin-sha256" in models:
+                    yield "timestamp-txid-vin-sha256", sha256_int(f"{t}:{txid}:{vin}")
+                if pubkey and "timestamp-pubkey-counter-sha256" in models:
+                    for c in range(0, max(0, int(counter_max)) + 1):
+                        yield "timestamp-pubkey-counter-sha256", sha256_int(f"{t}:{pubkey}:{c}")
 
     if "height-direct" in models or "height-sha256" in models or "height-counter-sha256" in models:
         if row.get("block_height") is not None:
@@ -141,6 +194,27 @@ def candidate_stream_for_row(
                 for c in range(0, max(0, int(counter_max)) + 1):
                     yield "height-counter-sha256", sha256_int(f"{h}:{c}")
                     yield "height-counter-sha256", sha256_int(f"{h}-{c}")
+            if txid and "height-txid-vin-sha256" in models:
+                yield "height-txid-vin-sha256", sha256_int(f"{h}:{txid}:{vin}")
+            if pubkey and "height-pubkey-counter-sha256" in models:
+                for c in range(0, max(0, int(counter_max)) + 1):
+                    yield "height-pubkey-counter-sha256", sha256_int(f"{h}:{pubkey}:{c}")
+
+    if (
+        height
+        and block_time
+        and txid
+        and (
+            "height-time-txid-vin-sha256" in models
+            or "pubkey-height-time-txid-vin-sha256" in models
+        )
+    ):
+        if "height-time-txid-vin-sha256" in models:
+            yield "height-time-txid-vin-sha256", sha256_int(f"{height}:{block_time}:{txid}:{vin}")
+        if pubkey and "pubkey-height-time-txid-vin-sha256" in models:
+            yield "pubkey-height-time-txid-vin-sha256", sha256_int(
+                f"{pubkey}:{height}:{block_time}:{txid}:{vin}"
+            )
 
 
 def generate_candidates(
@@ -242,7 +316,14 @@ def main() -> None:
     ap.add_argument(
         "--models",
         default="timestamp-direct,timestamp-sha256,height-direct,height-sha256",
-        help="Comma-separated: small-k,timestamp-direct,timestamp-sha256,timestamp-counter-sha256,height-direct,height-sha256,height-counter-sha256",
+        help=(
+            "Comma-separated models: small-k,timestamp-direct,timestamp-sha256,"
+            "timestamp-counter-sha256,height-direct,height-sha256,height-counter-sha256,"
+            "txid-sha256,txid-vin-sha256,txid-vin-sighash-sha256,pubkey-txid-vin-sha256,"
+            "prevout-txid-vin-sha256,timestamp-txid-vin-sha256,timestamp-pubkey-counter-sha256,"
+            "height-txid-vin-sha256,height-pubkey-counter-sha256,height-time-txid-vin-sha256,"
+            "pubkey-height-time-txid-vin-sha256"
+        ),
     )
     ap.add_argument("--target-pubkey", default="")
     ap.add_argument("--time-window-sec", type=int, default=0)

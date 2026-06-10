@@ -69,9 +69,7 @@ PY
 ## Compile The C++ Recovery Engine
 
 ```bash
-g++ -O3 -march=native -flto -fexceptions -pthread -std=c++17 \
-  ecdsa_recover_strict.cpp -o ecdsa_recover_strict \
-  -lsecp256k1 -lcrypto -lpthread -Wno-deprecated-declarations
+g++ -O3 -march=native -flto -fexceptions -pthread -std=c++17 ecdsa_recover_strict.cpp -o ecdsa_recover_strict -lsecp256k1 -lcrypto -lpthread -Wno-deprecated-declarations
 ```
 
 Verify the binary exists and prints help:
@@ -92,6 +90,9 @@ venv/bin/python -m py_compile \
   automate_recover.py \
   continuous_pipeline.py \
   hnp_lll_bkz_solver.py
+```
+```
+./venv/bin/python -m py_compile automate_recover.py continuous_pipeline.py candidate_hypotheses.py hnp_lll_bkz_solver.py
 ```
 
 Run HNP synthetic regression. Expected current result is exit code `5` until HNP math is fixed:
@@ -289,21 +290,29 @@ venv/bin/python automate_recover.py \
 More aggressive local search on a machine with enough headroom:
 
 ```bash
-venv/bin/python automate_recover.py \
+./venv/bin/python automate_recover.py \
   --sigs signatures.jsonl \
-  --audit-report ecdsa_audit_report.json \
-  --decision-out automate_decision.json \
   --recover-bin ./ecdsa_recover_strict \
   --threads 8 \
   --risk-threshold 40 \
-  --cluster-min-sigs 20 \
-  --cluster-risk-threshold 15 \
-  --max-clusters 100 \
+  --cluster-min-sigs 15 \
+  --cluster-risk-threshold 10 \
+  --max-clusters 120 \
   --max-iter 3 \
-  --random-k-budget 2048 \
-  --hnp-timeout-sec 120 \
-  --hnp-min-leaks 12 \
-  --full-scan-fallback \
+  --delta-max 8192 \
+  --delta-per-pair-cap 8192 \
+  --lcg-a-max 8 \
+  --lcg-b-max 8192 \
+  --lcg-per-pair-cap 4096 \
+  --random-k-budget 1024 \
+  --hnp-timeout-sec 180 \
+  --hnp-min-leaks 8 \
+  --enable-nonce-hypotheses \
+  --nonce-hypothesis-models timestamp-direct,timestamp-sha256,height-direct,height-sha256,txid-sha256,txid-vin-sha256,txid-vin-sighash-sha256,pubkey-txid-vin-sha256 \
+  --nonce-time-window-sec 2 \
+  --nonce-time-step-sec 1 \
+  --nonce-counter-max 3 \
+  --nonce-max-candidates 200000 \
   --enable-advanced-recover
 ```
 
