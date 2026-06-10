@@ -365,10 +365,16 @@ struct RecStore {
     mutex m;
     unordered_map<string,string> priv_by_pub; // pub -> priv_hex
     unordered_map<string, unordered_set<string>> k_by_r; // r -> set(khex)
-    void add_priv(const string& pub, const string& priv){ lock_guard<mutex> lk(m); priv_by_pub[pub]=priv; }
+    bool add_priv(const string& pub, const string& priv){
+        lock_guard<mutex> lk(m);
+        auto it = priv_by_pub.find(pub);
+        if(it != priv_by_pub.end() && it->second == priv) return false;
+        priv_by_pub[pub]=priv;
+        return true;
+    }
     bool has_priv_pub(const string& pub){ lock_guard<mutex> lk(m); return priv_by_pub.count(pub); }
     bool get_priv_pub(const string& pub, string& priv){ lock_guard<mutex> lk(m); auto it=priv_by_pub.find(pub); if(it==priv_by_pub.end()) return false; priv=it->second; return true;}
-    void add_k(const string& r, const string& khex){ lock_guard<mutex> lk(m); k_by_r[r].insert(khex); }
+    bool add_k(const string& r, const string& khex){ lock_guard<mutex> lk(m); return k_by_r[r].insert(khex).second; }
     bool get_kset(const string& r, vector<string>& out){ lock_guard<mutex> lk(m); auto it=k_by_r.find(r); if(it==k_by_r.end()) return false; out.assign(it->second.begin(), it->second.end()); return true; }
     bool empty_k(const string& r){ lock_guard<mutex> lk(m); return !k_by_r.count(r); }
     vector<pair<string, vector<string>>> snapshot_k(){
@@ -754,9 +760,10 @@ static pair<int,int> propagate_on_bucket(Ctx& C, Secp& S,
             if(!r_from_k_matches(C, S, R.r_hex, k.n)) continue;
 
             string khex=bn_hex(k.n);
-            if(store.empty_k(R.r_hex)) new_k+=2;
-            store.add_k(R.r_hex, khex);
-            BNWrap nk; BN_mod_sub(nk.n, C.N, k.n, C.N, C.ctx); store.add_k(R.r_hex, bn_hex(nk.n));
+            if(store.add_k(R.r_hex, khex)) new_k++;
+            BNWrap nk;
+            BN_mod_sub(nk.n, C.N, k.n, C.N, C.ctx);
+            if(store.add_k(R.r_hex, bn_hex(nk.n))) new_k++;
         }
         vector<string> ks;
         if(store.get_kset(R.r_hex, ks) && !ks.empty()){
@@ -777,8 +784,8 @@ static pair<int,int> propagate_on_bucket(Ctx& C, Secp& S,
                 string pub_out = !R.pub.empty()? R.pub : pubs.first;
                 if(!R.pub.empty() && R.pub!=pubs.first && R.pub!=pubs.second) continue;
                 string wif=priv_to_wif(dhex,true,true);
-                store.add_priv(pub_out, dhex);
-                GOUT.emit_unique_key(
+                bool new_priv = store.add_priv(pub_out, dhex);
+                bool emitted = GOUT.emit_unique_key(
                     out_json,
                     out_txt,
                     pub_out,
@@ -787,7 +794,7 @@ static pair<int,int> propagate_on_bucket(Ctx& C, Secp& S,
                     "\",\"wif\":\"" + wif + "\",\"r\":\"" + R.r_hex + "\",\"method\":\"propagate\"}",
                     string("PUB=") + pub_out + " PRIV=" + dhex + " WIF=" + wif + " R=" + R.r_hex + " (propagate)"
                 );
-                new_d++;
+                if(new_priv || emitted) new_d++;
             }
         }
     }
@@ -823,6 +830,11 @@ static int randk_scan_bucket(Ctx& C, const vector<Row>& rows, RecStore& store,
     for(auto& kv: by_r) rkeys.push_back(kv.first);
     if(rkeys.empty()) return 0;
 
+    // The CLI advertises --scan-random-k as a per-bucket budget. Keep that
+    // bounded by distributing the budget across unique r values in the bucket.
+    // Otherwise full-input fallback can accidentally become budget * unique_r.
+    const uint64_t attempts_per_r = max<uint64_t>(1, per_bucket / max<uint64_t>(1, rkeys.size()));
+
     atomic<size_t> idx{0};
     atomic<int> hits{0};
     auto worker = [&](int tid){
@@ -836,7 +848,7 @@ static int randk_scan_bucket(Ctx& C, const vector<Row>& rows, RecStore& store,
             vector<const Row*> vec;
             for(int id: by_r[Rhex]) vec.push_back(&rows[id]);
             if(vec.empty()) continue;
-            for(uint64_t t=0; t<per_bucket; ++t){
+            for(uint64_t t=0; t<attempts_per_r; ++t){
                 BN_zero(k.n);
                 for(int i=0;i<4;i++){
                     uint64_t w = R.next();
@@ -969,10 +981,45 @@ static size_t flush_k_snapshot(const string& out_k_path, RecStore& store)
     if(out_k_path.empty()) return 0;
     auto snapshot = store.snapshot_k();
     if(snapshot.empty()) return 0;
+
+    unordered_set<string> existing;
+    {
+        ifstream in(out_k_path);
+        string line;
+        while(getline(in, line)){
+            string r;
+            if(!jsonl_get(line, "r", r)) continue;
+            size_t arr_key = line.find("\"k_candidates\"");
+            if(arr_key == string::npos) continue;
+            size_t arr_begin = line.find('[', arr_key);
+            size_t arr_end = line.find(']', arr_begin == string::npos ? arr_key : arr_begin);
+            if(arr_begin == string::npos || arr_end == string::npos || arr_end <= arr_begin) continue;
+            vector<string> ks;
+            size_t p = arr_begin + 1;
+            while(true){
+                size_t q = line.find('"', p);
+                if(q == string::npos || q >= arr_end) break;
+                size_t q2 = line.find('"', q + 1);
+                if(q2 == string::npos || q2 > arr_end) break;
+                string val = line.substr(q + 1, q2 - q - 1);
+                if(val.size() == 64 && is_hexlike(val)) ks.push_back(hexlower(val));
+                p = q2 + 1;
+            }
+            sort(ks.begin(), ks.end());
+            ks.erase(unique(ks.begin(), ks.end()), ks.end());
+            string key = hexlower(r) + "|";
+            for(const auto& k : ks) key += k + ",";
+            existing.insert(key);
+        }
+    }
+
     ofstream fk(out_k_path, ios::app);
     size_t rows = 0;
     for(auto& item : snapshot){
         if(item.second.empty()) continue;
+        string snap_key = item.first + "|";
+        for(const auto& k : item.second) snap_key += k + ",";
+        if(existing.count(snap_key)) continue;
         fk << "{\"r\":\"" << item.first << "\",\"k_candidates\":[";
         for(size_t i=0;i<item.second.size();++i){
             if(i) fk << ",";
@@ -1237,12 +1284,17 @@ static void load_k_jsonl_into_store(const string& path, RecStore& store){
     Ctx C;
     while(getline(f,line)){
         string r; if(!jsonl_get(line,"r",r)) continue;
-        size_t p=0;
+        size_t arr_key = line.find("\"k_candidates\"");
+        if(arr_key == string::npos) continue;
+        size_t arr_begin = line.find('[', arr_key);
+        size_t arr_end = line.find(']', arr_begin == string::npos ? arr_key : arr_begin);
+        if(arr_begin == string::npos || arr_end == string::npos || arr_end <= arr_begin) continue;
+        size_t p=arr_begin + 1;
         while(true){
             size_t q=line.find('"', p);
-            if(q==string::npos) break;
+            if(q==string::npos || q>=arr_end) break;
             size_t q2=line.find('"', q+1);
-            if(q2==string::npos) break;
+            if(q2==string::npos || q2>arr_end) break;
             string val=line.substr(q+1,q2-q-1);
             if(val.size()==64 && is_hexlike(val)){
                 string rr = hexlower(r);
@@ -1261,6 +1313,45 @@ static void load_k_jsonl_into_store(const string& path, RecStore& store){
             p=q2+1;
         }
     }
+}
+
+static size_t load_recovered_keys_into_store(const string& path, RecStore& store, secp256k1_context* ctx){
+    if(path.empty()) return 0;
+    ifstream f(path);
+    if(!f.good()) return 0;
+
+    BIGNUM* bn = BN_new();
+    BIGNUM* n = BN_new();
+    BN_hex2bn(&n, N_HEX);
+
+    string line;
+    size_t seeded = 0;
+    while(getline(f, line)){
+        string pub, priv;
+        if(!jsonl_get(line, "pubkey", pub)) continue;
+        if(!jsonl_get(line, "priv_hex", priv)) continue;
+        pub = hexlower(pub);
+        priv = hexlower(priv);
+        if(priv.size() != 64 || !is_hexlike(priv)) continue;
+
+        std::array<unsigned char,32> d32{};
+        if(!hex_to_32(priv, d32)) continue;
+        BN_bin2bn(d32.data(), 32, bn);
+        if(BN_is_zero(bn) || BN_cmp(bn, n) >= 0) continue;
+
+        string pc, pu;
+        if(!derive_pub_hexes(d32, pc, pu, ctx)) continue;
+        pc = hexlower(pc);
+        pu = hexlower(pu);
+        if(pub != pc && pub != pu) continue;
+
+        store.add_priv(pub, priv);
+        seeded++;
+    }
+
+    BN_free(bn);
+    BN_free(n);
+    return seeded;
 }
 
 // ------------------------------- CLI / Args -------------------------------
@@ -1417,6 +1508,25 @@ int main(int argc, char** argv){
 
     RecStore store;
 
+    // Reuse local recovery artifacts as seed material on later runs. This keeps
+    // recovered knowledge active for newly downloaded signatures without
+    // re-emitting duplicate key rows.
+    {
+        Secp secp;
+        size_t seeded_privs = load_recovered_keys_into_store(A.out_json, store, secp.ctx);
+        if(seeded_privs > 0){
+            cerr << "[preload-recovered] priv_keys_seeded=" << seeded_privs
+                 << " from=" << A.out_json << "\n";
+        }
+    }
+    if(!A.out_k.empty()){
+        load_k_jsonl_into_store(A.out_k, store);
+        ifstream fk(A.out_k);
+        if(fk.good()){
+            cerr << "[preload-recovered-k] loaded_existing_k_candidates from=" << A.out_k << "\n";
+        }
+    }
+
     // preload from known privs
     if(!A.preload_priv.empty()){
         std::string seed_outk = A.out_k.empty() ? std::string("recovered_k_from_priv.jsonl") : A.out_k;
@@ -1534,6 +1644,23 @@ int main(int argc, char** argv){
                 if(i>=buckets.size()) break;
                 vector<Row> rows; Ctx C;
                 load_bucket_rows_precompute(buckets[i], rows);
+                unordered_set<string> unique_r_in_bucket;
+                unique_r_in_bucket.reserve(rows.size());
+                for(const auto& rw : rows) unique_r_in_bucket.insert(rw.r_hex);
+                uint64_t attempts_per_r = 0;
+                if(!unique_r_in_bucket.empty()){
+                    attempts_per_r = max<uint64_t>(
+                        1,
+                        A.scan_random_k / max<uint64_t>(1, unique_r_in_bucket.size())
+                    );
+                    log_line(
+                        string("[random-k budget ") + fs::path(buckets[i]).filename().string() +
+                        "] rows=" + to_string(rows.size()) +
+                        " unique_r=" + to_string(unique_r_in_bucket.size()) +
+                        " attempts_per_r=" + to_string(attempts_per_r) +
+                        " bucket_budget=" + to_string(A.scan_random_k)
+                    );
+                }
                 int hits = randk_scan_bucket(
                     C,
                     rows,
