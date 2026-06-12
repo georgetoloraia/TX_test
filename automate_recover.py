@@ -551,6 +551,25 @@ def build_external_candidate_args(args: argparse.Namespace) -> tuple[list[str], 
                 "sha256": sha256_file(p),
             }
 
+    if getattr(args, "preload_recovered_json", ""):
+        p = Path(args.preload_recovered_json)
+        if not p.exists():
+            print(f"[warn] skipping missing --preload-recovered-json file: {p}")
+            report["preload_recovered_json"] = {
+                "path": str(p),
+                "missing": True,
+                "rows": 0,
+                "sha256": None,
+            }
+        else:
+            extra += ["--preload-recovered", str(p)]
+            report["enabled"] = True
+            report["preload_recovered_json"] = {
+                "path": str(p),
+                "rows": count_nonempty_lines(p),
+                "sha256": sha256_file(p),
+            }
+
     return extra, report
 
 
@@ -652,7 +671,13 @@ def build_target_pubkey_subset(sig_path: Path, target_pubkey: str, out_path: Pat
     }
 
 
-def build_duplicate_r_focus_subset(sig_path: Path, out_path: Path) -> dict[str, Any]:
+def build_duplicate_r_focus_subset(
+    sig_path: Path,
+    out_path: Path,
+    recoverable_out_path: Path | None = None,
+    replay_out_path: Path | None = None,
+    report_path: Path | None = None,
+) -> dict[str, Any]:
     rows_by_r: dict[int, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
     with sig_path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -675,38 +700,127 @@ def build_duplicate_r_focus_subset(sig_path: Path, out_path: Path) -> dict[str, 
     same_r_same_s_diff_z_groups = 0
     same_r_diff_s_groups = 0
     nontrivial_selected = 0
+    recoverable_selected = 0
+    replay_selected = 0
+    cross_pub_groups = 0
+    report_groups: list[dict[str, Any]] = []
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as out:
-        for _, rows in dup_groups.items():
-            s_set = set()
-            z_set = set()
-            uniq_sz = set()
-            for _, obj in rows:
-                try:
-                    sv = parse_int(obj.get("s"))
-                    zv = parse_int(obj.get("z"))
-                    s_set.add(sv)
-                    z_set.add(zv)
-                    uniq_sz.add((sv, zv))
-                except Exception:
-                    pass
-            is_nontrivial = False
-            if len(uniq_sz) == 1:
-                exact_replay_groups += 1
-            elif len(s_set) == 1 and len(z_set) > 1:
-                same_r_same_s_diff_z_groups += 1
-            elif len(s_set) > 1:
-                same_r_diff_s_groups += 1
-                nontrivial_groups += 1
-                is_nontrivial = True
-            else:
-                nontrivial_groups += 1
-                is_nontrivial = True
-            for raw, _ in rows:
-                out.write(raw + "\n")
-                selected += 1
-                if is_nontrivial:
-                    nontrivial_selected += 1
+    recoverable_out = None
+    replay_out = None
+    try:
+        if recoverable_out_path is not None:
+            recoverable_out_path.parent.mkdir(parents=True, exist_ok=True)
+            recoverable_out = recoverable_out_path.open("w", encoding="utf-8")
+        if replay_out_path is not None:
+            replay_out_path.parent.mkdir(parents=True, exist_ok=True)
+            replay_out = replay_out_path.open("w", encoding="utf-8")
+        with out_path.open("w", encoding="utf-8") as out:
+            for r_value, rows in dup_groups.items():
+                s_set = set()
+                z_set = set()
+                uniq_sz = set()
+                pub_set = set()
+                tx_inputs = set()
+                for _, obj in rows:
+                    try:
+                        sv = parse_int(obj.get("s"))
+                        zv = parse_int(obj.get("z"))
+                        s_set.add(sv)
+                        z_set.add(zv)
+                        uniq_sz.add((sv, zv))
+                    except Exception:
+                        pass
+                    pub = normalize_pubkey_hex(str(obj.get("pubkey_hex") or obj.get("pub") or ""))
+                    if pub:
+                        pub_set.add(pub)
+                    txid = str(obj.get("txid") or "")
+                    vin = str(obj.get("vin") if obj.get("vin") is not None else obj.get("input_index") or "")
+                    if txid:
+                        tx_inputs.add((txid, vin))
+
+                is_nontrivial = False
+                group_kind = "unknown"
+                if len(uniq_sz) == 1:
+                    exact_replay_groups += 1
+                    group_kind = "exact_replay"
+                elif len(s_set) == 1 and len(z_set) > 1:
+                    same_r_same_s_diff_z_groups += 1
+                    group_kind = "same_r_same_s_diff_z"
+                elif len(s_set) > 1:
+                    same_r_diff_s_groups += 1
+                    nontrivial_groups += 1
+                    is_nontrivial = True
+                    group_kind = "same_r_diff_s"
+                else:
+                    nontrivial_groups += 1
+                    is_nontrivial = True
+                    group_kind = "nontrivial_unknown"
+
+                if len(pub_set) > 1:
+                    cross_pub_groups += 1
+
+                # Nontrivial duplicate-r is the direct algebraic recovery path.
+                # Cross-pub duplicate-r remains high-value evidence even when
+                # same-r/s rows are replay-like, so keep it in recoverable focus.
+                is_recoverable_focus = is_nontrivial or len(pub_set) > 1
+
+                report_groups.append(
+                    {
+                        "r": format(r_value, "064x"),
+                        "kind": group_kind,
+                        "rows": len(rows),
+                        "unique_s": len(s_set),
+                        "unique_z": len(z_set),
+                        "unique_pubkeys": len(pub_set),
+                        "unique_tx_inputs": len(tx_inputs),
+                        "recoverable_focus": is_recoverable_focus,
+                    }
+                )
+
+                for raw, _ in rows:
+                    out.write(raw + "\n")
+                    selected += 1
+                    if is_nontrivial:
+                        nontrivial_selected += 1
+                    if is_recoverable_focus:
+                        recoverable_selected += 1
+                        if recoverable_out is not None:
+                            recoverable_out.write(raw + "\n")
+                    else:
+                        replay_selected += 1
+                        if replay_out is not None:
+                            replay_out.write(raw + "\n")
+    finally:
+        if recoverable_out is not None:
+            recoverable_out.close()
+        if replay_out is not None:
+            replay_out.close()
+
+    report_groups.sort(
+        key=lambda x: (
+            bool(x.get("recoverable_focus")),
+            int(x.get("unique_pubkeys", 0)),
+            int(x.get("unique_s", 0)),
+            int(x.get("rows", 0)),
+        ),
+        reverse=True,
+    )
+    if report_path is not None:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_payload = {
+            "input": str(sig_path),
+            "all_duplicate_rows_out": str(out_path),
+            "recoverable_rows_out": str(recoverable_out_path) if recoverable_out_path else None,
+            "replay_rows_out": str(replay_out_path) if replay_out_path else None,
+            "duplicate_r_groups": len(dup_groups),
+            "recoverable_focus_groups": sum(1 for g in report_groups if g["recoverable_focus"]),
+            "recoverable_focus_rows": recoverable_selected,
+            "replay_like_rows": replay_selected,
+            "cross_pub_duplicate_r_groups": cross_pub_groups,
+            "groups": report_groups[:500],
+        }
+        report_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
 
     return {
         "duplicate_r_groups": len(dup_groups),
@@ -714,9 +828,15 @@ def build_duplicate_r_focus_subset(sig_path: Path, out_path: Path) -> dict[str, 
         "exact_replay_groups": exact_replay_groups,
         "same_r_same_s_diff_z_groups": same_r_same_s_diff_z_groups,
         "same_r_diff_s_groups": same_r_diff_s_groups,
+        "cross_pub_duplicate_r_groups": cross_pub_groups,
         "selected_signatures": selected,
         "selected_signatures_nontrivial": nontrivial_selected,
+        "selected_signatures_recoverable_focus": recoverable_selected,
+        "selected_signatures_replay_like": replay_selected,
         "output": str(out_path),
+        "recoverable_output": str(recoverable_out_path) if recoverable_out_path else None,
+        "replay_output": str(replay_out_path) if replay_out_path else None,
+        "classification_report": str(report_path) if report_path else None,
     }
 
 
@@ -804,6 +924,425 @@ def post_validate_recovered(path: Path) -> dict[str, Any]:
         "valid_rows": valid,
         "invalid_rows": invalid,
     }
+
+
+def build_recovery_chain_report(
+    *,
+    sig_path: Path,
+    recovered_json_path: Path,
+    recovered_k_path: Path,
+    out_path: Path,
+) -> dict[str, Any]:
+    """Write metadata-only coverage for recovered-key propagation.
+
+    This intentionally never copies private keys or WIF values into the report.
+    """
+    recovered_pubs: set[str] = set()
+    methods: Counter[str] = Counter()
+    bad_recovered_rows = 0
+    if recovered_json_path.exists():
+        with recovered_json_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    bad_recovered_rows += 1
+                    continue
+                if not isinstance(obj, dict):
+                    bad_recovered_rows += 1
+                    continue
+                pub = normalize_pubkey_hex(str(obj.get("pubkey") or obj.get("pubkey_hex") or obj.get("pub") or ""))
+                if pub:
+                    recovered_pubs.add(pub)
+                method = str(obj.get("method") or "unknown")
+                methods[method] += 1
+
+    matched_signatures = 0
+    matched_unique_r: set[str] = set()
+    matched_pub_counts: Counter[str] = Counter()
+    if recovered_pubs and sig_path.exists():
+        with sig_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                pub = normalize_pubkey_hex(str(obj.get("pubkey_hex") or obj.get("pub") or ""))
+                if pub not in recovered_pubs:
+                    continue
+                matched_signatures += 1
+                matched_pub_counts[pub] += 1
+                try:
+                    matched_unique_r.add(format(parse_int(obj.get("r")), "064x"))
+                except Exception:
+                    pass
+
+    recovered_k_rows = 0
+    recovered_k_r_values: set[str] = set()
+    if recovered_k_path.exists():
+        with recovered_k_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                recovered_k_rows += 1
+                try:
+                    obj = json.loads(raw)
+                    if isinstance(obj, dict) and obj.get("r") is not None:
+                        recovered_k_r_values.add(format(parse_int(obj.get("r")), "064x"))
+                except Exception:
+                    pass
+
+    payload = {
+        "source_sigs": str(sig_path),
+        "recovered_keys": str(recovered_json_path),
+        "recovered_k": str(recovered_k_path),
+        "recovered_pubkeys": len(recovered_pubs),
+        "bad_recovered_rows": bad_recovered_rows,
+        "methods": dict(methods),
+        "matched_signatures_for_recovered_pubkeys": matched_signatures,
+        "matched_unique_r_for_recovered_pubkeys": len(matched_unique_r),
+        "recovered_k_rows": recovered_k_rows,
+        "recovered_k_unique_r": len(recovered_k_r_values),
+        "top_recovered_pubkey_signature_counts": [
+            {"pubkey_prefix": pub[:20], "signature_count": count}
+            for pub, count in matched_pub_counts.most_common(20)
+        ],
+        "secret_material": "LOCAL_ARTIFACT_ONLY",
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
+def load_recovery_graph_facts(
+    recovered_json_path: Path,
+    recovered_k_path: Path,
+) -> dict[str, Any]:
+    """Load graph facts without returning any private/WIF material."""
+    recovered_pubs: set[str] = set()
+    recovered_r: set[str] = set()
+    methods: Counter[str] = Counter()
+    bad_recovered_rows = 0
+
+    if recovered_json_path.exists():
+        with recovered_json_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    bad_recovered_rows += 1
+                    continue
+                if not isinstance(obj, dict):
+                    bad_recovered_rows += 1
+                    continue
+                pub = normalize_pubkey_hex(str(obj.get("pubkey") or obj.get("pubkey_hex") or obj.get("pub") or ""))
+                if pub:
+                    recovered_pubs.add(pub)
+                if obj.get("r") is not None:
+                    try:
+                        recovered_r.add(format(parse_int(obj.get("r")), "064x"))
+                    except Exception:
+                        pass
+                methods[str(obj.get("method") or "unknown")] += 1
+
+    recovered_k_rows = 0
+    if recovered_k_path.exists():
+        with recovered_k_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                recovered_k_rows += 1
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    continue
+                if isinstance(obj, dict) and obj.get("r") is not None:
+                    try:
+                        recovered_r.add(format(parse_int(obj.get("r")), "064x"))
+                    except Exception:
+                        pass
+
+    return {
+        "recovered_pubs": recovered_pubs,
+        "recovered_r": recovered_r,
+        "methods": dict(methods),
+        "bad_recovered_rows": bad_recovered_rows,
+        "recovered_k_rows": recovered_k_rows,
+    }
+
+
+def build_recovery_graph_focus_subset(
+    *,
+    sig_path: Path,
+    recovered_json_path: Path,
+    recovered_k_path: Path,
+    out_path: Path,
+    report_path: Path,
+) -> dict[str, Any]:
+    """Select rows connected to known local recovered facts.
+
+    Rows are included when either:
+    - their pubkey already has a locally recovered private key; or
+    - their r has a locally recovered k candidate.
+
+    The report is metadata-only and intentionally omits private/WIF/k values.
+    """
+    facts = load_recovery_graph_facts(recovered_json_path, recovered_k_path)
+    recovered_pubs: set[str] = facts["recovered_pubs"]
+    recovered_r: set[str] = facts["recovered_r"]
+
+    total_rows = 0
+    selected_rows = 0
+    by_pub_rows = 0
+    by_r_rows = 0
+    both_rows = 0
+    bad_json_rows = 0
+    selected_unique_pub: set[str] = set()
+    selected_unique_r: set[str] = set()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with sig_path.open("r", encoding="utf-8", errors="replace") as src, out_path.open("w", encoding="utf-8") as out:
+        for line in src:
+            raw = line.strip()
+            if not raw:
+                continue
+            total_rows += 1
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                bad_json_rows += 1
+                continue
+            if not isinstance(obj, dict):
+                bad_json_rows += 1
+                continue
+
+            pub = normalize_pubkey_hex(str(obj.get("pubkey_hex") or obj.get("pub") or ""))
+            r_hex = ""
+            try:
+                r_hex = format(parse_int(obj.get("r")), "064x")
+            except Exception:
+                pass
+
+            pub_hit = bool(pub and pub in recovered_pubs)
+            r_hit = bool(r_hex and r_hex in recovered_r)
+            if not (pub_hit or r_hit):
+                continue
+
+            out.write(raw + "\n")
+            selected_rows += 1
+            by_pub_rows += int(pub_hit)
+            by_r_rows += int(r_hit)
+            both_rows += int(pub_hit and r_hit)
+            if pub:
+                selected_unique_pub.add(pub)
+            if r_hex:
+                selected_unique_r.add(r_hex)
+
+    payload = {
+        "source_sigs": str(sig_path),
+        "output": str(out_path),
+        "recovered_keys": str(recovered_json_path),
+        "recovered_k": str(recovered_k_path),
+        "total_rows": total_rows,
+        "selected_rows": selected_rows,
+        "selected_by_pubkey_rows": by_pub_rows,
+        "selected_by_recovered_r_rows": by_r_rows,
+        "selected_by_both_rows": both_rows,
+        "selected_unique_pubkeys": len(selected_unique_pub),
+        "selected_unique_r": len(selected_unique_r),
+        "known_recovered_pubkeys": len(recovered_pubs),
+        "known_recovered_r": len(recovered_r),
+        "recovered_methods": facts["methods"],
+        "recovered_k_rows": facts["recovered_k_rows"],
+        "bad_json_rows": bad_json_rows,
+        "bad_recovered_rows": facts["bad_recovered_rows"],
+        "secret_material": "LOCAL_ARTIFACT_ONLY",
+    }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
+def build_recovery_graph_expansion_report(
+    *,
+    graph_subset_path: Path,
+    recovered_json_path: Path,
+    recovered_k_path: Path,
+    pre_validation: dict[str, Any],
+    post_validation: dict[str, Any],
+    out_path: Path,
+) -> dict[str, Any]:
+    """Classify graph-selected rows and explain expansion blockers.
+
+    This report is intentionally metadata-only: it never includes private keys,
+    WIF values, raw k values, full pubkeys, or full r values.
+    """
+    facts = load_recovery_graph_facts(recovered_json_path, recovered_k_path)
+    recovered_pubs: set[str] = facts["recovered_pubs"]
+    recovered_r: set[str] = facts["recovered_r"]
+
+    rows = 0
+    bad_json_rows = 0
+    selected_by_pub_only = 0
+    selected_by_r_only = 0
+    selected_by_both = 0
+    known_k_should_derive_new_d_rows = 0
+    same_r_multi_pub_groups = 0
+    same_r_diff_s_groups = 0
+    same_r_diff_z_groups = 0
+    rows_missing_pubkey = 0
+    rows_missing_or_bad_r = 0
+    rows_with_bad_s_or_z = 0
+    r_groups: dict[str, dict[str, Any]] = {}
+
+    if graph_subset_path.exists():
+        with graph_subset_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                rows += 1
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    bad_json_rows += 1
+                    continue
+                if not isinstance(obj, dict):
+                    bad_json_rows += 1
+                    continue
+
+                pub = normalize_pubkey_hex(str(obj.get("pubkey_hex") or obj.get("pub") or ""))
+                if not pub:
+                    rows_missing_pubkey += 1
+
+                r_hex = ""
+                try:
+                    r_hex = format(parse_int(obj.get("r")), "064x")
+                except Exception:
+                    rows_missing_or_bad_r += 1
+
+                s_hex = ""
+                z_hex = ""
+                try:
+                    s_hex = format(parse_int(obj.get("s")), "064x")
+                    z_raw = obj.get("z")
+                    if z_raw is None:
+                        z_raw = obj.get("m")
+                    z_hex = format(parse_int(z_raw), "064x")
+                except Exception:
+                    rows_with_bad_s_or_z += 1
+
+                pub_hit = bool(pub and pub in recovered_pubs)
+                r_hit = bool(r_hex and r_hex in recovered_r)
+                if pub_hit and r_hit:
+                    selected_by_both += 1
+                elif pub_hit:
+                    selected_by_pub_only += 1
+                elif r_hit:
+                    selected_by_r_only += 1
+
+                # A recovered k for an unrecovered pubkey is the key-expansion
+                # opportunity. If no new key appears after chain stage, likely
+                # blockers are z mismatch, pubkey mismatch, or bad source data.
+                if r_hit and pub and pub not in recovered_pubs:
+                    known_k_should_derive_new_d_rows += 1
+
+                if r_hex:
+                    g = r_groups.setdefault(
+                        r_hex,
+                        {"pubs": set(), "s": set(), "z": set(), "rows": 0, "recovered_r": r_hex in recovered_r},
+                    )
+                    g["rows"] += 1
+                    if pub:
+                        g["pubs"].add(pub)
+                    if s_hex:
+                        g["s"].add(s_hex)
+                    if z_hex:
+                        g["z"].add(z_hex)
+
+    top_groups = []
+    for r_hex, g in r_groups.items():
+        pub_count = len(g["pubs"])
+        s_count = len(g["s"])
+        z_count = len(g["z"])
+        if pub_count > 1:
+            same_r_multi_pub_groups += 1
+        if s_count > 1:
+            same_r_diff_s_groups += 1
+        if z_count > 1:
+            same_r_diff_z_groups += 1
+        top_groups.append(
+            {
+                "r_prefix": r_hex[:16],
+                "rows": g["rows"],
+                "unique_pubkeys": pub_count,
+                "unique_s": s_count,
+                "unique_z": z_count,
+                "has_recovered_k": bool(g["recovered_r"]),
+            }
+        )
+
+    top_groups.sort(
+        key=lambda x: (
+            int(x["has_recovered_k"]),
+            int(x["unique_pubkeys"]),
+            int(x["unique_s"]),
+            int(x["unique_z"]),
+            int(x["rows"]),
+        ),
+        reverse=True,
+    )
+
+    pre_valid = int(pre_validation.get("valid_rows", 0) or 0)
+    post_valid = int(post_validation.get("valid_rows", 0) or 0)
+    new_valid = max(0, post_valid - pre_valid)
+    likely_blockers = []
+    if known_k_should_derive_new_d_rows > 0 and new_valid == 0:
+        likely_blockers.append("known_k_rows_did_not_validate_new_pubkeys")
+    if rows_with_bad_s_or_z > 0:
+        likely_blockers.append("bad_or_missing_s_z_in_graph_subset")
+    if rows_missing_pubkey > 0:
+        likely_blockers.append("missing_pubkey_blocks_strict_validation")
+    if same_r_multi_pub_groups > 0 and new_valid == 0:
+        likely_blockers.append("cross_pub_same_r_present_but_no_valid_new_d")
+
+    payload = {
+        "graph_subset": str(graph_subset_path),
+        "rows": rows,
+        "bad_json_rows": bad_json_rows,
+        "selected_by_pubkey_only_rows": selected_by_pub_only,
+        "selected_by_recovered_r_only_rows": selected_by_r_only,
+        "selected_by_both_rows": selected_by_both,
+        "known_k_should_derive_new_d_rows": known_k_should_derive_new_d_rows,
+        "same_r_multi_pub_groups": same_r_multi_pub_groups,
+        "same_r_diff_s_groups": same_r_diff_s_groups,
+        "same_r_diff_z_groups": same_r_diff_z_groups,
+        "rows_missing_pubkey": rows_missing_pubkey,
+        "rows_missing_or_bad_r": rows_missing_or_bad_r,
+        "rows_with_bad_s_or_z": rows_with_bad_s_or_z,
+        "pre_valid_recovered_rows": pre_valid,
+        "post_valid_recovered_rows": post_valid,
+        "new_valid_rows_from_graph_stage": new_valid,
+        "likely_blockers": likely_blockers,
+        "top_r_groups": top_groups[:50],
+        "secret_material": "LOCAL_ARTIFACT_ONLY",
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
 
 
 def cluster_key(obj: dict[str, Any]) -> str:
@@ -1050,6 +1589,8 @@ def main() -> None:
                     help="Local JSONL file with r plus 64-hex k candidates; passed to ecdsa_recover_strict --preload-k")
     ap.add_argument("--preload-priv-candidates", default="",
                     help="Local WIF/hex/decimal private-key candidate file; passed to ecdsa_recover_strict --preload-priv")
+    ap.add_argument("--preload-recovered-json", default="",
+                    help="Local recovered_keys.jsonl used to seed/deduplicate recovery graph without printing secrets")
     ap.add_argument("--candidate-validation-report", default="candidate_validation_report.json",
                     help="Local metadata-only report for external candidate validation")
     ap.add_argument("--enable-nonce-hypotheses", action="store_true",
@@ -1084,8 +1625,28 @@ def main() -> None:
                     help="Output JSONL path for --target-pubkey filtered signatures")
     ap.add_argument("--stage0-subset-out", default="signatures.dup_r_focus.jsonl",
                     help="Path for the duplicate-r focus subset")
+    ap.add_argument("--stage0-recoverable-out", default="signatures.dup_r_recoverable.jsonl",
+                    help="Path for nontrivial/cross-pub duplicate-r rows used by direct Stage0 recovery")
+    ap.add_argument("--stage0-replay-out", default="signatures.dup_r_replay.jsonl",
+                    help="Path for replay-like duplicate-r rows kept for evidence but skipped by Stage0 recovery")
+    ap.add_argument("--stage0-classification-report", default="duplicate_r_classification_report.json",
+                    help="Metadata-only duplicate-r classification report")
     ap.add_argument("--strong-signal-out", default="signatures.strong_signal.jsonl",
                     help="Path for the strongest-signal subset used by random-k stage")
+    ap.add_argument("--enable-chain-extraction", action="store_true", default=True,
+                    help="After recovered keys exist, rescan full input with cheap propagation to extract more local k/d chains")
+    ap.add_argument("--no-enable-chain-extraction", action="store_false", dest="enable_chain_extraction",
+                    help="Disable full-input propagation from already recovered local keys")
+    ap.add_argument("--chain-max-iter", type=int, default=2,
+                    help="max-iter for the cheap recovered-key chain extraction stage")
+    ap.add_argument("--recovery-chain-report", default="recovery_chain_report.json",
+                    help="Metadata-only report describing local recovered-key chain coverage")
+    ap.add_argument("--recovery-graph-subset-out", default="signatures.recovery_graph_focus.jsonl",
+                    help="Rows connected to recovered pubkeys or recovered r->k facts for cheap chain extraction")
+    ap.add_argument("--recovery-graph-report", default="recovery_graph_report.json",
+                    help="Metadata-only report for recovered fact graph focus selection")
+    ap.add_argument("--recovery-graph-expansion-report", default="recovery_graph_expansion_report.json",
+                    help="Metadata-only report explaining whether graph-connected rows expanded recovery")
     ap.add_argument("--disable-cluster-gating", action="store_true",
                     help="Recover on full signature file (legacy behavior)")
     ap.add_argument("--enable-advanced-recover", action="store_true", default=True,
@@ -1344,8 +1905,16 @@ def main() -> None:
     # Stage0 is built from the full input before any cluster filtering.
     stage0_subset_info = None
     stage0_path = Path(args.stage0_subset_out)
+    stage0_recoverable_path = Path(args.stage0_recoverable_out)
+    stage0_replay_path = Path(args.stage0_replay_out)
     if dup_r > 0:
-        stage0_subset_info = build_duplicate_r_focus_subset(sigs, stage0_path)
+        stage0_subset_info = build_duplicate_r_focus_subset(
+            sig_path=sigs,
+            out_path=stage0_path,
+            recoverable_out_path=stage0_recoverable_path,
+            replay_out_path=stage0_replay_path,
+            report_path=Path(args.stage0_classification_report),
+        )
 
     if not args.disable_cluster_gating:
         cluster_report = build_cluster_subset(
@@ -1414,10 +1983,13 @@ def main() -> None:
             f"groups={stage0_subset_info.get('duplicate_r_groups', 0)}",
             f"nontrivial={stage0_subset_info.get('nontrivial_duplicate_r_groups', 0)}",
             f"same_r_diff_s={stage0_subset_info.get('same_r_diff_s_groups', 0)}",
+            f"cross_pub={stage0_subset_info.get('cross_pub_duplicate_r_groups', 0)}",
             f"selected={stage0_subset_info.get('selected_signatures', 0)}",
+            f"recoverable_focus={stage0_subset_info.get('selected_signatures_recoverable_focus', 0)}",
+            f"replay_like={stage0_subset_info.get('selected_signatures_replay_like', 0)}",
         )
         if int(stage0_subset_info.get("nontrivial_duplicate_r_groups", 0)) > 0:
-            print("Stage0 has nontrivial duplicate-r; running dedicated duplicate-r recovery before broader input.")
+            print("Stage0 has nontrivial duplicate-r; running dedicated recovery on recoverable-focus rows.")
         else:
             print("Stage0 is replay-like only; keeping broader recover_input for stage1.")
 
@@ -1426,10 +1998,10 @@ def main() -> None:
     hnp_input = recover_input
     if (
         stage0_subset_info
-        and stage0_subset_info.get("selected_signatures", 0) > 0
+        and stage0_subset_info.get("selected_signatures_recoverable_focus", 0) > 0
         and int(stage0_subset_info.get("nontrivial_duplicate_r_groups", 0)) > 0
     ):
-        hnp_input = str(stage0_path)
+        hnp_input = str(stage0_recoverable_path)
     if stage0_subset_info and stage0_subset_info.get("duplicate_r_groups", 0) > 0:
         if int(stage0_subset_info.get("nontrivial_duplicate_r_groups", 0)) == 0:
             print("Duplicate-r groups are replay-like only (no same-r/diff-s); continuing with HNP + staged recovery.")
@@ -1458,6 +2030,11 @@ def main() -> None:
     external_candidate_args, external_candidate_report = build_external_candidate_args(args)
     if nonce_hypothesis_report.get("enabled"):
         external_candidate_report["nonce_hypotheses"] = nonce_hypothesis_report
+    candidate_evidence_available = bool(
+        external_candidate_report.get("enabled")
+        or (hnp_candidates and len(hnp_candidates) > 0)
+        or int(nonce_hypothesis_report.get("matched_candidates", 0) or 0) > 0
+    )
 
     # Multi-stage recovery:
     # stage1: primary/cheap scan (disable LCG + no random-k)
@@ -1481,7 +2058,7 @@ def main() -> None:
         dup_r=dup_r,
         cross_pub_dup_r=cross_pub_dup_r,
         strong_signal=strong_signal,
-        external_candidate_requested=external_candidate_requested,
+        external_candidate_requested=candidate_evidence_available,
     )
     stage1_threads = args.threads
     stage1_iter = max(1, args.max_iter)
@@ -1495,12 +2072,12 @@ def main() -> None:
     if (
         stage0_subset_info
         and int(stage0_subset_info.get("nontrivial_duplicate_r_groups", 0) or 0) > 0
-        and int(stage0_subset_info.get("selected_signatures", 0) or 0) > 0
+        and int(stage0_subset_info.get("selected_signatures_recoverable_focus", 0) or 0) > 0
     ):
         stage0_extra = ["--no-lcg", "--scan-random-k", "0", "--min-count", "1"] + external_candidate_args
         stage0_rc = run_recover_stage(
             recover_bin=args.recover_bin,
-            recover_input=str(stage0_path),
+            recover_input=str(stage0_recoverable_path),
             threads=stage1_threads,
             max_iter=1,
             stage_name="stage0-dup-r-direct",
@@ -1542,6 +2119,8 @@ def main() -> None:
                 "stage0_stop_reason": stop_reason,
                 "recovery_viability": recovery_viability,
                 "known_nonce_rows": known_nonce_rows,
+                "external_candidate_requested": external_candidate_requested,
+                "candidate_evidence_available": candidate_evidence_available,
                 "exhaustive_recover": args.exhaustive_recover,
                 "hnp_candidate_rows": len(hnp_candidates or []),
                 "external_candidate_validation": external_candidate_report,
@@ -1565,7 +2144,7 @@ def main() -> None:
                 "target_filter": target_filter_info,
                 "source_sigs": str(original_sigs),
                 "effective_cluster_risk_threshold": effective_cluster_threshold,
-                "recover_input": str(stage0_path),
+                "recover_input": str(stage0_recoverable_path),
                 "cluster_gating_used": not args.disable_cluster_gating,
                 "recover_stages": stage_runs,
                 "stage0_subset": stage0_subset_info,
@@ -1771,6 +2350,91 @@ def main() -> None:
         post_validation = post_validate_recovered(Path(args.recover_json_out))
         new_valid_rows = int(post_validation["valid_rows"]) - int(pre_recover_validation["valid_rows"])
 
+    chain_report: dict[str, Any] | None = None
+    if args.enable_chain_extraction and int(post_validation.get("valid_rows", 0) or 0) > 0:
+        chain_pre_validation = post_validation
+        graph_report = build_recovery_graph_focus_subset(
+            sig_path=sigs,
+            recovered_json_path=Path(args.recover_json_out),
+            recovered_k_path=Path(args.recover_k_out),
+            out_path=Path(args.recovery_graph_subset_out),
+            report_path=Path(args.recovery_graph_report),
+        )
+        chain_input = str(sigs)
+        if int(graph_report.get("selected_rows", 0) or 0) > 0:
+            chain_input = str(Path(args.recovery_graph_subset_out))
+            print(
+                "Recovery graph focus:",
+                f"selected_rows={graph_report.get('selected_rows', 0)}",
+                f"known_pubkeys={graph_report.get('known_recovered_pubkeys', 0)}",
+                f"known_r={graph_report.get('known_recovered_r', 0)}",
+            )
+        else:
+            print("Recovery graph focus is empty; falling back to full-input chain extraction.")
+        chain_rc = run_recover_stage(
+            recover_bin=args.recover_bin,
+            recover_input=chain_input,
+            threads=min(max(2, args.threads), 16),
+            max_iter=max(1, int(args.chain_max_iter)),
+            stage_name="stage-chain-extract-graph",
+            recover_json_out=args.recover_json_out,
+            recover_txt_out=args.recover_txt_out,
+            recover_k_out=args.recover_k_out,
+            recover_deltas_out=args.recover_deltas_out,
+            recover_collisions_out=args.recover_collisions_out,
+            recover_clusters_out=args.recover_clusters_out,
+            extra_args=["--no-lcg", "--scan-random-k", "0", "--min-count", "1"],
+        )
+        stage_runs.append({"name": "stage-chain-extract-graph", "rc": chain_rc, "input": chain_input})
+        if chain_rc != 0:
+            raise RuntimeError(f"Recover chain extraction failed with exit code {chain_rc}")
+        post_validation = post_validate_recovered(Path(args.recover_json_out))
+        new_valid_rows = int(post_validation["valid_rows"]) - int(pre_recover_validation["valid_rows"])
+        chain_report = build_recovery_chain_report(
+            sig_path=sigs,
+            recovered_json_path=Path(args.recover_json_out),
+            recovered_k_path=Path(args.recover_k_out),
+            out_path=Path(args.recovery_chain_report),
+        )
+        chain_report["new_valid_rows_from_chain_stage"] = max(
+            0,
+            int(post_validation.get("valid_rows", 0) or 0)
+            - int(chain_pre_validation.get("valid_rows", 0) or 0),
+        )
+        chain_report["recovery_graph_focus"] = graph_report
+        chain_report["recovery_graph_expansion"] = build_recovery_graph_expansion_report(
+            graph_subset_path=Path(args.recovery_graph_subset_out),
+            recovered_json_path=Path(args.recover_json_out),
+            recovered_k_path=Path(args.recover_k_out),
+            pre_validation=chain_pre_validation,
+            post_validation=post_validation,
+            out_path=Path(args.recovery_graph_expansion_report),
+        )
+    elif args.enable_chain_extraction:
+        graph_report = build_recovery_graph_focus_subset(
+            sig_path=sigs,
+            recovered_json_path=Path(args.recover_json_out),
+            recovered_k_path=Path(args.recover_k_out),
+            out_path=Path(args.recovery_graph_subset_out),
+            report_path=Path(args.recovery_graph_report),
+        )
+        chain_report = build_recovery_chain_report(
+            sig_path=sigs,
+            recovered_json_path=Path(args.recover_json_out),
+            recovered_k_path=Path(args.recover_k_out),
+            out_path=Path(args.recovery_chain_report),
+        )
+        chain_report["skipped_chain_stage"] = "no_valid_recovered_keys"
+        chain_report["recovery_graph_focus"] = graph_report
+        chain_report["recovery_graph_expansion"] = build_recovery_graph_expansion_report(
+            graph_subset_path=Path(args.recovery_graph_subset_out),
+            recovered_json_path=Path(args.recover_json_out),
+            recovered_k_path=Path(args.recover_k_out),
+            pre_validation=post_validation,
+            post_validation=post_validation,
+            out_path=Path(args.recovery_graph_expansion_report),
+        )
+
     pre_valid_rows = int(pre_recover_validation.get("valid_rows", 0))
     post_valid_rows = int(post_validation.get("valid_rows", 0))
 
@@ -1788,6 +2452,8 @@ def main() -> None:
         "search_attempted": True,
         "recovery_viability": recovery_viability,
         "known_nonce_rows": known_nonce_rows,
+        "external_candidate_requested": external_candidate_requested,
+        "candidate_evidence_available": candidate_evidence_available,
         "exhaustive_recover": args.exhaustive_recover,
         "hnp_candidate_rows": len(hnp_candidates or []),
         "external_candidate_validation": external_candidate_report,
@@ -1815,6 +2481,7 @@ def main() -> None:
         "cluster_gating_used": not args.disable_cluster_gating,
         "recover_stages": stage_runs,
         "stage0_subset": stage0_subset_info,
+        "recovery_chain_report": chain_report,
         "post_recover_validation": post_validation,
     })
     try:

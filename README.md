@@ -475,6 +475,28 @@ venv/bin/python continuous_pipeline.py \
   --stop-on-found
 ```
 
+===============================================
+======= TEST FOR MAX 8 GB RAM =================
+===============================================
+
+```
+python3 continuous_pipeline.py \
+  --start-height "$(cat last_processed_block.txt)" \
+  --batch-size 100 \
+  --threads 8 \
+  --python .venv/bin/python \
+  --random-k-budget 1024 \
+  --hnp-timeout-sec 120 \
+  --hnp-min-leaks 8 \
+  --enable-workset \
+  --workset-tail-lines 250000 \
+  --workset-max-rows 500000 \
+  --workset-recovered-keys recovered_keys.jsonl \
+  --workset-recovered-k recovered_k.jsonl \
+  --cumulative-recovered-keys recovered_keys.jsonl \
+  --cumulative-recovered-k recovered_k.jsonl
+  ```
+
 ## External Candidate Validation
 
 This is the recommended bounded extension path. Generate candidate nonces or candidate private keys externally, then let this project verify them locally against signatures and public keys.

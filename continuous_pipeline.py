@@ -443,7 +443,17 @@ def build_cycle_artifact_paths(run_dir: Path, cycle: int, cycle_start: int, args
         "nonce_hypothesis_report": cycle_dir / "nonce_hypothesis_report.json",
         "combined_preload_k": cycle_dir / "combined_preload_k.jsonl",
         "stage0_subset": cycle_dir / "signatures.dup_r_focus.jsonl",
+        "stage0_recoverable": cycle_dir / "signatures.dup_r_recoverable.jsonl",
+        "stage0_replay": cycle_dir / "signatures.dup_r_replay.jsonl",
+        "stage0_classification_report": cycle_dir / "duplicate_r_classification_report.json",
         "strong_signal": cycle_dir / "signatures.strong_signal.jsonl",
+        "recovery_chain_report": cycle_dir / "recovery_chain_report.json",
+        "recovery_graph_subset": cycle_dir / "signatures.recovery_graph_focus.jsonl",
+        "recovery_graph_report": cycle_dir / "recovery_graph_report.json",
+        "recovery_graph_expansion_report": cycle_dir / "recovery_graph_expansion_report.json",
+        "workset_sigs": cycle_dir / "signatures.workset.jsonl",
+        "workset_report": cycle_dir / "recovery_workset_report.json",
+        "workset_db": run_dir / "recovery_workset.sqlite",
     }
 
 
@@ -474,6 +484,88 @@ def recovered_artifact_summary(path: Path, new_rows: int) -> str:
         f"new_rows={new_rows}\n"
         "priv_material=LOCAL_ARTIFACT_ONLY"
     )
+
+
+def _jsonl_dedup_key(raw: str, obj: object, kind: str) -> str:
+    if isinstance(obj, dict):
+        if kind == "recovered_keys":
+            pub = str(obj.get("pubkey") or obj.get("pubkey_hex") or "")
+            priv = str(obj.get("priv_hex") or obj.get("priv") or obj.get("d") or "")
+            if pub or priv:
+                return "key:" + hashlib.sha256(f"{pub}|{priv}".encode("utf-8")).hexdigest()
+        if kind == "recovered_k":
+            r = str(obj.get("r") or obj.get("r_hex") or "")
+            k = str(obj.get("k") or obj.get("k_hex") or obj.get("nonce") or "")
+            candidates = obj.get("k_candidates")
+            if r and k:
+                return "rk:" + hashlib.sha256(f"{r}|{k}".encode("utf-8")).hexdigest()
+            if r and candidates is not None:
+                return "rkc:" + hashlib.sha256(
+                    json.dumps({"r": r, "k_candidates": candidates}, sort_keys=True).encode("utf-8")
+                ).hexdigest()
+            if r:
+                # Keep one canonical row per r when the file only stores a recovered r fact.
+                return "r:" + hashlib.sha256(r.encode("utf-8")).hexdigest()
+    return "raw:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def merge_jsonl_unique(src: Path, dst: Path, kind: str) -> dict[str, int | str]:
+    """Append unique JSONL facts from src into dst without exposing secret material."""
+    report: dict[str, int | str] = {
+        "src": str(src),
+        "dst": str(dst),
+        "existing_rows": 0,
+        "src_rows": 0,
+        "added_rows": 0,
+        "skipped_duplicate_rows": 0,
+        "skipped_bad_rows": 0,
+    }
+    if not src.exists():
+        report["missing_src"] = 1
+        return report
+    try:
+        if src.resolve() == dst.resolve():
+            report["same_path"] = 1
+            report["existing_rows"] = count_lines(dst)
+            return report
+    except Exception:
+        pass
+
+    seen: set[str] = set()
+    if dst.exists():
+        with dst.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    obj = None
+                seen.add(_jsonl_dedup_key(raw, obj, kind))
+                report["existing_rows"] = int(report["existing_rows"]) + 1
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with src.open("r", encoding="utf-8", errors="replace") as fin, dst.open("a", encoding="utf-8") as fout:
+        for line in fin:
+            raw = line.strip()
+            if not raw:
+                continue
+            report["src_rows"] = int(report["src_rows"]) + 1
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                report["skipped_bad_rows"] = int(report["skipped_bad_rows"]) + 1
+                continue
+            key = _jsonl_dedup_key(raw, obj, kind)
+            if key in seen:
+                report["skipped_duplicate_rows"] = int(report["skipped_duplicate_rows"]) + 1
+                continue
+            fout.write(raw + "\n")
+            seen.add(key)
+            report["added_rows"] = int(report["added_rows"]) + 1
+    report["final_rows"] = count_lines(dst)
+    return report
 
 
 def main() -> None:
@@ -531,6 +623,22 @@ def main() -> None:
                     help="Dynamically reduce heavy recovery parameters when runtime memory/CPU pressure is high")
     ap.add_argument("--no-live-backoff", action="store_false", dest="live_backoff",
                     help="Disable runtime backoff and keep configured parameters fixed")
+    ap.add_argument("--enable-workset", action="store_true",
+                    help="Build a bounded recovery workset from the full signatures archive before each recovery cycle")
+    ap.add_argument("--workset-tail-lines", type=int, default=250000,
+                    help="Recent tail rows included in the bounded recovery workset")
+    ap.add_argument("--workset-max-rows", type=int, default=0,
+                    help="Hard cap for workset rows; 0 means no cap")
+    ap.add_argument("--workset-batch-size", type=int, default=50000,
+                    help="SQLite insert batch size for build_recovery_workset.py")
+    ap.add_argument("--workset-recovered-keys", default="recovered_keys.jsonl",
+                    help="Cumulative recovered key artifact used only for workset selection")
+    ap.add_argument("--workset-recovered-k", default="recovered_k.jsonl",
+                    help="Cumulative recovered r->k artifact used only for workset selection")
+    ap.add_argument("--cumulative-recovered-keys", default="recovered_keys.jsonl",
+                    help="Cumulative recovered_keys.jsonl passed into each cycle recovery graph")
+    ap.add_argument("--cumulative-recovered-k", default="recovered_k.jsonl",
+                    help="Cumulative recovered_k.jsonl passed into each cycle as preload-k when no explicit preload is set")
 
     ap.add_argument("--signatures", default="signatures.jsonl")
     ap.add_argument("--recovered", default="recovered_keys.jsonl")
@@ -690,10 +798,31 @@ def main() -> None:
             cycle_artifacts["hnp_candidates"].unlink(missing_ok=True)
         except Exception:
             pass
+
+        recover_sigs = args.signatures
+        if args.enable_workset:
+            workset_cmd = [
+                args.python,
+                "build_recovery_workset.py",
+                "--input", args.signatures,
+                "--output", str(cycle_artifacts["workset_sigs"]),
+                "--db", str(cycle_artifacts["workset_db"]),
+                "--report", str(cycle_artifacts["workset_report"]),
+                "--recovered-keys", args.workset_recovered_keys,
+                "--recovered-k", args.workset_recovered_k,
+                "--tail-lines", str(args.workset_tail_lines),
+                "--max-rows", str(args.workset_max_rows),
+                "--batch-size", str(args.workset_batch_size),
+            ]
+            rc = run_cmd(workset_cmd)
+            if rc != 0:
+                raise RuntimeError(f"build_recovery_workset.py failed with exit code {rc}")
+            recover_sigs = str(cycle_artifacts["workset_sigs"])
+
         recover_cmd = [
             args.python,
             "automate_recover.py",
-            "--sigs", args.signatures,
+            "--sigs", recover_sigs,
             "--audit-report", str(cycle_artifacts["audit_report"]),
             "--decision-out", str(cycle_artifacts["decision_report"]),
             "--baseline-report", str(run_dir / "ecdsa_audit_report_prev.json"),
@@ -727,7 +856,14 @@ def main() -> None:
             "--nonce-hypothesis-report", str(cycle_artifacts["nonce_hypothesis_report"]),
             "--combined-preload-k-out", str(cycle_artifacts["combined_preload_k"]),
             "--stage0-subset-out", str(cycle_artifacts["stage0_subset"]),
+            "--stage0-recoverable-out", str(cycle_artifacts["stage0_recoverable"]),
+            "--stage0-replay-out", str(cycle_artifacts["stage0_replay"]),
+            "--stage0-classification-report", str(cycle_artifacts["stage0_classification_report"]),
             "--strong-signal-out", str(cycle_artifacts["strong_signal"]),
+            "--recovery-chain-report", str(cycle_artifacts["recovery_chain_report"]),
+            "--recovery-graph-subset-out", str(cycle_artifacts["recovery_graph_subset"]),
+            "--recovery-graph-report", str(cycle_artifacts["recovery_graph_report"]),
+            "--recovery-graph-expansion-report", str(cycle_artifacts["recovery_graph_expansion_report"]),
             "--fallback-max-iter", str(max(4 if args.discovery_mode == "max" else 3, effective["max_iter"])),
             "--fallback-random-k-budget", str(max(effective["random_k_budget"], 4096 if args.discovery_mode == "max" else 1024)),
         ]
@@ -737,8 +873,12 @@ def main() -> None:
             recover_cmd.append("--exhaustive-recover")
         if args.preload_k_candidates:
             recover_cmd += ["--preload-k-candidates", args.preload_k_candidates]
+        elif Path(args.cumulative_recovered_k).exists():
+            recover_cmd += ["--preload-k-candidates", args.cumulative_recovered_k]
         if args.preload_priv_candidates:
             recover_cmd += ["--preload-priv-candidates", args.preload_priv_candidates]
+        if Path(args.cumulative_recovered_keys).exists():
+            recover_cmd += ["--preload-recovered-json", args.cumulative_recovered_keys]
         if args.target_pubkey:
             recover_cmd += ["--target-pubkey", args.target_pubkey]
         if args.enable_nonce_hypotheses:
@@ -772,6 +912,34 @@ def main() -> None:
 
         after_recovered = count_lines(cycle_artifacts["recovered_json"])
         new_rows = max(0, after_recovered - before_recovered)
+        cumulative_merge_reports: list[dict[str, int | str]] = []
+        cumulative_keys = Path(args.cumulative_recovered_keys)
+        cumulative_k = Path(args.cumulative_recovered_k)
+        if cycle_artifacts["recovered_json"].exists():
+            cumulative_merge_reports.append(
+                merge_jsonl_unique(cycle_artifacts["recovered_json"], cumulative_keys, "recovered_keys")
+            )
+        if cycle_artifacts["recovered_k"].exists():
+            cumulative_merge_reports.append(
+                merge_jsonl_unique(cycle_artifacts["recovered_k"], cumulative_k, "recovered_k")
+            )
+        if cumulative_merge_reports:
+            added_keys = sum(
+                int(r.get("added_rows", 0) or 0)
+                for r in cumulative_merge_reports
+                if str(r.get("dst")) == str(cumulative_keys)
+            )
+            added_k = sum(
+                int(r.get("added_rows", 0) or 0)
+                for r in cumulative_merge_reports
+                if str(r.get("dst")) == str(cumulative_k)
+            )
+            print(
+                "Cumulative merge complete:",
+                f"recovered_keys_added={added_keys}",
+                f"recovered_k_added={added_k}",
+                "priv_material=LOCAL_ARTIFACT_ONLY",
+            )
         print(f"Cycle {cycle} complete: recovered_new_rows={new_rows}")
 
         anomaly_alert = None
@@ -909,6 +1077,7 @@ def main() -> None:
             "drift_flags": int(decision_obj.get("drift_flags", 0) or 0),
             "sighash_anomaly": bool(decision_obj.get("sighash_anomaly", False)),
             "recover_stages": decision_obj.get("recover_stages", []),
+            "cumulative_merge": cumulative_merge_reports,
         }
         timeline_path = Path(args.timeline_log)
         append_timeline_event(timeline_path, event)
