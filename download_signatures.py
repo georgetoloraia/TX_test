@@ -64,6 +64,18 @@ def sha256(b: bytes) -> bytes: return hashlib.sha256(b).digest()
 def hash256(b: bytes) -> bytes: return sha256(sha256(b))
 def ripemd160(b: bytes) -> bytes: h=hashlib.new('ripemd160'); h.update(b); return h.digest()
 
+def parse_int_value(value) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s.startswith("0x"):
+            return int(s, 16)
+        if any(c in "abcdef" for c in s):
+            return int(s, 16)
+        return int(s, 10)
+    return int(value)
+
 def le32(i: int) -> bytes: return i.to_bytes(4, 'little')
 def le64(i: int) -> bytes: return i.to_bytes(8, 'little')
 def varint(n: int) -> bytes:
@@ -391,8 +403,8 @@ class BlockWalker:
                         obj = json.loads(raw)
                         txid = obj.get("txid")
                         vin = obj.get("vin")
-                        r = parse_int(obj.get("r"))
-                        s = parse_int(obj.get("s"))
+                        r = parse_int_value(obj.get("r"))
+                        s = parse_int_value(obj.get("s"))
                     except Exception:
                         continue
                     if txid is None or vin is None:

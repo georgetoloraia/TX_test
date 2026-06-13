@@ -438,6 +438,10 @@ def build_cycle_artifact_paths(run_dir: Path, cycle: int, cycle_start: int, args
         "cluster_report": cycle_dir / "cluster_risk_report.json",
         "hnp_candidates": cycle_dir / "hnp_lll_bkz_candidates.txt",
         "hnp_report": cycle_dir / "hnp_lll_bkz_report.json",
+        "hnp_leaks": cycle_dir / "signatures.hnp_leaks.jsonl",
+        "hnp_leak_report": cycle_dir / "hnp_leak_report.json",
+        "hnp_bounded_k": cycle_dir / "hnp_bounded_k_candidates.jsonl",
+        "hnp_bounded_k_report": cycle_dir / "hnp_bounded_k_report.json",
         "target_sigs": cycle_dir / "signatures.target.jsonl",
         "nonce_hypothesis_k": cycle_dir / "nonce_hypothesis_k.jsonl",
         "nonce_hypothesis_report": cycle_dir / "nonce_hypothesis_report.json",
@@ -447,10 +451,13 @@ def build_cycle_artifact_paths(run_dir: Path, cycle: int, cycle_start: int, args
         "stage0_replay": cycle_dir / "signatures.dup_r_replay.jsonl",
         "stage0_classification_report": cycle_dir / "duplicate_r_classification_report.json",
         "strong_signal": cycle_dir / "signatures.strong_signal.jsonl",
+        "relation_neighborhood": cycle_dir / "signatures.relation_neighborhood.jsonl",
+        "relation_neighborhood_report": cycle_dir / "relation_neighborhood_report.json",
         "recovery_chain_report": cycle_dir / "recovery_chain_report.json",
         "recovery_graph_subset": cycle_dir / "signatures.recovery_graph_focus.jsonl",
         "recovery_graph_report": cycle_dir / "recovery_graph_report.json",
         "recovery_graph_expansion_report": cycle_dir / "recovery_graph_expansion_report.json",
+        "pubkey_expansion_report": cycle_dir / "pubkey_expansion_report.json",
         "workset_sigs": cycle_dir / "signatures.workset.jsonl",
         "workset_report": cycle_dir / "recovery_workset_report.json",
         "workset_db": run_dir / "recovery_workset.sqlite",
@@ -568,6 +575,65 @@ def merge_jsonl_unique(src: Path, dst: Path, kind: str) -> dict[str, int | str]:
     return report
 
 
+def latest_existing_artifact_names(names: list[str], runs_dir: Path) -> list[Path]:
+    """Return existing root/current-cycle style report paths, preferring newest run artifacts."""
+    out: list[Path] = []
+    seen: set[str] = set()
+    for name in names:
+        p = Path(name)
+        if p.exists():
+            out.append(p)
+            seen.add(str(p.resolve()))
+    for name in names:
+        matches = sorted(runs_dir.glob(f"*/cycle_*/{name}"))
+        for p in reversed(matches[-5:]):
+            try:
+                key = str(p.resolve())
+            except Exception:
+                key = str(p)
+            if p.exists() and key not in seen:
+                out.append(p)
+                seen.add(key)
+                break
+    return out
+
+
+def run_pubkey_expansion(args: argparse.Namespace, report_path: Path, sources: list[Path]) -> dict[str, object]:
+    if not sources and not args.target_pubkey:
+        return {"enabled": False, "reason": "no_sources"}
+    expansion_cmd = [
+        args.python,
+        "expand_pubkey_signatures.py",
+        "--signatures", args.signatures,
+        "--report", str(report_path),
+        "--max-pubkeys", str(args.pubkey_expansion_max_pubkeys),
+        "--max-pages-per-address", str(args.pubkey_expansion_max_pages_per_address),
+        "--max-txs-per-address", str(args.pubkey_expansion_max_txs_per_address),
+        "--sleep-sec", str(args.pubkey_expansion_sleep_sec),
+    ]
+    for src in sources:
+        expansion_cmd += ["--from-json", str(src)]
+    if args.target_pubkey:
+        expansion_cmd += ["--pubkey", args.target_pubkey]
+    rc = run_cmd(expansion_cmd)
+    if rc != 0:
+        print(f"[warn] expand_pubkey_signatures.py failed with exit code {rc}; continuing")
+        return {"enabled": True, "rc": rc, "failed": True, "sources": [str(p) for p in sources]}
+    if report_path.exists():
+        try:
+            d = json.loads(report_path.read_text(encoding="utf-8"))
+            print(
+                "Pubkey expansion complete:",
+                f"selected_pubkeys={d.get('selected_pubkeys')}",
+                f"txs_fetched={d.get('txs_fetched')}",
+                f"new_signature_rows={d.get('new_signature_rows')}",
+            )
+            return d
+        except Exception as e:
+            print(f"[warn] failed to parse pubkey expansion report: {e}")
+    return {"enabled": True, "rc": rc, "sources": [str(p) for p in sources]}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run download + recover in deterministic batches")
     ap.add_argument("--start-height", type=int, default=1, help="Initial block height")
@@ -607,10 +673,26 @@ def main() -> None:
                     help="Forward to automate_recover.py: affine nonce recurrence |b| bound")
     ap.add_argument("--lcg-per-pair-cap", type=int, default=2048,
                     help="Forward to automate_recover.py: per-pair affine-LCG scan cap")
+    ap.add_argument("--relation-min-sigs", type=int, default=8,
+                    help="Forward to automate_recover.py: minimum signatures per signer for relation-neighborhood scans")
+    ap.add_argument("--relation-max-signers", type=int, default=200,
+                    help="Forward to automate_recover.py: maximum signers selected for relation-neighborhood scans")
+    ap.add_argument("--relation-max-rows-per-signer", type=int, default=512,
+                    help="Forward to automate_recover.py: max rows retained per signer for relation-neighborhood scans")
+    ap.add_argument("--relation-neighbor-window", type=int, default=2,
+                    help="Forward to automate_recover.py: adjacent rows retained around selected signer rows")
     ap.add_argument("--hnp-timeout-sec", type=int, default=120,
                     help="Timeout (seconds) for HNP/LLL/BKZ solver subprocess")
     ap.add_argument("--hnp-min-leaks", type=int, default=8,
                     help="Minimum leakage rows required to run HNP solver")
+    ap.add_argument("--hnp-bits-known", type=int, default=6,
+                    help="Known nonce bits used for explicit HNP leak rows")
+    ap.add_argument("--hnp-leakage-model", choices=("LSB",), default="LSB",
+                    help="Explicit nonce leakage model for HNP rows")
+    ap.add_argument("--hnp-bruteforce-unknown-bits", type=int, default=18,
+                    help="Forward to automate_recover.py: exact k candidate generation unknown-bit cap")
+    ap.add_argument("--hnp-bruteforce-max-candidates", type=int, default=200000,
+                    help="Forward to automate_recover.py: global exact k candidate cap")
     ap.add_argument("--stage0-only", action="store_true",
                     help="Forward to automate_recover.py: run only direct duplicate-r Stage0 recovery")
     ap.add_argument("--stop-after-stage0-hit", action="store_true",
@@ -650,6 +732,18 @@ def main() -> None:
                     help="Local WIF/hex/decimal candidate file passed through to automate_recover.py")
     ap.add_argument("--target-pubkey", default="",
                     help="Optional compressed/uncompressed SEC pubkey hex; run accumulated audit/recovery only for this signer")
+    ap.add_argument("--enable-pubkey-expansion", action="store_true",
+                    help="After suspicious cycles, fetch extra transactions for suspect pubkeys and append matching signatures")
+    ap.add_argument("--pubkey-expansion-phase", choices=("before-recovery", "after-recovery", "both"), default="before-recovery",
+                    help="Run pubkey expansion before recovery using existing reports, after recovery using current reports, or both")
+    ap.add_argument("--pubkey-expansion-max-pubkeys", type=int, default=50,
+                    help="Maximum suspect pubkey variants expanded per cycle")
+    ap.add_argument("--pubkey-expansion-max-pages-per-address", type=int, default=3,
+                    help="Maximum mempool.space address pages fetched for each derived address")
+    ap.add_argument("--pubkey-expansion-max-txs-per-address", type=int, default=75,
+                    help="Maximum transactions fetched for each derived address")
+    ap.add_argument("--pubkey-expansion-sleep-sec", type=float, default=0.25,
+                    help="Delay between paginated address API requests")
     ap.add_argument("--enable-nonce-hypotheses", action="store_true",
                     help="Forward to automate_recover.py: generate bounded weak-nonce r->k candidates")
     ap.add_argument("--nonce-hypothesis-models",
@@ -799,6 +893,26 @@ def main() -> None:
         except Exception:
             pass
 
+        pubkey_expansion_report: dict[str, object] = {}
+        if args.enable_pubkey_expansion and args.pubkey_expansion_phase in ("before-recovery", "both"):
+            expansion_sources = latest_existing_artifact_names(
+                [
+                    "duplicate_r_classification_report.json",
+                    "r_collisions.jsonl",
+                    "dupR_clusters.jsonl",
+                    "cluster_risk_report.json",
+                    "relation_neighborhood_report.json",
+                    "recovery_graph_report.json",
+                    "recovery_chain_report.json",
+                ],
+                Path(args.runs_dir),
+            )
+            pubkey_expansion_report = run_pubkey_expansion(
+                args,
+                cycle_artifacts["pubkey_expansion_report"],
+                expansion_sources,
+            )
+
         recover_sigs = args.signatures
         if args.enable_workset:
             workset_cmd = [
@@ -838,8 +952,16 @@ def main() -> None:
             "--lcg-a-max", str(args.lcg_a_max),
             "--lcg-b-max", str(args.lcg_b_max),
             "--lcg-per-pair-cap", str(args.lcg_per_pair_cap),
+            "--relation-min-sigs", str(args.relation_min_sigs),
+            "--relation-max-signers", str(args.relation_max_signers),
+            "--relation-max-rows-per-signer", str(args.relation_max_rows_per_signer),
+            "--relation-neighbor-window", str(args.relation_neighbor_window),
             "--hnp-timeout-sec", str(args.hnp_timeout_sec),
             "--hnp-min-leaks", str(args.hnp_min_leaks),
+            "--hnp-bits-known", str(args.hnp_bits_known),
+            "--hnp-leakage-model", args.hnp_leakage_model,
+            "--hnp-bruteforce-unknown-bits", str(args.hnp_bruteforce_unknown_bits),
+            "--hnp-bruteforce-max-candidates", str(args.hnp_bruteforce_max_candidates),
             "--clustered-sigs-out", str(cycle_artifacts["clustered_sigs"]),
             "--cluster-report", str(cycle_artifacts["cluster_report"]),
             "--recover-json-out", str(cycle_artifacts["recovered_json"]),
@@ -850,6 +972,10 @@ def main() -> None:
             "--recover-clusters-out", str(cycle_artifacts["recover_clusters"]),
             "--hnp-candidates-out", str(cycle_artifacts["hnp_candidates"]),
             "--hnp-report-out", str(cycle_artifacts["hnp_report"]),
+            "--hnp-leaks-out", str(cycle_artifacts["hnp_leaks"]),
+            "--hnp-leak-report", str(cycle_artifacts["hnp_leak_report"]),
+            "--hnp-bounded-k-out", str(cycle_artifacts["hnp_bounded_k"]),
+            "--hnp-bounded-k-report", str(cycle_artifacts["hnp_bounded_k_report"]),
             "--candidate-validation-report", str(cycle_artifacts["candidate_validation_report"]),
             "--target-sigs-out", str(cycle_artifacts["target_sigs"]),
             "--nonce-hypothesis-out", str(cycle_artifacts["nonce_hypothesis_k"]),
@@ -860,6 +986,8 @@ def main() -> None:
             "--stage0-replay-out", str(cycle_artifacts["stage0_replay"]),
             "--stage0-classification-report", str(cycle_artifacts["stage0_classification_report"]),
             "--strong-signal-out", str(cycle_artifacts["strong_signal"]),
+            "--relation-neighborhood-out", str(cycle_artifacts["relation_neighborhood"]),
+            "--relation-neighborhood-report", str(cycle_artifacts["relation_neighborhood_report"]),
             "--recovery-chain-report", str(cycle_artifacts["recovery_chain_report"]),
             "--recovery-graph-subset-out", str(cycle_artifacts["recovery_graph_subset"]),
             "--recovery-graph-report", str(cycle_artifacts["recovery_graph_report"]),
@@ -1027,6 +1155,29 @@ def main() -> None:
             except Exception as e:
                 print(f"[warn] failed to parse audit report: {e}")
 
+        if args.enable_pubkey_expansion and args.pubkey_expansion_phase in ("after-recovery", "both") and (
+            anomaly_alert
+            or int(decision_obj.get("cross_pub_duplicate_r", 0) or 0) > 0
+            or int(decision_obj.get("duplicate_r", 0) or 0) > 0
+            or int(decision_obj.get("risk_score", 0) or 0) >= args.risk_threshold
+        ):
+            post_sources = [
+                p for p in [
+                    cycle_artifacts["stage0_classification_report"],
+                    cycle_artifacts["recover_collisions"],
+                    cycle_artifacts["recover_clusters"],
+                    cycle_artifacts["cluster_report"],
+                    cycle_artifacts["relation_neighborhood_report"],
+                    cycle_artifacts["recovery_graph_report"],
+                ]
+                if p.exists()
+            ]
+            pubkey_expansion_report = run_pubkey_expansion(
+                args,
+                cycle_artifacts["pubkey_expansion_report"],
+                post_sources,
+            )
+
         if new_rows > 0:
             if bot_token and telegram_chat_id:
                 artifact_summary = recovered_artifact_summary(cycle_artifacts["recovered_json"], new_rows)
@@ -1078,6 +1229,7 @@ def main() -> None:
             "sighash_anomaly": bool(decision_obj.get("sighash_anomaly", False)),
             "recover_stages": decision_obj.get("recover_stages", []),
             "cumulative_merge": cumulative_merge_reports,
+            "pubkey_expansion": pubkey_expansion_report,
         }
         timeline_path = Path(args.timeline_log)
         append_timeline_event(timeline_path, event)

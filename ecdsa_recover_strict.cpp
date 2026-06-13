@@ -315,6 +315,15 @@ static bool precompute_row(Ctx& C, Row& R){
 static inline string r_bucket_name(const string& rhex){
     return "r_" + rhex.substr(0,2);
 }
+static inline string short_hash_hex(const string& s){
+    unsigned char h[32];
+    sha256_once((const unsigned char*)s.data(), s.size(), h);
+    return to_hex(h, 8);
+}
+static inline string pub_bucket_name(const Row& rw){
+    if(!rw.pub.empty()) return "pub_" + short_hash_hex(rw.pub);
+    return r_bucket_name(rw.r_hex);
+}
 struct FileBuf {
     ofstream f;
     void open(const string& path){
@@ -324,6 +333,7 @@ struct FileBuf {
     void write(const string& s){ f<<s<<'\n'; }
 };
 static void pass0_bucketize_and_dedup(const string& sigs, const string& tmpdir,
+                                      const string& bucket_mode,
                                       vector<string>& buckets_out)
 {
     std::error_code ec;
@@ -336,7 +346,7 @@ static void pass0_bucketize_and_dedup(const string& sigs, const string& tmpdir,
         string line; size_t cnt=0;
         while(getline(in,line)){
             Row rw; if(!parse_row(line,rw)) continue;
-            string b = r_bucket_name(rw.r_hex);
+            string b = (bucket_mode == "pub") ? pub_bucket_name(rw) : r_bucket_name(rw.r_hex);
             string path = tmpdir + "/" + b + ".raw.jsonl";
             auto& ptr = writers[b];
             if(!ptr){ ptr.reset(new FileBuf()); ptr->open(path); }
@@ -1401,6 +1411,7 @@ struct Args {
     string preload_k="";
     string preload_priv="";
     string preload_recovered="";
+    string bucket_mode="rprefix";
     int threads=max(1,(int)thread::hardware_concurrency());
     int max_iter=2;
     int min_count=0;
@@ -1444,6 +1455,7 @@ static void usage(){
 "  --preload-k FILE                 preload r->k candidates (jsonl)\n"
 "  --preload-priv FILE              known private keys (WIF/hex/decimal) -> seed r->k & recovered_keys\n"
 "  --preload-recovered FILE         preload recovered_keys.jsonl into recovery graph and output dedup state\n"
+"  --bucket-mode MODE               pass0 bucket mode: rprefix or pub (default rprefix)\n"
 "\n  --dg-max-delta M                 max δ (default 4096)\n"
 "  --dg-seeds a,b,c                 gradient seeds\n"
 "  --dg-fill-step S                 fill step (default 8)\n"
@@ -1479,6 +1491,13 @@ static bool parse_args(int argc,char**argv, Args& A){
         else if(k=="--preload-k"){ if(!need(A.preload_k)) return false; }
         else if(k=="--preload-priv"){ if(!need(A.preload_priv)) return false; }
         else if(k=="--preload-recovered"){ if(!need(A.preload_recovered)) return false; }
+        else if(k=="--bucket-mode"){
+            if(!need(A.bucket_mode)) return false;
+            if(A.bucket_mode!="rprefix" && A.bucket_mode!="pub"){
+                cerr << "Invalid --bucket-mode: " << A.bucket_mode << "\n";
+                return false;
+            }
+        }
         else if(k=="--dg-max-delta"){ if(!needu(A.dg_max_delta)) return false; }
         else if(k=="--dg-seeds"){ string s; if(!need(s)) return false; A.dg_seeds=parse_list_u64(s); }
         else if(k=="--dg-fill-step"){ if(!needi(A.dg_fill_step)) return false; }
@@ -1538,8 +1557,8 @@ int main(int argc, char** argv){
     std::error_code ec2; fs::create_directories(tmpdir, ec2);
     if (ec2) cerr << "[warn] create_directories(pass0): " << ec2.message() << "\n";
     vector<string> buckets;
-    pass0_bucketize_and_dedup(A.sigs, tmpdir, buckets);
-    cerr<<"[pass0] buckets="<<buckets.size()<<"\n";
+    pass0_bucketize_and_dedup(A.sigs, tmpdir, A.bucket_mode, buckets);
+    cerr<<"[pass0] bucket_mode="<<A.bucket_mode<<" buckets="<<buckets.size()<<"\n";
     size_t cross_pub_collision_groups = write_dup_reports(buckets, A.report_collisions, A.export_clusters);
     cerr<<"[pass0-reports] cross_pub_collision_groups="<<cross_pub_collision_groups
         <<" collisions_out="<<A.report_collisions

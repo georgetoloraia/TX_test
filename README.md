@@ -484,17 +484,43 @@ python3 continuous_pipeline.py \
   --start-height "$(cat last_processed_block.txt)" \
   --batch-size 100 \
   --threads 8 \
-  --python .venv/bin/python \
-  --random-k-budget 1024 \
-  --hnp-timeout-sec 120 \
-  --hnp-min-leaks 8 \
+  --python venv/bin/python \
+  --discovery-mode max \
   --enable-workset \
   --workset-tail-lines 250000 \
   --workset-max-rows 500000 \
   --workset-recovered-keys recovered_keys.jsonl \
   --workset-recovered-k recovered_k.jsonl \
   --cumulative-recovered-keys recovered_keys.jsonl \
-  --cumulative-recovered-k recovered_k.jsonl
+  --cumulative-recovered-k recovered_k.jsonl \
+  --enable-pubkey-expansion \
+  --pubkey-expansion-phase before-recovery \
+  --pubkey-expansion-max-pubkeys 75 \
+  --pubkey-expansion-max-pages-per-address 3 \
+  --pubkey-expansion-max-txs-per-address 100 \
+  --relation-min-sigs 8 \
+  --relation-max-signers 150 \
+  --relation-max-rows-per-signer 384 \
+  --relation-neighbor-window 2 \
+  --delta-max 8192 \
+  --delta-per-pair-cap 8192 \
+  --lcg-a-max 8 \
+  --lcg-b-max 8192 \
+  --lcg-per-pair-cap 4096 \
+  --random-k-budget 1024 \
+  --hnp-timeout-sec 120 \
+  --hnp-min-leaks 8 \
+  --hnp-bits-known 6 \
+  --hnp-leakage-model LSB \
+  --hnp-bruteforce-unknown-bits 18 \
+  --hnp-bruteforce-max-candidates 200000 \
+  --enable-nonce-hypotheses \
+  --nonce-hypothesis-models timestamp-direct,timestamp-sha256,height-direct,height-sha256,txid-sha256,txid-vin-sha256,txid-vin-sighash-sha256 \
+  --nonce-time-window-sec 2 \
+  --nonce-time-step-sec 1 \
+  --nonce-counter-max 3 \
+  --nonce-max-candidates 200000 \
+  --enable-advanced-recover
   ```
 
 ## External Candidate Validation

@@ -347,6 +347,226 @@ def count_known_nonce_rows(sig_path: Path) -> int:
     return count
 
 
+def build_explicit_hnp_leak_subset(
+    *,
+    sig_path: Path,
+    out_path: Path,
+    report_path: Path,
+    bits_known: int,
+    leakage_model: str = "LSB",
+) -> dict[str, Any]:
+    """Normalize explicit nonce-leak rows for the HNP solver.
+
+    This does not infer or invent nonce leakage. It only accepts explicit fields
+    already present in JSONL rows and writes a standardized local leak file.
+    """
+    lsb_keys = ("known_nonce_bits", "nonce_lsb", "k_lsb", "known_k_lsb")
+    msb_keys = ("nonce_msb", "k_msb", "known_k_msb")
+    model = leakage_model.upper()
+    accepted_keys = lsb_keys if model == "LSB" else msb_keys
+    unsupported_keys = msb_keys if model == "LSB" else lsb_keys
+    max_known = 1 << int(bits_known)
+
+    total_rows = 0
+    explicit_rows = 0
+    valid_rows = 0
+    skipped_bad_json = 0
+    skipped_missing_core = 0
+    skipped_out_of_range = 0
+    unsupported_model_rows = 0
+    key_counts: Counter[str] = Counter()
+    signer_counts: Counter[str] = Counter()
+    seen = set()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with sig_path.open("r", encoding="utf-8", errors="replace") as src, out_path.open("w", encoding="utf-8") as out:
+        for line in src:
+            raw = line.strip()
+            if not raw:
+                continue
+            total_rows += 1
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                skipped_bad_json += 1
+                continue
+            if not isinstance(obj, dict):
+                skipped_bad_json += 1
+                continue
+
+            unsupported_model_rows += int(any(k in obj for k in unsupported_keys))
+            leak_key = None
+            leak_value_raw = None
+            for k in accepted_keys:
+                if k in obj:
+                    leak_key = k
+                    leak_value_raw = obj.get(k)
+                    break
+            if leak_key is None:
+                continue
+            explicit_rows += 1
+            key_counts[leak_key] += 1
+
+            try:
+                r = parse_int(obj.get("r"))
+                s = parse_int(obj.get("s"))
+                z_raw = obj.get("z")
+                if z_raw is None:
+                    z_raw = obj.get("m")
+                m = parse_int(z_raw)
+                known = parse_int(leak_value_raw)
+            except Exception:
+                skipped_missing_core += 1
+                continue
+            if not (1 <= r < SECP256K1_N and 1 <= s < SECP256K1_N and 0 <= known < max_known):
+                skipped_out_of_range += 1
+                continue
+
+            dedup_key = (r, s, m, known)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            pub = normalize_pubkey_hex(str(obj.get("pubkey_hex") or obj.get("pub") or ""))
+            if pub:
+                signer_counts[pub] += 1
+            out.write(
+                json.dumps(
+                    {
+                        "r": format(r, "064x"),
+                        "s": format(s, "064x"),
+                        "m": format(m, "064x"),
+                        "known_nonce_bits": known,
+                        "source_leak_field": leak_key,
+                        "pubkey_hex": pub,
+                    }
+                )
+                + "\n"
+            )
+            valid_rows += 1
+
+    payload = {
+        "source_sigs": str(sig_path),
+        "output": str(out_path),
+        "bits_known": int(bits_known),
+        "leakage_model": model,
+        "total_rows": total_rows,
+        "explicit_leak_rows": explicit_rows,
+        "valid_leak_rows": valid_rows,
+        "unique_valid_leak_rows": valid_rows,
+        "skipped_bad_json_rows": skipped_bad_json,
+        "skipped_missing_core_rows": skipped_missing_core,
+        "skipped_out_of_range_rows": skipped_out_of_range,
+        "unsupported_model_rows": unsupported_model_rows,
+        "field_counts": dict(key_counts),
+        "unique_signers_with_leaks": len(signer_counts),
+        "top_signer_leak_counts": [
+            {"pubkey_prefix": pub[:20], "leak_rows": count}
+            for pub, count in signer_counts.most_common(20)
+        ],
+        "secret_material": "LOCAL_ARTIFACT_ONLY",
+    }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
+def generate_explicit_leak_k_candidates(
+    *,
+    leak_path: Path,
+    out_path: Path,
+    report_path: Path,
+    bits_known: int,
+    leakage_model: str,
+    max_unknown_bits: int,
+    max_total_candidates: int,
+) -> dict[str, Any]:
+    """Generate exact bounded nonce candidates from explicit leak rows.
+
+    This only runs when the remaining unknown nonce space is small enough to be
+    exhaustively enumerated. Candidate k values are written to a local preload-k
+    artifact; reports contain counts only.
+    """
+    model = leakage_model.upper()
+    q = SECP256K1_N
+    bits = int(bits_known)
+    max_unknown = max(0, int(max_unknown_bits))
+    max_total = max(0, int(max_total_candidates))
+    unknown_bits = max(0, q.bit_length() - bits)
+
+    report: dict[str, Any] = {
+        "input": str(leak_path),
+        "output": str(out_path),
+        "bits_known": bits,
+        "leakage_model": model,
+        "unknown_bits": unknown_bits,
+        "max_unknown_bits": max_unknown,
+        "max_total_candidates": max_total,
+        "enabled": unknown_bits <= max_unknown and max_total > 0,
+        "rows_seen": 0,
+        "rows_emitted": 0,
+        "rows_skipped_too_many_candidates": 0,
+        "rows_skipped_bad": 0,
+        "total_candidates": 0,
+        "secret_material": "LOCAL_ARTIFACT_ONLY",
+    }
+    if not report["enabled"] or not leak_path.exists():
+        reason = "unknown_space_too_large" if unknown_bits > max_unknown else "missing_or_disabled"
+        report["reason"] = reason
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        return report
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with leak_path.open("r", encoding="utf-8", errors="replace") as src, out_path.open("w", encoding="utf-8") as out:
+        for line in src:
+            raw = line.strip()
+            if not raw:
+                continue
+            report["rows_seen"] = int(report["rows_seen"]) + 1
+            try:
+                obj = json.loads(raw)
+                r_hex = format(parse_int(obj.get("r")), "064x")
+                known = parse_int(obj.get("known_nonce_bits"))
+            except Exception:
+                report["rows_skipped_bad"] = int(report["rows_skipped_bad"]) + 1
+                continue
+
+            candidates: list[str] = []
+            if model == "LSB":
+                step = 1 << bits
+                if known >= step:
+                    report["rows_skipped_bad"] = int(report["rows_skipped_bad"]) + 1
+                    continue
+                count = ((q - 1 - known) // step) + 1
+                if count <= 0:
+                    report["rows_skipped_bad"] = int(report["rows_skipped_bad"]) + 1
+                    continue
+                if count > (1 << max_unknown):
+                    report["rows_skipped_too_many_candidates"] = int(report["rows_skipped_too_many_candidates"]) + 1
+                    continue
+                if int(report["total_candidates"]) + count > max_total:
+                    report["rows_skipped_too_many_candidates"] = int(report["rows_skipped_too_many_candidates"]) + 1
+                    continue
+                for x in range(int(count)):
+                    k = known + step * x
+                    if 1 <= k < q:
+                        candidates.append(format(k, "064x"))
+            else:
+                report["rows_skipped_bad"] = int(report["rows_skipped_bad"]) + 1
+                continue
+
+            if not candidates:
+                continue
+            out.write(json.dumps({"r": r_hex, "k_candidates": candidates, "source": "explicit-leak-bounded"}) + "\n")
+            report["rows_emitted"] = int(report["rows_emitted"]) + 1
+            report["total_candidates"] = int(report["total_candidates"]) + len(candidates)
+
+    report["reason"] = "ok"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
+
+
 def recovery_viability_label(
     *,
     stage0_subset_info: dict[str, Any] | None,
@@ -576,6 +796,7 @@ def build_external_candidate_args(args: argparse.Namespace) -> tuple[list[str], 
 def structured_relation_args(args: argparse.Namespace) -> list[str]:
     """Bounded nonce-relation scan knobs passed through to ecdsa_recover_strict."""
     return [
+        "--bucket-mode", "pub",
         "--dg-max-delta", str(max(0, int(args.delta_max))),
         "--dg-per-pair-cap", str(max(0, int(args.delta_per_pair_cap))),
         "--lcg-a-max", str(max(0, int(args.lcg_a_max))),
@@ -592,22 +813,63 @@ def write_candidate_validation_report(
 ) -> None:
     if not candidate_report.get("enabled"):
         return
-    new_valid_rows = int(post_validation.get("valid_rows", 0)) - int(pre_validation.get("valid_rows", 0))
-    pre_valid_rows = int(pre_validation.get("valid_rows", 0))
-    post_valid_rows = int(post_validation.get("valid_rows", 0))
+    summary = recovery_material_summary(candidate_report, pre_validation, post_validation)
     payload = {
         "external_candidates": candidate_report,
         "pre_recover_validation": pre_validation,
         "post_recover_validation": post_validation,
-        "key_recovered": new_valid_rows > 0,
-        "new_local_recovered_rows": max(0, new_valid_rows),
-        "key_material_present": post_valid_rows > 0,
-        "pre_existing_valid_recovered_rows": pre_valid_rows,
-        "total_valid_recovered_rows": post_valid_rows,
+        "preloaded_recovered_validation": summary["preloaded_recovered_validation"],
+        "key_recovered": summary["key_recovered"],
+        "new_local_recovered_rows": summary["new_local_recovered_rows"],
+        "key_material_present": summary["key_material_present"],
+        "pre_existing_valid_recovered_rows": summary["pre_existing_valid_recovered_rows"],
+        "preloaded_valid_recovered_rows": summary["preloaded_valid_recovered_rows"],
+        "cycle_valid_recovered_rows": summary["cycle_valid_recovered_rows"],
+        "total_valid_recovered_rows": summary["total_valid_recovered_rows"],
         "priv_material": "LOCAL_ARTIFACT_ONLY",
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def recovery_material_summary(
+    candidate_report: dict[str, Any],
+    pre_validation: dict[str, Any],
+    post_validation: dict[str, Any],
+) -> dict[str, Any]:
+    """Summarize newly emitted and preloaded recovered-key artifacts.
+
+    Cycle-local output may be empty when all known keys were supplied via
+    --preload-recovered-json. Treat those preloaded rows as available local
+    material, but keep the "new_local_recovered_rows" metric strict.
+    """
+    pre_valid_rows = int(pre_validation.get("valid_rows", 0) or 0)
+    post_valid_rows = int(post_validation.get("valid_rows", 0) or 0)
+    new_valid_rows = max(0, post_valid_rows - pre_valid_rows)
+
+    preload_meta = candidate_report.get("preload_recovered_json") or {}
+    preload_validation: dict[str, Any] = {
+        "exists": False,
+        "rows": 0,
+        "valid_rows": 0,
+        "invalid_rows": 0,
+    }
+    preload_path = preload_meta.get("path")
+    if preload_path and not preload_meta.get("missing"):
+        preload_validation = post_validate_recovered(Path(preload_path))
+
+    preloaded_valid_rows = int(preload_validation.get("valid_rows", 0) or 0)
+    total_available = post_valid_rows + preloaded_valid_rows
+    return {
+        "key_recovered": new_valid_rows > 0,
+        "new_local_recovered_rows": new_valid_rows,
+        "key_material_present": total_available > 0,
+        "pre_existing_valid_recovered_rows": pre_valid_rows,
+        "preloaded_valid_recovered_rows": preloaded_valid_rows,
+        "cycle_valid_recovered_rows": post_valid_rows,
+        "total_valid_recovered_rows": total_available,
+        "preloaded_recovered_validation": preload_validation,
+    }
 
 
 def normalize_pubkey_hex(value: str) -> str:
@@ -906,7 +1168,7 @@ def post_validate_recovered(path: Path) -> dict[str, Any]:
             try:
                 obj = json.loads(raw)
                 if isinstance(obj, dict):
-                    for k in ("wif", "priv", "privkey", "private_key", "d"):
+                    for k in ("wif", "priv_hex", "priv", "privkey", "private_key", "d"):
                         if k in obj and obj[k] is not None:
                             cand = str(obj[k])
                             break
@@ -1345,6 +1607,201 @@ def build_recovery_graph_expansion_report(
     return payload
 
 
+def _signature_order_key(obj: dict[str, Any], fallback_index: int) -> tuple[int, int, str, int]:
+    height_raw = (
+        obj.get("height")
+        if obj.get("height") is not None
+        else obj.get("block_height")
+        if obj.get("block_height") is not None
+        else obj.get("block")
+    )
+    time_raw = obj.get("time") if obj.get("time") is not None else obj.get("block_time")
+    try:
+        height = parse_int(height_raw) if height_raw is not None else 0
+    except Exception:
+        height = 0
+    try:
+        ts = parse_int(time_raw) if time_raw is not None else 0
+    except Exception:
+        ts = 0
+    txid = str(obj.get("txid") or "")
+    try:
+        vin = parse_int(obj.get("vin") if obj.get("vin") is not None else obj.get("input_index") or 0)
+    except Exception:
+        vin = 0
+    return (height or fallback_index, ts, txid, vin)
+
+
+def build_signer_relation_neighborhood_subset(
+    *,
+    sig_path: Path,
+    recovered_json_path: Path,
+    recovered_k_path: Path,
+    out_path: Path,
+    report_path: Path,
+    min_sigs: int,
+    max_signers: int,
+    max_rows_per_signer: int,
+    neighbor_window: int,
+) -> dict[str, Any]:
+    """Build a bounded signer-local subset for delta/affine nonce-relation scans.
+
+    This is metadata-only except for the selected signature rows. It avoids
+    private/WIF/k disclosure and keeps relation scans focused on same-signer
+    temporal neighborhoods.
+    """
+    facts = load_recovery_graph_facts(recovered_json_path, recovered_k_path)
+    recovered_pubs: set[str] = facts["recovered_pubs"]
+    recovered_r: set[str] = facts["recovered_r"]
+
+    groups: dict[str, list[tuple[int, str, dict[str, Any]]]] = defaultdict(list)
+    total_rows = 0
+    bad_json_rows = 0
+    missing_pubkey_rows = 0
+    if sig_path.exists():
+        with sig_path.open("r", encoding="utf-8", errors="replace") as f:
+            for idx, line in enumerate(f, start=1):
+                raw = line.strip()
+                if not raw:
+                    continue
+                total_rows += 1
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    bad_json_rows += 1
+                    continue
+                if not isinstance(obj, dict):
+                    bad_json_rows += 1
+                    continue
+                pub = normalize_pubkey_hex(str(obj.get("pubkey_hex") or obj.get("pub") or ""))
+                if not pub:
+                    missing_pubkey_rows += 1
+                    continue
+                groups[pub].append((idx, raw, obj))
+
+    signer_stats = []
+    for pub, rows in groups.items():
+        if len(rows) < max(2, int(min_sigs)):
+            continue
+        r_counts: Counter[str] = Counter()
+        recovered_r_hits = 0
+        bad_r = 0
+        for _, _, obj in rows:
+            try:
+                r_hex = format(parse_int(obj.get("r")), "064x")
+                r_counts[r_hex] += 1
+                if r_hex in recovered_r:
+                    recovered_r_hits += 1
+            except Exception:
+                bad_r += 1
+        dup_r_events = sum(c - 1 for c in r_counts.values() if c > 1)
+        signer_stats.append(
+            {
+                "pub": pub,
+                "rows": rows,
+                "count": len(rows),
+                "dup_r_events": dup_r_events,
+                "dup_r_values": sum(1 for c in r_counts.values() if c > 1),
+                "recovered_pubkey": pub in recovered_pubs,
+                "recovered_r_hits": recovered_r_hits,
+                "bad_r_rows": bad_r,
+            }
+        )
+
+    signer_stats.sort(
+        key=lambda x: (
+            bool(x["recovered_pubkey"]),
+            int(x["recovered_r_hits"]),
+            int(x["dup_r_events"]),
+            int(x["count"]),
+        ),
+        reverse=True,
+    )
+    if max_signers > 0:
+        signer_stats = signer_stats[:max_signers]
+
+    selected_raw: dict[tuple[str, str, int], str] = {}
+    top_report = []
+    rows_per_signer = max(2, int(max_rows_per_signer))
+    window = max(1, int(neighbor_window))
+    for stat in signer_stats:
+        pub = stat["pub"]
+        ordered = sorted(
+            stat["rows"],
+            key=lambda item: _signature_order_key(item[2], item[0]),
+        )
+        if len(ordered) > rows_per_signer:
+            # Preserve the newest rows and a deterministic prefix sample. This
+            # keeps old anomalies reachable while bounding per-signer cost.
+            head_n = max(0, min(len(ordered), rows_per_signer // 4))
+            tail_n = rows_per_signer - head_n
+            ordered = ordered[:head_n] + ordered[-tail_n:]
+
+        signer_selected = 0
+        for pos, (_, raw, obj) in enumerate(ordered):
+            try:
+                vin = parse_int(obj.get("vin") if obj.get("vin") is not None else obj.get("input_index") or 0)
+            except Exception:
+                vin = 0
+            txid = str(obj.get("txid") or "")
+            key = (pub, txid, vin)
+            selected_raw[key] = raw
+            signer_selected += 1
+            # Ensure local temporal neighbors are retained even after the head/tail cap.
+            for off in range(1, window + 1):
+                for np in (pos - off, pos + off):
+                    if 0 <= np < len(ordered):
+                        _, nraw, nobj = ordered[np]
+                        try:
+                            nvin = parse_int(
+                                nobj.get("vin") if nobj.get("vin") is not None else nobj.get("input_index") or 0
+                            )
+                        except Exception:
+                            nvin = 0
+                        selected_raw[(pub, str(nobj.get("txid") or ""), nvin)] = nraw
+
+        top_report.append(
+            {
+                "pubkey_prefix": pub[:20],
+                "source_rows": stat["count"],
+                "selected_rows": signer_selected,
+                "dup_r_values": stat["dup_r_values"],
+                "dup_r_events": stat["dup_r_events"],
+                "recovered_pubkey": stat["recovered_pubkey"],
+                "recovered_r_hits": stat["recovered_r_hits"],
+            }
+        )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as out:
+        for raw in selected_raw.values():
+            out.write(raw + "\n")
+
+    payload = {
+        "source_sigs": str(sig_path),
+        "output": str(out_path),
+        "total_rows": total_rows,
+        "bad_json_rows": bad_json_rows,
+        "missing_pubkey_rows": missing_pubkey_rows,
+        "signer_groups_total": len(groups),
+        "eligible_signers": len([s for s in signer_stats if int(s["count"]) >= max(2, int(min_sigs))]),
+        "selected_signers": len(signer_stats),
+        "selected_rows": len(selected_raw),
+        "policy": {
+            "min_sigs": int(min_sigs),
+            "max_signers": int(max_signers),
+            "max_rows_per_signer": int(max_rows_per_signer),
+            "neighbor_window": int(neighbor_window),
+            "ranking": "recovered_pubkey+recovered_r+dup_r+count",
+        },
+        "top_signers": top_report[:100],
+        "secret_material": "LOCAL_ARTIFACT_ONLY",
+    }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
 def cluster_key(obj: dict[str, Any]) -> str:
     pub = (obj.get("pubkey_hex") or obj.get("pub") or "").strip().lower()
     if pub:
@@ -1585,6 +2042,14 @@ def main() -> None:
                     help="Exported duplicate-R cluster JSONL path")
     ap.add_argument("--hnp-candidates-out", default="hnp_lll_bkz_candidates.txt",
                     help="HNP solver candidate output path")
+    ap.add_argument("--hnp-leaks-out", default="signatures.hnp_leaks.jsonl",
+                    help="Standardized explicit nonce-leak JSONL passed to the HNP solver")
+    ap.add_argument("--hnp-leak-report", default="hnp_leak_report.json",
+                    help="Metadata-only report for explicit HNP leak extraction")
+    ap.add_argument("--hnp-bounded-k-out", default="hnp_bounded_k_candidates.jsonl",
+                    help="Local r->k candidates generated when explicit nonce leakage leaves a bounded search space")
+    ap.add_argument("--hnp-bounded-k-report", default="hnp_bounded_k_report.json",
+                    help="Metadata-only report for bounded explicit-leak k generation")
     ap.add_argument("--preload-k-candidates", default="",
                     help="Local JSONL file with r plus 64-hex k candidates; passed to ecdsa_recover_strict --preload-k")
     ap.add_argument("--preload-priv-candidates", default="",
@@ -1633,6 +2098,18 @@ def main() -> None:
                     help="Metadata-only duplicate-r classification report")
     ap.add_argument("--strong-signal-out", default="signatures.strong_signal.jsonl",
                     help="Path for the strongest-signal subset used by random-k stage")
+    ap.add_argument("--relation-neighborhood-out", default="signatures.relation_neighborhood.jsonl",
+                    help="Path for signer-local rows used by structured delta/affine relation recovery")
+    ap.add_argument("--relation-neighborhood-report", default="relation_neighborhood_report.json",
+                    help="Metadata-only report for signer-local relation recovery subset")
+    ap.add_argument("--relation-min-sigs", type=int, default=8,
+                    help="Minimum signatures per signer for relation-neighborhood selection")
+    ap.add_argument("--relation-max-signers", type=int, default=200,
+                    help="Maximum signers selected for relation-neighborhood scans; 0 means no cap")
+    ap.add_argument("--relation-max-rows-per-signer", type=int, default=512,
+                    help="Maximum rows retained per signer before neighbor expansion")
+    ap.add_argument("--relation-neighbor-window", type=int, default=2,
+                    help="Adjacent sorted rows retained around selected signer rows")
     ap.add_argument("--enable-chain-extraction", action="store_true", default=True,
                     help="After recovered keys exist, rescan full input with cheap propagation to extract more local k/d chains")
     ap.add_argument("--no-enable-chain-extraction", action="store_false", dest="enable_chain_extraction",
@@ -1669,6 +2146,14 @@ def main() -> None:
                     help="Timeout in seconds for HNP/LLL/BKZ solver subprocess")
     ap.add_argument("--hnp-min-leaks", type=int, default=8,
                     help="Minimum rows with explicit known_nonce_bits required to run HNP solver")
+    ap.add_argument("--hnp-bits-known", type=int, default=6,
+                    help="Known nonce bits used for explicit HNP leak rows")
+    ap.add_argument("--hnp-leakage-model", choices=("LSB",), default="LSB",
+                    help="Explicit nonce leakage model for HNP rows; only LSB is currently validation-safe")
+    ap.add_argument("--hnp-bruteforce-unknown-bits", type=int, default=18,
+                    help="Generate exact k candidates only if explicit leak leaves <= this many unknown bits")
+    ap.add_argument("--hnp-bruteforce-max-candidates", type=int, default=200000,
+                    help="Global cap for exact explicit-leak k candidates")
     ap.add_argument("--hnp-report-out", default="hnp_lll_bkz_report.json",
                     help="Metadata-only HNP gating/solver diagnostics report")
     ap.add_argument("--max-invalid-ratio", type=float, default=0.35,
@@ -1993,25 +2478,36 @@ def main() -> None:
         else:
             print("Stage0 is replay-like only; keeping broader recover_input for stage1.")
 
-    # Always attempt HNP/LLL/BKZ when recovery is enabled.
-    # Replay-like duplicate-r groups are still useful to test solver integration and diagnostics.
-    hnp_input = recover_input
-    if (
-        stage0_subset_info
-        and stage0_subset_info.get("selected_signatures_recoverable_focus", 0) > 0
-        and int(stage0_subset_info.get("nontrivial_duplicate_r_groups", 0)) > 0
-    ):
-        hnp_input = str(stage0_recoverable_path)
+    hnp_leak_report = build_explicit_hnp_leak_subset(
+        sig_path=sigs,
+        out_path=Path(args.hnp_leaks_out),
+        report_path=Path(args.hnp_leak_report),
+        bits_known=args.hnp_bits_known,
+        leakage_model=args.hnp_leakage_model,
+    )
+    hnp_bounded_k_report = generate_explicit_leak_k_candidates(
+        leak_path=Path(args.hnp_leaks_out),
+        out_path=Path(args.hnp_bounded_k_out),
+        report_path=Path(args.hnp_bounded_k_report),
+        bits_known=args.hnp_bits_known,
+        leakage_model=args.hnp_leakage_model,
+        max_unknown_bits=args.hnp_bruteforce_unknown_bits,
+        max_total_candidates=args.hnp_bruteforce_max_candidates,
+    )
+
+    # Always attempt HNP/LLL/BKZ when recovery is enabled, but only on
+    # normalized explicit leak rows. HNP is not run on inferred anomalies.
+    hnp_input = args.hnp_leaks_out
     if stage0_subset_info and stage0_subset_info.get("duplicate_r_groups", 0) > 0:
         if int(stage0_subset_info.get("nontrivial_duplicate_r_groups", 0)) == 0:
             print("Duplicate-r groups are replay-like only (no same-r/diff-s); continuing with HNP + staged recovery.")
         else:
-            print("[HNP/LLL/BKZ] Attempting key recovery from nontrivial duplicate-r group subset...")
+            print("[HNP/LLL/BKZ] Checking explicit nonce-leak subset alongside nontrivial duplicate-r evidence...")
     else:
-        print("[HNP/LLL/BKZ] Attempting key recovery from selected recovery input...")
+        print("[HNP/LLL/BKZ] Checking explicit nonce-leak subset...")
     hnp_candidates = try_hnp_lll_bkz_solver(
         hnp_input,
-        bits_known=6,
+        bits_known=args.hnp_bits_known,
         q=None,
         out_path=args.hnp_candidates_out,
         report_path=args.hnp_report_out,
@@ -2022,6 +2518,8 @@ def main() -> None:
     preload_k_paths = []
     if args.preload_k_candidates:
         preload_k_paths.append(Path(args.preload_k_candidates))
+    if int(hnp_bounded_k_report.get("total_candidates", 0) or 0) > 0:
+        preload_k_paths.append(Path(args.hnp_bounded_k_out))
     if nonce_hypothesis_report.get("enabled"):
         preload_k_paths.append(Path(args.nonce_hypothesis_out))
     merged_preload_k = merge_preload_k_files(preload_k_paths, Path(args.combined_preload_k_out))
@@ -2105,11 +2603,16 @@ def main() -> None:
                 pre_recover_validation,
                 stage0_post_validation,
             )
+            stage0_material_summary = recovery_material_summary(
+                external_candidate_report,
+                pre_recover_validation,
+                stage0_post_validation,
+            )
             stop_reason = "stage0_only" if args.stage0_only else "stage0_hit"
             print(
                 "Recovery automation stopped after Stage0.",
                 f"reason={stop_reason}",
-                f"new_valid_rows={max(0, stage0_new_valid_rows)}",
+                f"new_valid_rows={stage0_material_summary['new_local_recovered_rows']}",
             )
             write_decision(args.decision_out, {
                 "should_recover": True,
@@ -2124,11 +2627,13 @@ def main() -> None:
                 "exhaustive_recover": args.exhaustive_recover,
                 "hnp_candidate_rows": len(hnp_candidates or []),
                 "external_candidate_validation": external_candidate_report,
-                "key_recovered": stage0_new_valid_rows > 0,
-                "new_local_recovered_rows": max(0, stage0_new_valid_rows),
-                "key_material_present": stage0_post_valid_rows > 0,
-                "pre_existing_valid_recovered_rows": stage0_pre_valid_rows,
-                "total_valid_recovered_rows": stage0_post_valid_rows,
+                "key_recovered": stage0_material_summary["key_recovered"],
+                "new_local_recovered_rows": stage0_material_summary["new_local_recovered_rows"],
+                "key_material_present": stage0_material_summary["key_material_present"],
+                "pre_existing_valid_recovered_rows": stage0_material_summary["pre_existing_valid_recovered_rows"],
+                "preloaded_valid_recovered_rows": stage0_material_summary["preloaded_valid_recovered_rows"],
+                "cycle_valid_recovered_rows": stage0_material_summary["cycle_valid_recovered_rows"],
+                "total_valid_recovered_rows": stage0_material_summary["total_valid_recovered_rows"],
                 "risk_score": risk,
                 "risk_verdict": verdict,
                 "duplicate_r": dup_r,
@@ -2180,6 +2685,30 @@ def main() -> None:
     if stage1_rc != 0:
         raise RuntimeError(f"Recover stage1 failed with exit code {stage1_rc}")
 
+    relation_subset_report: dict[str, Any] | None = None
+    relation_input = recover_input
+    if allow_advanced and strong_signal:
+        relation_subset_report = build_signer_relation_neighborhood_subset(
+            sig_path=sigs,
+            recovered_json_path=Path(args.recover_json_out),
+            recovered_k_path=Path(args.recover_k_out),
+            out_path=Path(args.relation_neighborhood_out),
+            report_path=Path(args.relation_neighborhood_report),
+            min_sigs=args.relation_min_sigs,
+            max_signers=args.relation_max_signers,
+            max_rows_per_signer=args.relation_max_rows_per_signer,
+            neighbor_window=args.relation_neighbor_window,
+        )
+        if int(relation_subset_report.get("selected_rows", 0) or 0) >= 2:
+            relation_input = args.relation_neighborhood_out
+            print(
+                "Relation neighborhood focus:",
+                f"selected_rows={relation_subset_report.get('selected_rows', 0)}",
+                f"selected_signers={relation_subset_report.get('selected_signers', 0)}",
+            )
+        else:
+            print("Relation neighborhood focus is empty; using primary recovery input for relation scans.")
+
     if allow_advanced and strong_signal:
         if low_quality_data and not args.exhaustive_recover:
             # Constrained advanced pass for low-quality datasets:
@@ -2193,7 +2722,7 @@ def main() -> None:
                 stage2_iter = max(stage2_iter, 3)
         stage2_rc = run_recover_stage(
             recover_bin=args.recover_bin,
-            recover_input=recover_input,
+            recover_input=relation_input,
             threads=stage2_threads,
             max_iter=stage2_iter,
             stage_name="stage2-lcg-delta",
@@ -2205,7 +2734,7 @@ def main() -> None:
             recover_clusters_out=args.recover_clusters_out,
             extra_args=["--scan-random-k", "0"] + structured_relation_args(args) + external_candidate_args,
         )
-        stage_runs.append({"name": "stage2-lcg-delta", "rc": stage2_rc})
+        stage_runs.append({"name": "stage2-lcg-delta", "rc": stage2_rc, "input": relation_input})
         if stage2_rc != 0:
             raise RuntimeError(f"Recover stage2 failed with exit code {stage2_rc}")
 
@@ -2222,7 +2751,7 @@ def main() -> None:
             stage3_input = recover_input
             strong_subset = Path(args.strong_signal_out)
             selected = build_strong_signal_subset_from_cluster_report(
-                sig_path=Path(recover_input),
+                sig_path=Path(relation_input),
                 cluster_report_path=Path(args.cluster_report),
                 out_path=strong_subset,
             )
@@ -2264,9 +2793,12 @@ def main() -> None:
         fallback_threads = min(max(2, args.threads), 16)
         if fusion_tier == "critical":
             fallback_iter = max(fallback_iter, 4)
+        fallback_relation_input = relation_input
+        if relation_subset_report is not None and int(relation_subset_report.get("selected_rows", 0) or 0) < 2:
+            fallback_relation_input = str(sigs)
         fallback_rc = run_recover_stage(
             recover_bin=args.recover_bin,
-            recover_input=str(sigs),
+            recover_input=fallback_relation_input,
             threads=fallback_threads,
             max_iter=fallback_iter,
             stage_name="fallback-full-lcg-delta",
@@ -2278,7 +2810,7 @@ def main() -> None:
             recover_clusters_out=args.recover_clusters_out,
             extra_args=structured_relation_args(args) + external_candidate_args,
         )
-        stage_runs.append({"name": "fallback-full-lcg-delta", "rc": fallback_rc})
+        stage_runs.append({"name": "fallback-full-lcg-delta", "rc": fallback_rc, "input": fallback_relation_input})
         if fallback_rc != 0:
             raise RuntimeError(f"Recover full-input fallback failed with exit code {fallback_rc}")
 
@@ -2437,6 +2969,11 @@ def main() -> None:
 
     pre_valid_rows = int(pre_recover_validation.get("valid_rows", 0))
     post_valid_rows = int(post_validation.get("valid_rows", 0))
+    material_summary = recovery_material_summary(
+        external_candidate_report,
+        pre_recover_validation,
+        post_validation,
+    )
 
     write_candidate_validation_report(
         Path(args.candidate_validation_report),
@@ -2457,11 +2994,13 @@ def main() -> None:
         "exhaustive_recover": args.exhaustive_recover,
         "hnp_candidate_rows": len(hnp_candidates or []),
         "external_candidate_validation": external_candidate_report,
-        "key_recovered": new_valid_rows > 0,
-        "new_local_recovered_rows": max(0, new_valid_rows),
-        "key_material_present": post_valid_rows > 0,
-        "pre_existing_valid_recovered_rows": pre_valid_rows,
-        "total_valid_recovered_rows": post_valid_rows,
+        "key_recovered": material_summary["key_recovered"],
+        "new_local_recovered_rows": material_summary["new_local_recovered_rows"],
+        "key_material_present": material_summary["key_material_present"],
+        "pre_existing_valid_recovered_rows": material_summary["pre_existing_valid_recovered_rows"],
+        "preloaded_valid_recovered_rows": material_summary["preloaded_valid_recovered_rows"],
+        "cycle_valid_recovered_rows": material_summary["cycle_valid_recovered_rows"],
+        "total_valid_recovered_rows": material_summary["total_valid_recovered_rows"],
         "risk_score": risk,
         "risk_verdict": verdict,
         "duplicate_r": dup_r,
@@ -2481,6 +3020,9 @@ def main() -> None:
         "cluster_gating_used": not args.disable_cluster_gating,
         "recover_stages": stage_runs,
         "stage0_subset": stage0_subset_info,
+        "hnp_leak_report": hnp_leak_report,
+        "hnp_bounded_k_report": hnp_bounded_k_report,
+        "relation_neighborhood_report": relation_subset_report,
         "recovery_chain_report": chain_report,
         "post_recover_validation": post_validation,
     })
