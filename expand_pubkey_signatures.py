@@ -345,6 +345,8 @@ def main() -> None:
     ap.add_argument("--max-txs-per-address", type=int, default=100)
     ap.add_argument("--timeout", type=int, default=20)
     ap.add_argument("--sleep-sec", type=float, default=0.25)
+    ap.add_argument("--include-sighash-context", action="store_true",
+                    help="Store compact transaction context needed to recompute z in later diagnostics.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -382,7 +384,10 @@ def main() -> None:
         ds.R_VALUES_FILE = str(sig_path.with_name("r_values.txt"))
         ds.REPEAT_JSONL = str(sig_path.with_name("repetitions.jsonl"))
         ds.SIGSCRIPTS_TXT = str(sig_path.with_name("Sigscript.txt"))
-    processor = None if args.dry_run else BlockWalker(deterministic=True)
+    processor = None if args.dry_run else BlockWalker(
+        deterministic=True,
+        include_sighash_context=args.include_sighash_context,
+    )
 
     seen_txs: set[str] = set()
     address_counter: Counter[str] = Counter()
@@ -437,7 +442,7 @@ def main() -> None:
                         if row_key in seen:
                             report["skipped_existing_rows"] = int(report["skipped_existing_rows"]) + 1
                             continue
-                        processor.record_sig(tx["txid"], vin_index, entry, block_height=height, block_time=block_time)
+                        processor.record_sig(tx["txid"], vin_index, entry, block_height=height, block_time=block_time, tx=tx)
                         seen.add(row_key)
                         report["new_signature_rows"] = int(report["new_signature_rows"]) + 1
                         addr_payload["new_signature_rows"] += 1

@@ -356,6 +356,7 @@ class BlockWalker:
         random_min_height: int = 5000,
         random_max_height: int = 450000,
         emit_secrets: bool = False,
+        include_sighash_context: bool = False,
     ):
         self.api_endpoints = [
             {"name":"Mempool.space","base_url":"https://mempool.space/api/","weight":9,"requests":0,"last_used":0,
@@ -373,6 +374,7 @@ class BlockWalker:
         self.random_min_height = random_min_height
         self.random_max_height = random_max_height
         self.emit_secrets = emit_secrets
+        self.include_sighash_context = include_sighash_context
         self._rng = random.Random(random_seed if random_seed is not None else 0)
 
         # duplicate-R tracking
@@ -619,10 +621,12 @@ class BlockWalker:
                     sig_hex=None
                 if sig_hex:
                     z = legacy_sighash(tx, vin_index, p2pkh_script_code_from_hash160(pubkey_hash160(pub_hex)), ht)
+                    script_code = p2pkh_script_code_from_hash160(pubkey_hash160(pub_hex))
                     results.append({
                         "type":"legacy",
                         "sig":sig_hex,"pub":pub_hex,"sighash":ht,
                         "prev_spk":prev_spk,"prev_value":prev_val,"z":z,"r":r,"s":s,
+                        "script_code": script_code,
                         "prev_txid": inp["txid"], "prev_vout": inp["vout"]
                     })
                     # scriptSig dump (დამხმარე)
@@ -647,6 +651,7 @@ class BlockWalker:
                         "type":"legacy-p2pk",
                         "sig":sig_hex,"pub":pub_hex,"sighash":ht,
                         "prev_spk":prev_spk,"prev_value":prev_val,"z":z,"r":r,"s":s,
+                        "script_code": prev_spk,
                         "prev_txid": inp["txid"], "prev_vout": inp["vout"]
                     })
                     with open(SIGSCRIPTS_TXT,"a") as f: f.write(f"{tx['txid']}|{vin_index}|{inp.get('scriptsig','')}\n")
@@ -715,6 +720,7 @@ class BlockWalker:
                         "type":"witness-wsh",
                         "sig":sig_hex,"pub":"", "sighash":ht,
                         "prev_spk":prev_spk,"prev_value":prev_val,"z":z,"r":r,"s":s,
+                        "script_code": witness_script_hex,
                         "witness_script": witness_script_hex,
                         "redeem_script": redeem_script_hex,
                         "pub_candidates": pubs,
@@ -741,10 +747,11 @@ class BlockWalker:
                         # Compute z per-signature because sighash type may differ between signatures.
                         z = legacy_sighash(tx, vin_index, redeem, ht)
                         results.append({
-                            "type":"legacy-p2sh-ms",
-                            "sig":sig_hex,"pub":"", "sighash":ht,
-                            "prev_spk":prev_spk,"prev_value":prev_val,"z":z,"r":r,"s":s,
-                            "redeem_script": redeem,
+                        "type":"legacy-p2sh-ms",
+                        "sig":sig_hex,"pub":"", "sighash":ht,
+                        "prev_spk":prev_spk,"prev_value":prev_val,"z":z,"r":r,"s":s,
+                        "script_code": redeem,
+                        "redeem_script": redeem,
                             "pub_candidates": pubs,
                             "prev_txid": inp["txid"], "prev_vout": inp["vout"]
                         })
@@ -753,7 +760,39 @@ class BlockWalker:
         return results
 
     # ---------------- duplicate-R bookkeeping & recovery ----------------
-    def record_sig(self, txid:str, vin:int, entry:dict, block_height: Optional[int] = None, block_time: Optional[int] = None):
+    def build_sighash_context(self, tx: dict, vin: int, entry: dict) -> dict:
+        """Minimal deterministic context needed to recompute the stored z.
+
+        This intentionally excludes full scriptsig/witness payloads. The current
+        input scriptCode is stored separately, and all other inputs use empty
+        scripts under legacy sighash rules.
+        """
+        algorithm = "bip143" if str(entry.get("type", "")).startswith("witness") else "legacy"
+        return {
+            "algorithm": algorithm,
+            "version": int(tx.get("version", 2)),
+            "locktime": int(tx.get("locktime", 0)),
+            "vin_index": int(vin),
+            "script_code": entry.get("script_code") or entry.get("witness_script") or entry.get("redeem_script") or entry.get("prev_spk"),
+            "prev_value": int(entry.get("prev_value", 0)),
+            "inputs": [
+                {
+                    "txid": str(inp.get("txid") or ""),
+                    "vout": int(inp.get("vout", 0)),
+                    "sequence": int(inp.get("sequence", 0xffffffff)),
+                }
+                for inp in tx.get("vin", [])
+            ],
+            "outputs": [
+                {
+                    "value": int(out.get("value", 0)),
+                    "scriptpubkey": str(out.get("scriptpubkey") or out.get("scriptPubKey") or ""),
+                }
+                for out in tx.get("vout", [])
+            ],
+        }
+
+    def record_sig(self, txid:str, vin:int, entry:dict, block_height: Optional[int] = None, block_time: Optional[int] = None, tx: Optional[dict] = None):
         # dedup line guard
         key = (txid, vin, entry["r"], entry["s"])
         if key in self._seen_lines:
@@ -776,6 +815,8 @@ class BlockWalker:
         if entry.get("redeem_script"):  rec["redeem_script"]  = entry["redeem_script"]
         if entry.get("script_code"):    rec["script_code"]    = entry["script_code"]
         if entry.get("pub_candidates"): rec["pub_candidates"] = entry["pub_candidates"]
+        if self.include_sighash_context and tx is not None:
+            rec["sighash_context"] = self.build_sighash_context(tx, vin, entry)
 
         with open(SIGS_JSONL,"a") as f: f.write(json.dumps(rec)+"\n")
 
@@ -901,7 +942,7 @@ class BlockWalker:
                     all_coinbase_inputs = False
                 entries = self.extract_sigs_from_input(tx, vin_index)
                 for e in entries:
-                    self.record_sig(tx["txid"], vin_index, e, block_height=height, block_time=tx_block_time)
+                    self.record_sig(tx["txid"], vin_index, e, block_height=height, block_time=tx_block_time, tx=tx)
                     sig_count += 1
 
             if all_coinbase_inputs:
@@ -959,6 +1000,8 @@ def build_cli() -> argparse.ArgumentParser:
     p.add_argument("--random-max-height", type=int, default=450000, help="Upper bound for random mode.")
     p.add_argument("--emit-secrets", action="store_true",
                    help="Write full recovered private keys/WIF into outputs and logs. Default is redacted.")
+    p.add_argument("--include-sighash-context", action="store_true",
+                   help="Store compact transaction context needed to recompute z in later diagnostics.")
     return p
 
 if __name__ == "__main__":
@@ -972,6 +1015,7 @@ if __name__ == "__main__":
         random_min_height=args.random_min_height,
         random_max_height=args.random_max_height,
         emit_secrets=args.emit_secrets,
+        include_sighash_context=args.include_sighash_context,
     )
     walker.run(
         start_height=args.start_height,

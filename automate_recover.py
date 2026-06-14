@@ -811,8 +811,6 @@ def write_candidate_validation_report(
     pre_validation: dict[str, Any],
     post_validation: dict[str, Any],
 ) -> None:
-    if not candidate_report.get("enabled"):
-        return
     summary = recovery_material_summary(candidate_report, pre_validation, post_validation)
     payload = {
         "external_candidates": candidate_report,
@@ -820,6 +818,10 @@ def write_candidate_validation_report(
         "post_recover_validation": post_validation,
         "preloaded_recovered_validation": summary["preloaded_recovered_validation"],
         "key_recovered": summary["key_recovered"],
+        "new_key_recovered": summary["new_key_recovered"],
+        "valid_recovered_material_present": summary["valid_recovered_material_present"],
+        "recovery_outcome": summary["recovery_outcome"],
+        "no_new_key_reason": summary["no_new_key_reason"],
         "new_local_recovered_rows": summary["new_local_recovered_rows"],
         "key_material_present": summary["key_material_present"],
         "pre_existing_valid_recovered_rows": summary["pre_existing_valid_recovered_rows"],
@@ -860,8 +862,21 @@ def recovery_material_summary(
 
     preloaded_valid_rows = int(preload_validation.get("valid_rows", 0) or 0)
     total_available = post_valid_rows + preloaded_valid_rows
+    if new_valid_rows > 0:
+        recovery_outcome = "new_key_recovered"
+        no_new_key_reason = None
+    elif total_available > 0:
+        recovery_outcome = "known_material_available"
+        no_new_key_reason = "only_preexisting_or_preloaded_valid_material"
+    else:
+        recovery_outcome = "no_valid_recovered_material"
+        no_new_key_reason = "no_candidate_validated"
     return {
         "key_recovered": new_valid_rows > 0,
+        "new_key_recovered": new_valid_rows > 0,
+        "valid_recovered_material_present": total_available > 0,
+        "recovery_outcome": recovery_outcome,
+        "no_new_key_reason": no_new_key_reason,
         "new_local_recovered_rows": new_valid_rows,
         "key_material_present": total_available > 0,
         "pre_existing_valid_recovered_rows": pre_valid_rows,
@@ -1099,6 +1114,378 @@ def build_duplicate_r_focus_subset(
         "recoverable_output": str(recoverable_out_path) if recoverable_out_path else None,
         "replay_output": str(replay_out_path) if replay_out_path else None,
         "classification_report": str(report_path) if report_path else None,
+    }
+
+
+def _safe_row_id(obj: dict[str, Any], idx: int) -> dict[str, Any]:
+    return {
+        "index": idx,
+        "txid": str(obj.get("txid") or "")[:16],
+        "vin": obj.get("vin", obj.get("input_index")),
+        "pubkey_prefix": normalize_pubkey_hex(str(obj.get("pubkey_hex") or obj.get("pub") or ""))[:20],
+    }
+
+
+def _extract_der_and_sighash(sig_hex: str) -> tuple[bytes | None, int | None, str | None]:
+    if not sig_hex:
+        return None, None, "missing_signature_hex"
+    try:
+        b = bytes.fromhex(sig_hex)
+    except Exception:
+        return None, None, "bad_signature_hex"
+    if len(b) < 8 or b[0] != 0x30:
+        return None, None, "not_der"
+    if len(b) >= 2 and (2 + b[1]) == len(b):
+        return b, None, None
+    if len(b) >= 3 and (2 + b[1]) == len(b) - 1:
+        return b[:-1], b[-1], None
+    return None, b[-1] if b else None, "bad_der_length"
+
+
+def _parse_der_rs(der: bytes | None) -> tuple[int | None, int | None, str | None]:
+    if not der:
+        return None, None, "missing_der"
+    try:
+        if len(der) < 8 or der[0] != 0x30:
+            return None, None, "not_sequence"
+        pos = 2
+        if der[pos] != 0x02:
+            return None, None, "missing_r_integer"
+        r_len = der[pos + 1]
+        r_bytes = der[pos + 2:pos + 2 + r_len]
+        pos += 2 + r_len
+        if pos + 2 > len(der) or der[pos] != 0x02:
+            return None, None, "missing_s_integer"
+        s_len = der[pos + 1]
+        s_bytes = der[pos + 2:pos + 2 + s_len]
+        if pos + 2 + s_len != len(der):
+            return None, None, "trailing_der_bytes"
+        return int.from_bytes(r_bytes, "big"), int.from_bytes(s_bytes, "big"), None
+    except Exception as e:
+        return None, None, f"der_parse_exception:{type(e).__name__}"
+
+
+def _verify_row_signature(obj: dict[str, Any]) -> tuple[bool | None, str]:
+    pub = normalize_pubkey_hex(str(obj.get("pubkey_hex") or obj.get("pub") or ""))
+    sig_hex = str(obj.get("signature_hex") or obj.get("sig") or "")
+    if not pub:
+        return None, "missing_pubkey"
+    try:
+        z = parse_int(obj.get("z"))
+        if not (0 <= z < 2**256):
+            return None, "z_out_of_256_bit_range"
+    except Exception:
+        return None, "bad_z"
+    der, _, der_reason = _extract_der_and_sighash(sig_hex)
+    if der is None:
+        return None, der_reason or "bad_der"
+    try:
+        from coincurve import PublicKey  # type: ignore
+        ok = bool(PublicKey(bytes.fromhex(pub)).verify(der, z.to_bytes(32, "big"), hasher=None))
+        return ok, "ok" if ok else "verify_false"
+    except ValueError:
+        return False, "pubkey_parse_error"
+    except Exception as e:
+        return False, f"verify_exception:{type(e).__name__}"
+
+
+def _recompute_z_from_context(obj: dict[str, Any]) -> tuple[bool | None, str]:
+    ctx = obj.get("sighash_context")
+    if not isinstance(ctx, dict):
+        return None, "missing_sighash_context"
+    try:
+        from download_signatures import bip143_sighash, legacy_sighash  # type: ignore
+        vin_index = int(ctx.get("vin_index", obj.get("vin", 0)))
+        script_code = str(ctx.get("script_code") or obj.get("script_code") or "")
+        if not script_code:
+            return None, "missing_script_code"
+        sighash = int(obj.get("sighash"))
+        tx = {
+            "version": int(ctx.get("version", 2)),
+            "locktime": int(ctx.get("locktime", 0)),
+            "vin": [
+                {
+                    "txid": str(inp.get("txid") or ""),
+                    "vout": int(inp.get("vout", 0)),
+                    "sequence": int(inp.get("sequence", 0xffffffff)),
+                }
+                for inp in (ctx.get("inputs") or [])
+                if isinstance(inp, dict)
+            ],
+            "vout": [
+                {
+                    "value": int(out.get("value", 0)),
+                    "scriptpubkey": str(out.get("scriptpubkey") or ""),
+                }
+                for out in (ctx.get("outputs") or [])
+                if isinstance(out, dict)
+            ],
+        }
+        if not tx["vin"] or vin_index < 0 or vin_index >= len(tx["vin"]):
+            return None, "bad_context_inputs"
+        algorithm = str(ctx.get("algorithm") or "").lower()
+        if algorithm == "bip143":
+            z_calc = bip143_sighash(tx, vin_index, int(ctx.get("prev_value", obj.get("prev_value", 0))), script_code, sighash)
+        elif algorithm == "legacy":
+            z_calc = legacy_sighash(tx, vin_index, script_code, sighash)
+        else:
+            return None, "unknown_sighash_algorithm"
+        z_row = parse_int(obj.get("z"))
+        return z_calc == z_row, "z_recompute_match" if z_calc == z_row else "z_recompute_mismatch"
+    except Exception as e:
+        return None, f"z_recompute_exception:{type(e).__name__}"
+
+
+def _derived_pubkey_matches(d: int, pubkeys: set[str]) -> tuple[bool | None, str]:
+    if not pubkeys:
+        return None, "missing_pubkey"
+    try:
+        from coincurve import PrivateKey  # type: ignore
+        pk = PrivateKey(d.to_bytes(32, "big"))
+        compressed = pk.public_key.format(compressed=True).hex()
+        uncompressed = pk.public_key.format(compressed=False).hex()
+        return bool({compressed, uncompressed} & pubkeys), "ok"
+    except Exception as e:
+        return None, f"derive_pubkey_exception:{type(e).__name__}"
+
+
+def build_duplicate_r_pair_diagnostics(
+    sig_path: Path,
+    out_path: Path,
+    max_groups: int = 500,
+    max_pair_samples: int = 200,
+) -> dict[str, Any]:
+    """Explain duplicate-r recoverability without writing d/k material.
+
+    Full Bitcoin sighash reconstruction is intentionally marked as not available
+    unless raw tx/preimage data exists in the row. Local checks still catch the
+    common blockers: bad DER, row r/s mismatch, bad z shape, invalid signature,
+    cross-pub pairs, non-invertible denominators, and derived-pubkey mismatch.
+    """
+    rows_by_r: dict[int, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    row_count = 0
+    malformed_rows = 0
+    row_reason_counts: Counter[str] = Counter()
+    with sig_path.open("r", encoding="utf-8") as f:
+        for idx, line in enumerate(f):
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+                if not isinstance(obj, dict):
+                    malformed_rows += 1
+                    continue
+                r = parse_int(obj.get("r"))
+                rows_by_r[r].append((idx, obj))
+                row_count += 1
+            except Exception:
+                malformed_rows += 1
+
+    groups = [(r, rows) for r, rows in rows_by_r.items() if len(rows) > 1]
+    groups.sort(key=lambda item: len(item[1]), reverse=True)
+    groups = groups[:max_groups]
+
+    pair_reason_counts: Counter[str] = Counter()
+    row_verification_counts: Counter[str] = Counter()
+    z_recompute_counts: Counter[str] = Counter()
+    group_reports: list[dict[str, Any]] = []
+    pair_samples: list[dict[str, Any]] = []
+    total_pairs = 0
+    direct_candidate_pairs = 0
+    direct_valid_pairs = 0
+    cross_pub_pairs = 0
+
+    for r, rows in groups:
+        group_pair_reasons: Counter[str] = Counter()
+        group_valid = 0
+        group_direct = 0
+        try:
+            r_inv = pow(r, -1, SECP256K1_N) if 1 <= r < SECP256K1_N else None
+        except ValueError:
+            r_inv = None
+        row_summaries = []
+        for idx, obj in rows:
+            row_reasons = []
+            try:
+                row_r = parse_int(obj.get("r"))
+                row_s = parse_int(obj.get("s"))
+                row_z = parse_int(obj.get("z"))
+            except Exception:
+                row_reasons.append("bad_numeric_field")
+                row_reason_counts["bad_numeric_field"] += 1
+                row_summaries.append({**_safe_row_id(obj, idx), "reasons": row_reasons})
+                continue
+            sig_hex = str(obj.get("signature_hex") or obj.get("sig") or "")
+            der, sighash_byte, der_reason = _extract_der_and_sighash(sig_hex)
+            der_r, der_s, parse_reason = _parse_der_rs(der)
+            if der_reason:
+                row_reasons.append(der_reason)
+            if parse_reason:
+                row_reasons.append(parse_reason)
+            if der_r is not None and der_r != row_r:
+                row_reasons.append("der_r_mismatch")
+            if der_s is not None and der_s != row_s:
+                # Low-S normalization can intentionally change row s. Keep it
+                # distinct from a hard mismatch for debugging.
+                if (SECP256K1_N - der_s) % SECP256K1_N == row_s:
+                    row_reasons.append("row_s_is_low_s_normalized")
+                else:
+                    row_reasons.append("der_s_mismatch")
+            if sighash_byte is not None and obj.get("sighash") is not None:
+                try:
+                    if int(obj.get("sighash")) != int(sighash_byte):
+                        row_reasons.append("sighash_byte_mismatch")
+                except Exception:
+                    row_reasons.append("bad_sighash_field")
+            if not (0 <= row_z < 2**256):
+                row_reasons.append("z_out_of_256_bit_range")
+            ok, verify_reason = _verify_row_signature(obj)
+            row_verification_counts[verify_reason] += 1
+            if ok is False:
+                row_reasons.append(f"signature_{verify_reason}")
+            z_ok, z_reason = _recompute_z_from_context(obj)
+            z_recompute_counts[z_reason] += 1
+            if z_ok is False:
+                row_reasons.append(z_reason)
+            for reason in row_reasons:
+                row_reason_counts[reason] += 1
+            row_summaries.append(
+                {
+                    **_safe_row_id(obj, idx),
+                    "signature_verification": verify_reason,
+                    "z_recompute": z_reason,
+                    "sighash_byte": sighash_byte,
+                    "row_sighash": obj.get("sighash"),
+                    "reasons": row_reasons,
+                }
+            )
+
+        for a in range(len(rows)):
+            i1, x1 = rows[a]
+            for b in range(a + 1, len(rows)):
+                i2, x2 = rows[b]
+                total_pairs += 1
+                try:
+                    s1, s2 = parse_int(x1.get("s")), parse_int(x2.get("s"))
+                    z1, z2 = parse_int(x1.get("z")), parse_int(x2.get("z"))
+                except Exception:
+                    reason = "bad_numeric_field"
+                    pair_reason_counts[reason] += 1
+                    group_pair_reasons[reason] += 1
+                    continue
+                pub1 = normalize_pubkey_hex(str(x1.get("pubkey_hex") or x1.get("pub") or ""))
+                pub2 = normalize_pubkey_hex(str(x2.get("pubkey_hex") or x2.get("pub") or ""))
+                if pub1 and pub2 and pub1 != pub2:
+                    reason = "cross_pub_pair_not_directly_solvable"
+                    cross_pub_pairs += 1
+                    pair_reason_counts[reason] += 1
+                    group_pair_reasons[reason] += 1
+                    if len(pair_samples) < max_pair_samples:
+                        pair_samples.append({"r": format(r, "064x"), "reason": reason, "rows": [_safe_row_id(x1, i1), _safe_row_id(x2, i2)]})
+                    continue
+                if s1 == s2:
+                    reason = "same_s_noninvertible"
+                    pair_reason_counts[reason] += 1
+                    group_pair_reasons[reason] += 1
+                    continue
+                if z1 == z2:
+                    reason = "same_z_no_nonce_reuse_signal"
+                    pair_reason_counts[reason] += 1
+                    group_pair_reasons[reason] += 1
+                    continue
+                denom = (s1 - s2) % SECP256K1_N
+                if denom == 0 or r_inv is None:
+                    reason = "bad_inverse"
+                    pair_reason_counts[reason] += 1
+                    group_pair_reasons[reason] += 1
+                    continue
+                direct_candidate_pairs += 1
+                group_direct += 1
+                k = ((z1 - z2) % SECP256K1_N) * pow(denom, -1, SECP256K1_N) % SECP256K1_N
+                d = (((s1 * k - z1) % SECP256K1_N) * r_inv) % SECP256K1_N
+                lhs1 = (s1 * k - z1) % SECP256K1_N
+                lhs2 = (s2 * k - z2) % SECP256K1_N
+                rhs = (r * d) % SECP256K1_N
+                if lhs1 != rhs or lhs2 != rhs:
+                    reason = "algebraic_equation_failed"
+                    pair_reason_counts[reason] += 1
+                    group_pair_reasons[reason] += 1
+                    continue
+                match, match_reason = _derived_pubkey_matches(d, {p for p in (pub1, pub2) if p})
+                if match:
+                    reason = "direct_recovery_valid"
+                    direct_valid_pairs += 1
+                    group_valid += 1
+                elif match is False:
+                    reason = "derived_pubkey_mismatch"
+                else:
+                    reason = match_reason
+                pair_reason_counts[reason] += 1
+                group_pair_reasons[reason] += 1
+                if len(pair_samples) < max_pair_samples:
+                    pair_samples.append({"r": format(r, "064x"), "reason": reason, "rows": [_safe_row_id(x1, i1), _safe_row_id(x2, i2)]})
+
+        pubs = {
+            normalize_pubkey_hex(str(obj.get("pubkey_hex") or obj.get("pub") or ""))
+            for _, obj in rows
+            if normalize_pubkey_hex(str(obj.get("pubkey_hex") or obj.get("pub") or ""))
+        }
+        group_reports.append(
+            {
+                "r": format(r, "064x"),
+                "rows": len(rows),
+                "unique_pubkeys": len(pubs),
+                "pairs_total": len(rows) * (len(rows) - 1) // 2,
+                "direct_candidate_pairs": group_direct,
+                "direct_valid_pairs": group_valid,
+                "pair_reason_counts": dict(group_pair_reasons),
+                "row_summaries": row_summaries[:20],
+            }
+        )
+
+    payload = {
+        "input": str(sig_path),
+        "rows": row_count,
+        "malformed_rows": malformed_rows,
+        "duplicate_r_groups": len(groups),
+        "pairs_total": total_pairs,
+        "direct_candidate_pairs": direct_candidate_pairs,
+        "direct_valid_pairs": direct_valid_pairs,
+        "cross_pub_pairs": cross_pub_pairs,
+        "pair_reason_counts": dict(pair_reason_counts),
+        "row_reason_counts": dict(row_reason_counts),
+        "row_verification_counts": dict(row_verification_counts),
+        "z_recompute_counts": dict(z_recompute_counts),
+        "sighash_reconstruction": {
+            "available": bool(z_recompute_counts and any(k in z_recompute_counts for k in ("z_recompute_match", "z_recompute_mismatch"))),
+            "reason": "z is recomputed for rows carrying sighash_context; older rows without context are reported as missing_sighash_context",
+            "required_fields": ["sighash_context.version", "sighash_context.locktime", "sighash_context.inputs", "sighash_context.outputs", "sighash_context.script_code", "sighash"],
+        },
+        "groups": group_reports,
+        "pair_samples": pair_samples,
+        "priv_material": "NOT_WRITTEN",
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
+def summarize_duplicate_r_pair_diagnostics(report: dict[str, Any]) -> dict[str, Any]:
+    if not report:
+        return {}
+    return {
+        "input": report.get("input"),
+        "rows": report.get("rows", 0),
+        "duplicate_r_groups": report.get("duplicate_r_groups", 0),
+        "pairs_total": report.get("pairs_total", 0),
+        "direct_candidate_pairs": report.get("direct_candidate_pairs", 0),
+        "direct_valid_pairs": report.get("direct_valid_pairs", 0),
+        "cross_pub_pairs": report.get("cross_pub_pairs", 0),
+        "pair_reason_counts": report.get("pair_reason_counts", {}),
+        "row_verification_counts": report.get("row_verification_counts", {}),
+        "z_recompute_counts": report.get("z_recompute_counts", {}),
+        "sighash_reconstruction": report.get("sighash_reconstruction", {}),
     }
 
 
@@ -2096,6 +2483,8 @@ def main() -> None:
                     help="Path for replay-like duplicate-r rows kept for evidence but skipped by Stage0 recovery")
     ap.add_argument("--stage0-classification-report", default="duplicate_r_classification_report.json",
                     help="Metadata-only duplicate-r classification report")
+    ap.add_argument("--duplicate-r-pair-report", default="duplicate_r_pair_diagnostics.json",
+                    help="Metadata-only per-pair duplicate-r correctness and blocker diagnostics")
     ap.add_argument("--strong-signal-out", default="signatures.strong_signal.jsonl",
                     help="Path for the strongest-signal subset used by random-k stage")
     ap.add_argument("--relation-neighborhood-out", default="signatures.relation_neighborhood.jsonl",
@@ -2199,6 +2588,10 @@ def main() -> None:
         args.combined_preload_k_out,
         args.target_sigs_out,
         args.stage0_subset_out,
+        args.stage0_recoverable_out,
+        args.stage0_replay_out,
+        args.stage0_classification_report,
+        args.duplicate_r_pair_report,
         args.strong_signal_out,
         args.baseline_report,
     ):
@@ -2389,6 +2782,8 @@ def main() -> None:
         effective_cluster_threshold = max(0, effective_cluster_threshold - 10)
     # Stage0 is built from the full input before any cluster filtering.
     stage0_subset_info = None
+    duplicate_r_pair_report: dict[str, Any] = {}
+    duplicate_r_pair_summary: dict[str, Any] = {}
     stage0_path = Path(args.stage0_subset_out)
     stage0_recoverable_path = Path(args.stage0_recoverable_out)
     stage0_replay_path = Path(args.stage0_replay_out)
@@ -2455,6 +2850,7 @@ def main() -> None:
                     "cluster_gating_used": not args.disable_cluster_gating,
                     "effective_cluster_risk_threshold": effective_cluster_threshold,
                     "cluster_report": cluster_report,
+                    "duplicate_r_pair_diagnostics": duplicate_r_pair_summary,
                 })
                 return
         if cluster_report["selected_signatures"] > 0:
@@ -2477,6 +2873,19 @@ def main() -> None:
             print("Stage0 has nontrivial duplicate-r; running dedicated recovery on recoverable-focus rows.")
         else:
             print("Stage0 is replay-like only; keeping broader recover_input for stage1.")
+
+        pair_diag_input = stage0_recoverable_path if stage0_recoverable_path.exists() else stage0_path
+        duplicate_r_pair_report = build_duplicate_r_pair_diagnostics(
+            sig_path=pair_diag_input,
+            out_path=Path(args.duplicate_r_pair_report),
+        )
+        duplicate_r_pair_summary = summarize_duplicate_r_pair_diagnostics(duplicate_r_pair_report)
+        print(
+            "Duplicate-r pair diagnostics:",
+            f"direct_valid_pairs={duplicate_r_pair_report.get('direct_valid_pairs', 0)}",
+            f"cross_pub_pairs={duplicate_r_pair_report.get('cross_pub_pairs', 0)}",
+            f"report={args.duplicate_r_pair_report}",
+        )
 
     hnp_leak_report = build_explicit_hnp_leak_subset(
         sig_path=sigs,
@@ -2628,12 +3037,17 @@ def main() -> None:
                 "hnp_candidate_rows": len(hnp_candidates or []),
                 "external_candidate_validation": external_candidate_report,
                 "key_recovered": stage0_material_summary["key_recovered"],
+                "new_key_recovered": stage0_material_summary["new_key_recovered"],
+                "valid_recovered_material_present": stage0_material_summary["valid_recovered_material_present"],
+                "recovery_outcome": stage0_material_summary["recovery_outcome"],
+                "no_new_key_reason": stage0_material_summary["no_new_key_reason"],
                 "new_local_recovered_rows": stage0_material_summary["new_local_recovered_rows"],
                 "key_material_present": stage0_material_summary["key_material_present"],
                 "pre_existing_valid_recovered_rows": stage0_material_summary["pre_existing_valid_recovered_rows"],
                 "preloaded_valid_recovered_rows": stage0_material_summary["preloaded_valid_recovered_rows"],
                 "cycle_valid_recovered_rows": stage0_material_summary["cycle_valid_recovered_rows"],
                 "total_valid_recovered_rows": stage0_material_summary["total_valid_recovered_rows"],
+                "duplicate_r_pair_diagnostics": duplicate_r_pair_summary,
                 "risk_score": risk,
                 "risk_verdict": verdict,
                 "duplicate_r": dup_r,
@@ -2995,12 +3409,17 @@ def main() -> None:
         "hnp_candidate_rows": len(hnp_candidates or []),
         "external_candidate_validation": external_candidate_report,
         "key_recovered": material_summary["key_recovered"],
+        "new_key_recovered": material_summary["new_key_recovered"],
+        "valid_recovered_material_present": material_summary["valid_recovered_material_present"],
+        "recovery_outcome": material_summary["recovery_outcome"],
+        "no_new_key_reason": material_summary["no_new_key_reason"],
         "new_local_recovered_rows": material_summary["new_local_recovered_rows"],
         "key_material_present": material_summary["key_material_present"],
         "pre_existing_valid_recovered_rows": material_summary["pre_existing_valid_recovered_rows"],
         "preloaded_valid_recovered_rows": material_summary["preloaded_valid_recovered_rows"],
         "cycle_valid_recovered_rows": material_summary["cycle_valid_recovered_rows"],
         "total_valid_recovered_rows": material_summary["total_valid_recovered_rows"],
+        "duplicate_r_pair_diagnostics": duplicate_r_pair_summary,
         "risk_score": risk,
         "risk_verdict": verdict,
         "duplicate_r": dup_r,

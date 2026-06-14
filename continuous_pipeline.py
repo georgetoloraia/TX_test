@@ -217,6 +217,22 @@ def resolve_python_explicit_or_default(python_arg: str) -> str:
     return sys.executable
 
 
+def resolve_fallback_random_k_budget(args: argparse.Namespace, effective: dict) -> int:
+    """Resolve the expensive fallback random-k budget explicitly.
+
+    The main --random-k-budget controls the normal strongest-signal random-k
+    stage. This resolver controls the later fallback-targeted-random-k stage,
+    which can run for a long time on large strong-signal subsets.
+    """
+    if getattr(args, "disable_fallback_random_k", False):
+        return 0
+    explicit = int(getattr(args, "fallback_random_k_budget", -1))
+    if explicit >= 0:
+        return explicit
+    auto_floor = 4096 if getattr(args, "discovery_mode", "balanced") == "max" else 1024
+    return max(int(effective.get("random_k_budget", 0)), auto_floor)
+
+
 def run_cmd(cmd: list[str]) -> int:
     print("$", " ".join(shlex.quote(x) for x in cmd), flush=True)
     return subprocess.run(cmd).returncode
@@ -450,6 +466,7 @@ def build_cycle_artifact_paths(run_dir: Path, cycle: int, cycle_start: int, args
         "stage0_recoverable": cycle_dir / "signatures.dup_r_recoverable.jsonl",
         "stage0_replay": cycle_dir / "signatures.dup_r_replay.jsonl",
         "stage0_classification_report": cycle_dir / "duplicate_r_classification_report.json",
+        "duplicate_r_pair_report": cycle_dir / "duplicate_r_pair_diagnostics.json",
         "strong_signal": cycle_dir / "signatures.strong_signal.jsonl",
         "relation_neighborhood": cycle_dir / "signatures.relation_neighborhood.jsonl",
         "relation_neighborhood_report": cycle_dir / "relation_neighborhood_report.json",
@@ -611,6 +628,8 @@ def run_pubkey_expansion(args: argparse.Namespace, report_path: Path, sources: l
         "--max-txs-per-address", str(args.pubkey_expansion_max_txs_per_address),
         "--sleep-sec", str(args.pubkey_expansion_sleep_sec),
     ]
+    if args.include_sighash_context:
+        expansion_cmd.append("--include-sighash-context")
     for src in sources:
         expansion_cmd += ["--from-json", str(src)]
     if args.target_pubkey:
@@ -648,6 +667,8 @@ def main() -> None:
                     help="Lower bound passed to download_signatures.py when --download-mode=random")
     ap.add_argument("--random-max-height", type=int, default=450000,
                     help="Upper bound passed to download_signatures.py when --download-mode=random")
+    ap.add_argument("--include-sighash-context", action="store_true",
+                    help="Store compact transaction context in new signature rows for later z recomputation diagnostics")
 
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--risk-threshold", type=int, default=40)
@@ -663,6 +684,10 @@ def main() -> None:
     ap.add_argument("--no-enable-advanced-recover", action="store_false", dest="enable_advanced_recover")
     ap.add_argument("--random-k-budget", type=int, default=0,
                     help="Random-k tries per bucket for the strongest recovery stage")
+    ap.add_argument("--fallback-random-k-budget", type=int, default=-1,
+                    help="-1 = auto by discovery mode, 0 disables fallback random-k, >0 explicit fallback random-k tries per bucket")
+    ap.add_argument("--disable-fallback-random-k", action="store_true",
+                    help="Disable only the expensive fallback targeted random-k stage")
     ap.add_argument("--delta-max", type=int, default=4096,
                     help="Forward to automate_recover.py: maximum delta for k2 = k1 +/- delta")
     ap.add_argument("--delta-per-pair-cap", type=int, default=4096,
@@ -875,6 +900,8 @@ def main() -> None:
             "--start-height", str(cycle_start),
             "--max-blocks", str(args.batch_size),
         ]
+        if args.include_sighash_context:
+            download_cmd.append("--include-sighash-context")
         if args.download_mode == "deterministic":
             download_cmd += ["--end-height", "900000"]
         else:
@@ -985,6 +1012,7 @@ def main() -> None:
             "--stage0-recoverable-out", str(cycle_artifacts["stage0_recoverable"]),
             "--stage0-replay-out", str(cycle_artifacts["stage0_replay"]),
             "--stage0-classification-report", str(cycle_artifacts["stage0_classification_report"]),
+            "--duplicate-r-pair-report", str(cycle_artifacts["duplicate_r_pair_report"]),
             "--strong-signal-out", str(cycle_artifacts["strong_signal"]),
             "--relation-neighborhood-out", str(cycle_artifacts["relation_neighborhood"]),
             "--relation-neighborhood-report", str(cycle_artifacts["relation_neighborhood_report"]),
@@ -993,7 +1021,7 @@ def main() -> None:
             "--recovery-graph-report", str(cycle_artifacts["recovery_graph_report"]),
             "--recovery-graph-expansion-report", str(cycle_artifacts["recovery_graph_expansion_report"]),
             "--fallback-max-iter", str(max(4 if args.discovery_mode == "max" else 3, effective["max_iter"])),
-            "--fallback-random-k-budget", str(max(effective["random_k_budget"], 4096 if args.discovery_mode == "max" else 1024)),
+            "--fallback-random-k-budget", str(resolve_fallback_random_k_budget(args, effective)),
         ]
         if args.discovery_mode == "max":
             recover_cmd.append("--full-scan-fallback")
@@ -1092,6 +1120,7 @@ def main() -> None:
                     stage0 = d.get("stage0_subset", {}) or {}
                     target = d.get("target_filter", {}) or {}
                     external_candidates = d.get("external_candidate_validation", {}) or {}
+                    dup_pair_diag = d.get("duplicate_r_pair_diagnostics", {}) or {}
                     stage_runs = d.get("recover_stages", []) or []
                     stage_names = ",".join(str(s.get("name", "?")) for s in stage_runs) if stage_runs else "none"
                     invalid_ratio = vq.get("invalid_ratio")
@@ -1116,8 +1145,11 @@ def main() -> None:
                         f"target_enabled={target.get('enabled')}\n"
                         f"target_matched_rows={target.get('matched_rows')}\n"
                         f"recovery_viability={d.get('recovery_viability')}\n"
-                        f"key_recovered={d.get('key_recovered')}\n"
+                        f"new_key_recovered={d.get('new_key_recovered', d.get('key_recovered'))}\n"
+                        f"valid_recovered_material_present={d.get('valid_recovered_material_present', d.get('key_material_present'))}\n"
+                        f"recovery_outcome={d.get('recovery_outcome')}\n"
                         f"new_local_recovered_rows={d.get('new_local_recovered_rows')}\n"
+                        f"total_valid_recovered_rows={d.get('total_valid_recovered_rows')}\n"
                         f"known_nonce_rows={d.get('known_nonce_rows')}\n"
                         f"external_candidates={external_candidates.get('enabled')}\n"
                         f"recover_input={d.get('recover_input')}\n"
@@ -1125,6 +1157,9 @@ def main() -> None:
                         f"cluster_gating_used={d.get('cluster_gating_used')}\n"
                         f"stage0_selected={stage0.get('selected_signatures')}\n"
                         f"stage0_nontrivial_groups={stage0.get('nontrivial_duplicate_r_groups')}\n"
+                        f"dupR_direct_valid_pairs={dup_pair_diag.get('direct_valid_pairs')}\n"
+                        f"dupR_cross_pub_pairs={dup_pair_diag.get('cross_pub_pairs')}\n"
+                        f"z_recompute_counts={dup_pair_diag.get('z_recompute_counts')}\n"
                         f"hnp_candidates={d.get('hnp_candidate_rows', hnp_candidate_count)}\n"
                     )
             except Exception as e:
