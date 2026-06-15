@@ -59,15 +59,74 @@ def load_jsonl(path: Path) -> tuple[list[str], list[dict[str, Any] | None]]:
     return raw_lines, rows
 
 
+def cache_path_for_tx(cache_dir: Path, txid: str) -> Path:
+    safe = "".join(c for c in txid.lower() if c in "0123456789abcdef")
+    if len(safe) != 64:
+        safe = txid.replace("/", "_").replace("\\", "_")
+    return cache_dir / f"{safe}.json"
+
+
+def load_tx_from_cache(cache_dir: Path, txid: str) -> dict[str, Any] | None:
+    path = cache_path_for_tx(cache_dir, txid)
+    if not path.exists():
+        return None
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(obj, dict) and (obj.get("txid") or obj.get("hash") or obj.get("vin") or obj.get("inputs")):
+            return obj
+    except Exception:
+        return None
+    return None
+
+
+def write_tx_to_cache(cache_dir: Path, txid: str, raw: dict[str, Any]) -> bool:
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path = cache_path_for_tx(cache_dir, txid)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(raw, sort_keys=True), encoding="utf-8")
+        tmp.replace(path)
+        return True
+    except Exception:
+        return False
+
+
+def get_tx_with_cache(
+    processor: BlockWalker,
+    txid: str,
+    cache_dir: Path | None,
+    stats: Counter[str],
+) -> dict[str, Any] | None:
+    if cache_dir is not None:
+        cached = load_tx_from_cache(cache_dir, txid)
+        if cached is not None:
+            stats["cache_hits"] += 1
+            return cached
+        stats["cache_misses"] += 1
+    raw = processor.get_tx(txid)
+    if isinstance(raw, dict):
+        stats["network_fetches"] += 1
+        if cache_dir is not None:
+            if write_tx_to_cache(cache_dir, txid, raw):
+                stats["cache_writes"] += 1
+            else:
+                stats["cache_write_errors"] += 1
+        return raw
+    stats["network_misses"] += 1
+    return None
+
+
 def build_context_index(
     processor: BlockWalker,
     txid: str,
+    cache_dir: Path | None,
+    cache_stats: Counter[str],
 ) -> tuple[
     dict[tuple[str, int, int, int], dict[str, Any]],
     dict[str, Any] | None,
     dict[int, list[dict[str, Any]]],
 ]:
-    raw = processor.get_tx(txid)
+    raw = get_tx_with_cache(processor, txid, cache_dir, cache_stats)
     if not isinstance(raw, dict):
         return {}, None, {}
     tx = processor.normalize_tx(raw)
@@ -168,6 +227,10 @@ def main() -> None:
                     help="Backfill every row missing sighash_context")
     ap.add_argument("--max-rows", type=int, default=0, help="Maximum candidate rows to backfill; 0 = no limit")
     ap.add_argument("--max-txs", type=int, default=0, help="Maximum unique txids to fetch; 0 = no limit")
+    ap.add_argument("--tx-cache-dir", default=".tx_cache/backfill",
+                    help="Directory for cached provider transaction JSON responses")
+    ap.add_argument("--no-tx-cache", action="store_true",
+                    help="Disable transaction cache and fetch every tx from providers")
     ap.add_argument("--require-extraction-match", action="store_true",
                     help="Only write contexts copied from a re-extracted matching (txid,vin,r,s); disables row_fallback_unverified")
     ap.add_argument("--report", default="sighash_context_backfill_report.json")
@@ -212,13 +275,15 @@ def main() -> None:
                 break
 
     processor = BlockWalker(deterministic=True, include_sighash_context=True)
+    cache_dir = None if args.no_tx_cache else Path(args.tx_cache_dir)
+    cache_stats: Counter[str] = Counter()
     context_by_key: dict[tuple[str, int, int, int], dict[str, Any]] = {}
     tx_by_txid: dict[str, dict[str, Any]] = {}
     extracted_by_txid: dict[str, dict[int, list[dict[str, Any]]]] = {}
     fetch_errors = 0
     for txid in txids:
         try:
-            ctx, tx, extracted_by_vin = build_context_index(processor, txid)
+            ctx, tx, extracted_by_vin = build_context_index(processor, txid, cache_dir, cache_stats)
             context_by_key.update(ctx)
             for item in ctx.values():
                 item["context_source"] = "extraction_match"
@@ -286,6 +351,11 @@ def main() -> None:
         "extraction_failure_reason_counts": dict(failure_reason_counts),
         "extraction_failure_samples": extraction_failure_samples,
         "fetch_errors": fetch_errors,
+        "tx_cache": {
+            "enabled": cache_dir is not None,
+            "dir": str(cache_dir) if cache_dir is not None else None,
+            **dict(cache_stats),
+        },
         "only_duplicate_r": bool(args.only_duplicate_r),
         "secret_material": "NOT_USED",
     }

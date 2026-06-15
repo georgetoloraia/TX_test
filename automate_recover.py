@@ -121,6 +121,29 @@ def _hnp_worker(leaks, q, bits_known, solver_path, qout):
             candidates = result[0] if len(result) > 0 else []
         else:
             candidates = result
+        all_candidates = []
+        if isinstance(candidates, (list, tuple, set)):
+            for c in candidates:
+                try:
+                    d = int(c)
+                except Exception:
+                    continue
+                if d not in all_candidates:
+                    all_candidates.append(d)
+        try:
+            bounded, _bounded_report = hnp_solver.bounded_lsb_recovery(
+                leaks,
+                q,
+                bits_known,
+                max_candidates=200_000,
+            )
+            for c in bounded:
+                d = int(c)
+                if d not in all_candidates:
+                    all_candidates.append(d)
+        except Exception:
+            pass
+        candidates = all_candidates
         if not isinstance(candidates, (list, tuple, set)):
             qout.put(("error", "unexpected_candidates_type"))
             return
@@ -232,6 +255,16 @@ def try_hnp_lll_bkz_solver(
         return None
     if q is None:
         q = int("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
+    try:
+        import hnp_lll_bkz_solver as hnp_solver  # type: ignore
+        report["feasibility"] = hnp_solver.hnp_feasibility(
+            sample_count=len(leaks),
+            bits_known=int(bits_known),
+            q=int(q),
+            leakage_model="LSB",
+        )
+    except Exception:
+        report["feasibility"] = {"reason": "unavailable"}
 
     qout: mp.Queue = mp.Queue()
     proc = mp.get_context("spawn").Process(
@@ -328,6 +361,189 @@ def merge_preload_k_files(paths: list[Path], out_path: Path) -> Path | None:
     return out_path
 from pathlib import Path
 from typing import Any
+
+
+def build_or_use_signature_index(
+    sig_path: Path,
+    db_path: Path,
+    build_report_path: Path,
+    summary_report_path: Path,
+    store_raw: bool = False,
+) -> dict[str, Any]:
+    """Build/update a local SQLite index and return a metadata-only summary.
+
+    The index is optional acceleration/selection infrastructure. Recovery still
+    validates cryptographic candidates in the normal C++ path.
+    """
+    from signature_sqlite_index import db_report, ingest_jsonl
+
+    report: dict[str, Any] = {
+        "enabled": True,
+        "db": str(db_path),
+        "input": str(sig_path),
+        "store_raw": bool(store_raw),
+    }
+    try:
+        build = ingest_jsonl(db_path, sig_path, store_raw=store_raw)
+        summary = db_report(db_path)
+        build_report_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_report_path.parent.mkdir(parents=True, exist_ok=True)
+        build_report_path.write_text(json.dumps(build, indent=2, sort_keys=True), encoding="utf-8")
+        summary_report_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+        report.update(
+            {
+                "available": True,
+                "build_report": str(build_report_path),
+                "summary_report": str(summary_report_path),
+                "inserted_rows": build.get("inserted_rows", 0),
+                "skipped_duplicate_rows": build.get("skipped_duplicate_rows", 0),
+                "total_index_rows": summary.get("total_rows", 0),
+                "duplicate_r_groups": summary.get("duplicate_r_groups", 0),
+                "recoverable_same_pub_groups": summary.get("recoverable_same_pub_groups", 0),
+                "cross_pub_duplicate_r_groups": summary.get("cross_pub_duplicate_r_groups", 0),
+            }
+        )
+    except Exception as e:
+        report.update({"available": False, "error": str(e)})
+        try:
+            build_report_path.parent.mkdir(parents=True, exist_ok=True)
+            build_report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+        except Exception:
+            pass
+    return report
+
+
+def build_target_pubkey_subset_indexed(
+    db_path: Path,
+    target_pubkey: str,
+    out_path: Path,
+    report_path: Path | None = None,
+) -> dict[str, Any]:
+    from signature_sqlite_index import extract_target_pubkey
+
+    report = extract_target_pubkey(db_path, target_pubkey, out_path)
+    report["indexed"] = True
+    if report_path is not None:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    return report
+
+
+def build_duplicate_r_focus_subset_indexed(
+    db_path: Path,
+    out_path: Path,
+    recoverable_out_path: Path,
+    replay_out_path: Path,
+    report_path: Path,
+) -> dict[str, Any]:
+    """Indexed duplicate-r extraction with the same shape as JSONL Stage0 info."""
+    from signature_sqlite_index import extract_duplicate_r
+
+    all_report = extract_duplicate_r(db_path, out_path, recoverable_only=False)
+    recoverable_report = extract_duplicate_r(db_path, recoverable_out_path, recoverable_only=True)
+
+    # Replay rows are evidence-only. With the index fast path we keep replay
+    # classification in the report and write an empty replay file rather than
+    # spending another extraction pass on data Stage0 will not recover from.
+    replay_out_path.parent.mkdir(parents=True, exist_ok=True)
+    replay_out_path.write_text("", encoding="utf-8")
+
+    conn = sqlite_connect_readonly(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS duplicate_r_groups,
+                SUM(CASE WHEN pubkeys > 1 THEN 1 ELSE 0 END) AS cross_pub_groups
+            FROM (
+                SELECT r, COUNT(*) AS rows, COUNT(DISTINCT pubkey_hex) AS pubkeys
+                FROM signatures
+                GROUP BY r
+                HAVING COUNT(*) > 1
+            )
+            """
+        ).fetchone()
+        exact_replay = conn.execute(
+            """
+            SELECT COUNT(*) FROM (
+                SELECT 1
+                FROM signatures
+                GROUP BY pubkey_hex, r
+                HAVING pubkey_hex != ''
+                   AND COUNT(*) > 1
+                   AND COUNT(DISTINCT s) = 1
+                   AND COUNT(DISTINCT z) = 1
+            )
+            """
+        ).fetchone()[0]
+        same_s_diff_z = conn.execute(
+            """
+            SELECT COUNT(*) FROM (
+                SELECT 1
+                FROM signatures
+                GROUP BY pubkey_hex, r
+                HAVING pubkey_hex != ''
+                   AND COUNT(*) > 1
+                   AND COUNT(DISTINCT s) = 1
+                   AND COUNT(DISTINCT z) > 1
+            )
+            """
+        ).fetchone()[0]
+        same_r_diff_s = conn.execute(
+            """
+            SELECT COUNT(*) FROM (
+                SELECT 1
+                FROM signatures
+                GROUP BY pubkey_hex, r
+                HAVING pubkey_hex != ''
+                   AND COUNT(*) > 1
+                   AND COUNT(DISTINCT s) > 1
+            )
+            """
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    duplicate_r_groups = int(row[0] or 0) if row else 0
+    cross_pub_groups = int(row[1] or 0) if row else 0
+    nontrivial_groups = int(same_s_diff_z or 0) + int(same_r_diff_s or 0)
+    selected = int(all_report.get("written_rows", 0) or 0)
+    recoverable_selected = int(recoverable_report.get("written_rows", 0) or 0)
+    replay_selected = max(0, selected - recoverable_selected)
+    info = {
+        "indexed": True,
+        "db": str(db_path),
+        "duplicate_r_groups": duplicate_r_groups,
+        "nontrivial_duplicate_r_groups": nontrivial_groups,
+        "exact_replay_groups": int(exact_replay or 0),
+        "same_r_same_s_diff_z_groups": int(same_s_diff_z or 0),
+        "same_r_diff_s_groups": int(same_r_diff_s or 0),
+        "cross_pub_duplicate_r_groups": cross_pub_groups,
+        "selected_signatures": selected,
+        "selected_signatures_nontrivial": recoverable_selected,
+        "selected_signatures_recoverable_focus": recoverable_selected,
+        "selected_signatures_replay_like": replay_selected,
+        "output": str(out_path),
+        "recoverable_output": str(recoverable_out_path),
+        "replay_output": str(replay_out_path),
+        "classification_report": str(report_path),
+        "index_extract_reports": {
+            "all_duplicate_r": all_report,
+            "recoverable_duplicate_r": recoverable_report,
+        },
+    }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(info, indent=2, sort_keys=True), encoding="utf-8")
+    return info
+
+
+def sqlite_connect_readonly(db_path: Path) -> sqlite3.Connection:
+    import sqlite3
+
+    uri = f"file:{db_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def count_known_nonce_rows(sig_path: Path) -> int:
@@ -894,12 +1110,31 @@ def normalize_pubkey_hex(value: str) -> str:
     return s
 
 
+def pubkey_hex_variants(value: str) -> set[str]:
+    """Return compressed/uncompressed SEC encodings for a pubkey hex string."""
+    pub = normalize_pubkey_hex(value)
+    if not pub:
+        return set()
+    if len(pub) not in {66, 130} or any(c not in "0123456789abcdef" for c in pub):
+        raise ValueError("pubkey must be a compressed or uncompressed SEC pubkey hex string")
+    variants = {pub}
+    try:
+        from coincurve import PublicKey  # type: ignore
+        key = PublicKey(bytes.fromhex(pub))
+        variants.add(key.format(compressed=True).hex())
+        variants.add(key.format(compressed=False).hex())
+    except Exception:
+        # Keep validation permissive when coincurve is unavailable; exact-form
+        # matching still works and audit verification will report dependency gaps.
+        pass
+    return variants
+
+
 def build_target_pubkey_subset(sig_path: Path, target_pubkey: str, out_path: Path) -> dict[str, Any]:
-    target = normalize_pubkey_hex(target_pubkey)
-    if not target:
+    targets = pubkey_hex_variants(target_pubkey)
+    if not targets:
         return {"enabled": False}
-    if len(target) not in {66, 130} or any(c not in "0123456789abcdef" for c in target):
-        raise ValueError("--target-pubkey must be a compressed or uncompressed SEC pubkey hex string")
+    target = normalize_pubkey_hex(target_pubkey)
 
     total_rows = 0
     matched_rows = 0
@@ -926,7 +1161,7 @@ def build_target_pubkey_subset(sig_path: Path, target_pubkey: str, out_path: Pat
             if not pub:
                 missing_pubkey += 1
                 continue
-            if pub != target:
+            if pub not in targets:
                 continue
             out.write(raw + "\n")
             matched_rows += 1
@@ -938,6 +1173,7 @@ def build_target_pubkey_subset(sig_path: Path, target_pubkey: str, out_path: Pat
     return {
         "enabled": True,
         "target_pubkey": target,
+        "target_pubkey_variants": sorted(targets),
         "source": str(sig_path),
         "output": str(out_path),
         "total_rows": total_rows,
@@ -2108,17 +2344,22 @@ def build_signer_relation_neighborhood_subset(
         if len(rows) < max(2, int(min_sigs)):
             continue
         r_counts: Counter[str] = Counter()
+        r_to_sz: dict[str, set[tuple[str, str]]] = defaultdict(set)
         recovered_r_hits = 0
         bad_r = 0
         for _, _, obj in rows:
             try:
                 r_hex = format(parse_int(obj.get("r")), "064x")
                 r_counts[r_hex] += 1
+                s_hex = format(parse_int(obj.get("s")), "064x")
+                z_hex = format(parse_int(obj.get("z") or obj.get("m")), "064x")
+                r_to_sz[r_hex].add((s_hex, z_hex))
                 if r_hex in recovered_r:
                     recovered_r_hits += 1
             except Exception:
                 bad_r += 1
         dup_r_events = sum(c - 1 for c in r_counts.values() if c > 1)
+        same_r_diff_sz = sum(1 for vals in r_to_sz.values() if len(vals) > 1)
         signer_stats.append(
             {
                 "pub": pub,
@@ -2126,6 +2367,7 @@ def build_signer_relation_neighborhood_subset(
                 "count": len(rows),
                 "dup_r_events": dup_r_events,
                 "dup_r_values": sum(1 for c in r_counts.values() if c > 1),
+                "same_r_diff_signature_values": same_r_diff_sz,
                 "recovered_pubkey": pub in recovered_pubs,
                 "recovered_r_hits": recovered_r_hits,
                 "bad_r_rows": bad_r,
@@ -2164,9 +2406,13 @@ def build_signer_relation_neighborhood_subset(
         if len(ordered) > effective_rows_per_signer:
             # Preserve the newest rows and a deterministic prefix sample. This
             # keeps old anomalies reachable while bounding per-signer cost.
+            source_len = len(ordered)
             head_n = max(0, min(len(ordered), effective_rows_per_signer // 4))
             tail_n = effective_rows_per_signer - head_n
             ordered = ordered[:head_n] + ordered[-tail_n:]
+            rows_dropped_by_cap = max(0, source_len - len(ordered))
+        else:
+            rows_dropped_by_cap = 0
 
         signer_selected = 0
         for pos, (_, raw, obj) in enumerate(ordered):
@@ -2193,14 +2439,28 @@ def build_signer_relation_neighborhood_subset(
 
         top_report.append(
             {
+                "pubkey": pub,
                 "pubkey_prefix": pub[:20],
                 "source_rows": stat["count"],
                 "selected_rows": signer_selected,
                 "estimated_pairs": signer_selected * (signer_selected - 1) // 2,
+                "rows_dropped_by_cap": rows_dropped_by_cap,
+                "pair_cap_applied": bool(rows_dropped_by_cap),
                 "dup_r_values": stat["dup_r_values"],
                 "dup_r_events": stat["dup_r_events"],
+                "same_r_diff_signature_values": stat["same_r_diff_signature_values"],
                 "recovered_pubkey": stat["recovered_pubkey"],
                 "recovered_r_hits": stat["recovered_r_hits"],
+                "likely_blockers": [
+                    reason
+                    for reason, enabled in (
+                        ("row_cap_truncated_candidate_pairs", bool(rows_dropped_by_cap)),
+                        ("no_duplicate_r_inside_selected_rows", int(stat["dup_r_values"]) == 0),
+                        ("no_recovered_nonce_overlap", int(stat["recovered_r_hits"]) == 0),
+                        ("no_recovered_pubkey_seed", not bool(stat["recovered_pubkey"])),
+                    )
+                    if enabled
+                ],
             }
         )
         estimated_pairs_total += signer_selected * (signer_selected - 1) // 2
@@ -2499,7 +2759,11 @@ def main() -> None:
     ap.add_argument("--nonce-hypothesis-models",
                     default=(
                         "timestamp-direct,timestamp-sha256,height-direct,height-sha256,"
-                        "txid-sha256,txid-vin-sha256,txid-vin-sighash-sha256"
+                        "txid-sha256,txid-vin-sha256,txid-vin-sighash-sha256,"
+                        "pubkey-txid-vin-sha256,prevout-txid-vin-sha256,"
+                        "timestamp-txid-vin-sha256,timestamp-pubkey-counter-sha256,"
+                        "height-txid-vin-sha256,height-pubkey-counter-sha256,"
+                        "height-time-txid-vin-sha256,pubkey-height-time-txid-vin-sha256"
                     ),
                     help="Comma-separated candidate_hypotheses.py models")
     ap.add_argument("--nonce-hypothesis-out", default="nonce_hypothesis_k.jsonl",
@@ -2524,6 +2788,16 @@ def main() -> None:
                     help="Optional compressed/uncompressed SEC pubkey hex; audit/recover only signatures for this pubkey")
     ap.add_argument("--target-sigs-out", default="signatures.target.jsonl",
                     help="Output JSONL path for --target-pubkey filtered signatures")
+    ap.add_argument("--enable-sqlite-index", action="store_true",
+                    help="Build/use a local SQLite signature index for target and duplicate-r subset extraction")
+    ap.add_argument("--sqlite-index-db", default="signatures.index.sqlite",
+                    help="SQLite index path used when --enable-sqlite-index is set")
+    ap.add_argument("--sqlite-index-build-report", default="signature_index_build_report.json",
+                    help="Metadata report for SQLite index ingestion")
+    ap.add_argument("--sqlite-index-report", default="signature_index_report.json",
+                    help="Metadata report for SQLite index summary")
+    ap.add_argument("--sqlite-index-store-raw", action="store_true",
+                    help="Store raw JSON rows in SQLite for faster extraction at higher disk cost")
     ap.add_argument("--stage0-subset-out", default="signatures.dup_r_focus.jsonl",
                     help="Path for the duplicate-r focus subset")
     ap.add_argument("--stage0-recoverable-out", default="signatures.dup_r_recoverable.jsonl",
@@ -2638,6 +2912,9 @@ def main() -> None:
         args.nonce_hypothesis_report,
         args.combined_preload_k_out,
         args.target_sigs_out,
+        args.sqlite_index_db,
+        args.sqlite_index_build_report,
+        args.sqlite_index_report,
         args.stage0_subset_out,
         args.stage0_recoverable_out,
         args.stage0_replay_out,
@@ -2648,10 +2925,41 @@ def main() -> None:
     ):
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
+    sqlite_index_report: dict[str, Any] = {"enabled": bool(args.enable_sqlite_index), "available": False}
+    if args.enable_sqlite_index and not args.dry_run:
+        sqlite_index_report = build_or_use_signature_index(
+            sig_path=sigs,
+            db_path=Path(args.sqlite_index_db),
+            build_report_path=Path(args.sqlite_index_build_report),
+            summary_report_path=Path(args.sqlite_index_report),
+            store_raw=bool(args.sqlite_index_store_raw),
+        )
+        if sqlite_index_report.get("available"):
+            print(
+                "SQLite signature index:",
+                f"rows={sqlite_index_report.get('total_index_rows', 0)}",
+                f"dup_r={sqlite_index_report.get('duplicate_r_groups', 0)}",
+                f"recoverable_dup_r={sqlite_index_report.get('recoverable_same_pub_groups', 0)}",
+                f"db={args.sqlite_index_db}",
+            )
+        else:
+            print(f"[warn] SQLite signature index unavailable: {sqlite_index_report.get('error', 'unknown')}")
+
     target_filter_info: dict[str, Any] = {"enabled": False}
     original_sigs = sigs
     if args.target_pubkey:
-        target_filter_info = build_target_pubkey_subset(sigs, args.target_pubkey, Path(args.target_sigs_out))
+        if args.enable_sqlite_index and sqlite_index_report.get("available"):
+            try:
+                target_filter_info = build_target_pubkey_subset_indexed(
+                    db_path=Path(args.sqlite_index_db),
+                    target_pubkey=args.target_pubkey,
+                    out_path=Path(args.target_sigs_out),
+                )
+            except Exception as e:
+                print(f"[warn] indexed target-pubkey extraction failed; falling back to JSONL scan: {e}")
+                target_filter_info = build_target_pubkey_subset(sigs, args.target_pubkey, Path(args.target_sigs_out))
+        else:
+            target_filter_info = build_target_pubkey_subset(sigs, args.target_pubkey, Path(args.target_sigs_out))
         sigs = Path(args.target_sigs_out)
         print(
             "Target pubkey filter:",
@@ -2667,6 +2975,7 @@ def main() -> None:
             "should_recover": False,
             "recover_executed": False,
             "search_attempted": False,
+            "sqlite_index": sqlite_index_report,
             "target_filter": target_filter_info,
             "source_sigs": str(original_sigs),
             "recover_input": None,
@@ -2782,6 +3091,7 @@ def main() -> None:
             "verification_quality": vq,
             "low_quality_data": low_quality_data,
             "cluster_fallback_used": cluster_fallback_used,
+            "sqlite_index": sqlite_index_report,
             "target_filter": target_filter_info,
             "source_sigs": str(original_sigs),
             "recover_input": None,
@@ -2814,6 +3124,7 @@ def main() -> None:
             "verification_quality": vq,
             "low_quality_data": low_quality_data,
             "cluster_fallback_used": cluster_fallback_used,
+            "sqlite_index": sqlite_index_report,
             "target_filter": target_filter_info,
             "source_sigs": str(original_sigs),
             "recover_input": None,
@@ -2839,13 +3150,32 @@ def main() -> None:
     stage0_recoverable_path = Path(args.stage0_recoverable_out)
     stage0_replay_path = Path(args.stage0_replay_out)
     if dup_r > 0:
-        stage0_subset_info = build_duplicate_r_focus_subset(
-            sig_path=sigs,
-            out_path=stage0_path,
-            recoverable_out_path=stage0_recoverable_path,
-            replay_out_path=stage0_replay_path,
-            report_path=Path(args.stage0_classification_report),
-        )
+        if args.enable_sqlite_index and sqlite_index_report.get("available") and not args.target_pubkey:
+            try:
+                stage0_subset_info = build_duplicate_r_focus_subset_indexed(
+                    db_path=Path(args.sqlite_index_db),
+                    out_path=stage0_path,
+                    recoverable_out_path=stage0_recoverable_path,
+                    replay_out_path=stage0_replay_path,
+                    report_path=Path(args.stage0_classification_report),
+                )
+            except Exception as e:
+                print(f"[warn] indexed duplicate-r extraction failed; falling back to JSONL scan: {e}")
+                stage0_subset_info = build_duplicate_r_focus_subset(
+                    sig_path=sigs,
+                    out_path=stage0_path,
+                    recoverable_out_path=stage0_recoverable_path,
+                    replay_out_path=stage0_replay_path,
+                    report_path=Path(args.stage0_classification_report),
+                )
+        else:
+            stage0_subset_info = build_duplicate_r_focus_subset(
+                sig_path=sigs,
+                out_path=stage0_path,
+                recoverable_out_path=stage0_recoverable_path,
+                replay_out_path=stage0_replay_path,
+                report_path=Path(args.stage0_classification_report),
+            )
 
     if not args.disable_cluster_gating:
         cluster_report = build_cluster_subset(
@@ -2895,6 +3225,7 @@ def main() -> None:
                     "verification_quality": vq,
                     "low_quality_data": low_quality_data,
                     "cluster_fallback_used": cluster_fallback_used,
+                    "sqlite_index": sqlite_index_report,
                     "target_filter": target_filter_info,
                     "source_sigs": str(original_sigs),
                     "recover_input": None,
@@ -3111,6 +3442,7 @@ def main() -> None:
                 "verification_quality": vq,
                 "low_quality_data": low_quality_data,
                 "cluster_fallback_used": cluster_fallback_used,
+                "sqlite_index": sqlite_index_report,
                 "target_filter": target_filter_info,
                 "source_sigs": str(original_sigs),
                 "effective_cluster_risk_threshold": effective_cluster_threshold,
@@ -3484,6 +3816,7 @@ def main() -> None:
         "verification_quality": vq,
         "low_quality_data": low_quality_data,
         "cluster_fallback_used": cluster_fallback_used,
+        "sqlite_index": sqlite_index_report,
         "target_filter": target_filter_info,
         "source_sigs": str(original_sigs),
         "effective_cluster_risk_threshold": effective_cluster_threshold,

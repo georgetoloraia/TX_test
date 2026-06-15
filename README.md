@@ -11,6 +11,7 @@ Implemented and verified:
 - Direct duplicate-`r` / nonce-reuse recovery.
 - Dedicated Stage0 direct duplicate-`r` recovery on `signatures.dup_r_focus.jsonl` before broader clustered recovery.
 - Delta / small linear nonce-relation search.
+- Reflected delta two-signature search: `k2 = -k1 + δ`.
 - Affine LCG relation search.
 - Known private-key propagation through local candidate files.
 - External `k` candidate validation through local candidate files.
@@ -482,44 +483,28 @@ venv/bin/python continuous_pipeline.py \
 ```
 python3 continuous_pipeline.py \
   --start-height "$(cat last_processed_block.txt)" \
-  --batch-size 100 \
-  --threads 8 \
+  --batch-size 50 \
+  --max-cycles 1 \
+  --threads 4 \
   --python venv/bin/python \
-  --discovery-mode max \
+  --discovery-mode balanced \
+  --enable-sqlite-index \
   --enable-workset \
-  --workset-tail-lines 250000 \
-  --workset-max-rows 500000 \
-  --workset-recovered-keys recovered_keys.jsonl \
-  --workset-recovered-k recovered_k.jsonl \
-  --cumulative-recovered-keys recovered_keys.jsonl \
-  --cumulative-recovered-k recovered_k.jsonl \
+  --workset-tail-lines 100000 \
+  --workset-max-rows 150000 \
   --enable-pubkey-expansion \
-  --pubkey-expansion-phase before-recovery \
-  --pubkey-expansion-max-pubkeys 75 \
-  --pubkey-expansion-max-pages-per-address 3 \
-  --pubkey-expansion-max-txs-per-address 100 \
-  --relation-min-sigs 8 \
-  --relation-max-signers 150 \
-  --relation-max-rows-per-signer 384 \
-  --relation-neighbor-window 2 \
-  --delta-max 8192 \
-  --delta-per-pair-cap 8192 \
-  --lcg-a-max 8 \
-  --lcg-b-max 8192 \
-  --lcg-per-pair-cap 4096 \
-  --random-k-budget 1024 \
-  --hnp-timeout-sec 120 \
+  --pubkey-expansion-phase both \
+  --pubkey-expansion-max-pubkeys 15 \
+  --pubkey-expansion-max-pages-per-address 1 \
+  --pubkey-expansion-max-txs-per-address 25 \
+  --relation-max-signers 30 \
+  --relation-max-rows-per-signer 96 \
+  --relation-max-pairs-per-signer 2048 \
+  --random-k-budget 4 \
+  --fallback-random-k-budget 4 \
+  --hnp-timeout-sec 60 \
   --hnp-min-leaks 8 \
-  --hnp-bits-known 6 \
-  --hnp-leakage-model LSB \
-  --hnp-bruteforce-unknown-bits 18 \
-  --hnp-bruteforce-max-candidates 200000 \
-  --enable-nonce-hypotheses \
-  --nonce-hypothesis-models timestamp-direct,timestamp-sha256,height-direct,height-sha256,txid-sha256,txid-vin-sha256,txid-vin-sighash-sha256 \
-  --nonce-time-window-sec 2 \
-  --nonce-time-step-sec 1 \
-  --nonce-counter-max 3 \
-  --nonce-max-candidates 200000 \
+  --preload-k-candidates candidate_k.jsonl \
   --enable-advanced-recover
   ```
 
@@ -737,6 +722,74 @@ print('dup_instances', sum(v - 1 for v in c.values() if v > 1))
 PY
 ```
 
+Build a persistent SQLite index for large `signatures.jsonl` files:
+
+```bash
+venv/bin/python signature_sqlite_index.py build \
+  --db signatures.index.sqlite \
+  --input signatures.jsonl \
+  --report-out signature_index_build_report.json
+```
+
+Run full automated recovery with SQLite-backed subset extraction:
+
+```bash
+python3 continuous_pipeline.py \
+  --start-height "$(cat last_processed_block.txt)" \
+  --batch-size 100 \
+  --threads 8 \
+  --python venv/bin/python \
+  --discovery-mode max \
+  --enable-sqlite-index \
+  --enable-workset \
+  --workset-tail-lines 250000 \
+  --workset-max-rows 500000 \
+  --enable-pubkey-expansion \
+  --pubkey-expansion-phase before-recovery \
+  --pubkey-expansion-max-pubkeys 30 \
+  --pubkey-expansion-max-pages-per-address 2 \
+  --pubkey-expansion-max-txs-per-address 50 \
+  --relation-max-signers 80 \
+  --relation-max-rows-per-signer 128 \
+  --relation-max-pairs-per-signer 4096 \
+  --random-k-budget 16 \
+  --fallback-random-k-budget 16 \
+  --hnp-timeout-sec 120 \
+  --hnp-min-leaks 8 \
+  --preload-k-candidates candidate_k.jsonl \
+  --enable-advanced-recover
+```
+
+For faster extraction at higher disk cost, add `--sqlite-index-store-raw`.
+
+Summarize indexed duplicate-r and target-pubkey coverage:
+
+```bash
+venv/bin/python signature_sqlite_index.py report \
+  --db signatures.index.sqlite \
+  --report-out signature_index_report.json
+```
+
+Extract only recoverable duplicate-r rows from the index:
+
+```bash
+venv/bin/python signature_sqlite_index.py extract-duplicate-r \
+  --db signatures.index.sqlite \
+  --recoverable-only \
+  --out signatures.index.dup_r_recoverable.jsonl \
+  --report-out signature_index_dup_r_extract_report.json
+```
+
+Extract all rows for one public key. Compressed and uncompressed SEC forms are matched when `coincurve` is available:
+
+```bash
+venv/bin/python signature_sqlite_index.py extract-target-pubkey \
+  --db signatures.index.sqlite \
+  --target-pubkey <COMPRESSED_OR_UNCOMPRESSED_PUBKEY_HEX> \
+  --out signatures.index.target.jsonl \
+  --report-out signature_index_target_report.json
+```
+
 Copy only reports from another machine:
 
 ```bash
@@ -763,6 +816,7 @@ automate_recover.py           audit + recovery orchestration
 ecdsa_recover_strict.cpp      C++ recovery/validation engine
 continuous_pipeline.py        repeated download + audit + recover cycles
 dedup_signatures.py           offline exact-row deduplication
+signature_sqlite_index.py     persistent SQLite index for large JSONL scans
 hnp_lll_bkz_solver.py         experimental HNP diagnostics/regression
 requirements.txt              Python dependencies
 runs/                         cycle-local pipeline artifacts

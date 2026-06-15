@@ -81,6 +81,9 @@ def load_observed(
     missing_height = 0
     missing_txid = 0
     missing_vin = 0
+    missing_sighash = 0
+    missing_pubkey = 0
+    missing_prevout = 0
     skipped_bad = 0
 
     with sig_path.open("r", encoding="utf-8") as f:
@@ -115,7 +118,16 @@ def load_observed(
                 missing_txid += 1
             if not row_field(obj, "vin", "input_index"):
                 missing_vin += 1
+            if not row_field(obj, "sighash"):
+                missing_sighash += 1
+            if not normalize_pubkey_hex(str(obj.get("pubkey_hex") or obj.get("pub") or "")):
+                missing_pubkey += 1
+            if not row_field(obj, "prev_txid"):
+                missing_prevout += 1
             observed.setdefault(r, obj)
+
+    def present(missing: int) -> int:
+        return max(0, usable - int(missing))
 
     meta = {
         "total_rows": total,
@@ -127,9 +139,69 @@ def load_observed(
         "missing_block_height_rows": missing_height,
         "missing_txid_rows": missing_txid,
         "missing_vin_rows": missing_vin,
+        "missing_sighash_rows": missing_sighash,
+        "missing_pubkey_rows": missing_pubkey,
+        "missing_prevout_rows": missing_prevout,
+        "field_availability": {
+            "block_time_rows": present(missing_time),
+            "block_height_rows": present(missing_height),
+            "txid_rows": present(missing_txid),
+            "vin_rows": present(missing_vin),
+            "sighash_rows": present(missing_sighash),
+            "pubkey_rows": present(missing_pubkey),
+            "prevout_rows": present(missing_prevout),
+        },
         "skipped_bad_rows": skipped_bad,
     }
     return observed, meta
+
+
+MODEL_FIELD_REQUIREMENTS: dict[str, tuple[str, ...]] = {
+    "timestamp-direct": ("block_time",),
+    "timestamp-sha256": ("block_time",),
+    "timestamp-counter-sha256": ("block_time",),
+    "height-direct": ("block_height",),
+    "height-sha256": ("block_height",),
+    "height-counter-sha256": ("block_height",),
+    "txid-sha256": ("txid",),
+    "txid-vin-sha256": ("txid", "vin"),
+    "txid-vin-sighash-sha256": ("txid", "vin", "sighash"),
+    "pubkey-txid-vin-sha256": ("pubkey", "txid", "vin"),
+    "prevout-txid-vin-sha256": ("prevout", "txid", "vin"),
+    "timestamp-txid-vin-sha256": ("block_time", "txid", "vin"),
+    "timestamp-pubkey-counter-sha256": ("block_time", "pubkey"),
+    "height-txid-vin-sha256": ("block_height", "txid", "vin"),
+    "height-pubkey-counter-sha256": ("block_height", "pubkey"),
+    "height-time-txid-vin-sha256": ("block_height", "block_time", "txid", "vin"),
+    "pubkey-height-time-txid-vin-sha256": ("pubkey", "block_height", "block_time", "txid", "vin"),
+}
+
+
+def model_readiness(models: set[str], observed_meta: dict[str, Any]) -> dict[str, Any]:
+    availability = observed_meta.get("field_availability", {}) or {}
+    field_to_key = {
+        "block_time": "block_time_rows",
+        "block_height": "block_height_rows",
+        "txid": "txid_rows",
+        "vin": "vin_rows",
+        "sighash": "sighash_rows",
+        "pubkey": "pubkey_rows",
+        "prevout": "prevout_rows",
+    }
+    rows: dict[str, dict[str, Any]] = {}
+    for model in sorted(models):
+        required = MODEL_FIELD_REQUIREMENTS.get(model, ())
+        missing_fields = [
+            field
+            for field in required
+            if int(availability.get(field_to_key.get(field, ""), 0) or 0) <= 0
+        ]
+        rows[model] = {
+            "required_fields": list(required),
+            "ready": not missing_fields,
+            "missing_fields": missing_fields,
+        }
+    return rows
 
 
 def candidate_stream_for_row(
@@ -298,6 +370,7 @@ def generate_candidates(
             "max_candidates": max_candidates,
         },
         "observed": meta,
+        "model_readiness": model_readiness(models, meta),
         "tested_candidates": tested,
         "matched_candidates": matched,
         "model_match_counts": model_counts,

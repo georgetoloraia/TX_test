@@ -54,6 +54,72 @@ def graceful_exit(signum, frame):
 
 DEFAULT_Q = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141  # secp256k1
 
+
+def hnp_feasibility(sample_count, bits_known, q, leakage_model="LSB"):
+    q_bits = int(q).bit_length()
+    n = max(0, int(sample_count))
+    bits = max(0, int(bits_known))
+    leakage_bits = n * bits
+    recommended_min = q_bits + 32
+    unknown_bits_per_nonce = max(0, q_bits - bits)
+    return {
+        "q_bits": q_bits,
+        "sample_count": n,
+        "bits_known": bits,
+        "leakage_model": str(leakage_model),
+        "leakage_bits": leakage_bits,
+        "recommended_min_leakage_bits": recommended_min,
+        "unknown_bits_per_nonce": unknown_bits_per_nonce,
+        "likely_solvable": leakage_bits >= recommended_min,
+        "reason": "ok" if leakage_bits >= recommended_min else "not_enough_leakage",
+    }
+
+
+def bounded_lsb_recovery(leaks, q, bits_known, max_candidates):
+    """Exact candidate extraction when known-LSB leakage leaves a small k-space.
+
+    This is a correctness fallback for explicit leaks. It does not guess private
+    keys; it enumerates the unknown nonce suffix only when bounded by
+    --max-candidates, derives d from ECDSA, and validates d against all leaks.
+    """
+    q_int = int(q)
+    bits = int(bits_known)
+    if bits <= 0:
+        return [], {"ran": False, "reason": "bad_bits_known"}
+    unknown_space = (q_int + (1 << bits) - 1) >> bits
+    if unknown_space > max(0, int(max_candidates)):
+        return [], {
+            "ran": False,
+            "reason": "unknown_space_too_large",
+            "unknown_space": int(unknown_space),
+            "max_candidates": int(max_candidates),
+        }
+    if not leaks:
+        return [], {"ran": False, "reason": "no_leaks"}
+
+    r0, s0, m0, known0 = leaks[0]
+    candidates = []
+    tested = 0
+    inv_r0 = pow(int(r0), -1, q_int)
+    for x in range(int(unknown_space)):
+        k = int(known0) + ((1 << bits) * x)
+        if not (1 <= k < q_int):
+            continue
+        tested += 1
+        d = ((int(s0) * k - int(m0)) * inv_r0) % q_int
+        score = candidate_score(d, leaks, q_int, bits)
+        if int(score.get("match_count", 0)) == len(leaks):
+            candidates.append(int(d))
+
+    unique = sorted(set(candidates))
+    return unique, {
+        "ran": True,
+        "reason": "ok",
+        "unknown_space": int(unknown_space),
+        "tested_candidates": int(tested),
+        "validated_candidates": len(unique),
+    }
+
 def sha256_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -897,6 +963,22 @@ def main():
             print("[E_PREFLIGHT_SAMPLE] Not enough valid leaks for attack. Aborting.")
             sys.exit(1)
 
+    feasibility = hnp_feasibility(
+        sample_count=len(leaks),
+        bits_known=bits_known,
+        q=q,
+        leakage_model=config.get("leakage_model", "LSB"),
+    )
+    save_json(feasibility, os.path.join(out_dir, "feasibility_report.json"))
+    if config.get("synthetic_test") and not feasibility["likely_solvable"]:
+        print(
+            "[SYNTHETIC] Infeasible regression instance:",
+            f"n={feasibility['sample_count']}",
+            f"bits_known={feasibility['bits_known']}",
+            f"leakage_bits={feasibility['leakage_bits']}",
+            f"recommended_min={feasibility['recommended_min_leakage_bits']}",
+        )
+
     # Preflight: memory guard
     memory_guard(config.get("max_memory_mb", 2048))
 
@@ -916,10 +998,9 @@ def main():
     # Lattice reduction & telemetry
 
     t0 = time.time()
+    q_int = int(config["q"], 0) if isinstance(config["q"], str) else int(config["q"])
+    bits_int = int(config["bits_known"])
     try:
-        q_int = int(config["q"], 0) if isinstance(config["q"], str) else int(config["q"])
-        bits_int = int(config["bits_known"])
-
         def run_variant(variant_name, leaks_local, bits_known_local, decode_mode_local=None):
             recover_private_key.leakage_model = config.get("leakage_model", "LSB")
             recover_private_key.debug_algo = bool(config.get("debug_algo", False))
@@ -1238,6 +1319,17 @@ def main():
         reduction_metrics = {"error": str(e)}
         candidates = []
         hnp_diag = {"summary": {"count": 0}, "rows": []}
+
+    bounded_candidates, bounded_report = bounded_lsb_recovery(
+        leaks,
+        q_int,
+        bits_int,
+        int(config.get("max_candidates", 1000) or 1000),
+    )
+    if bounded_candidates:
+        candidates = sorted(set([int(c) for c in candidates] + bounded_candidates))
+    reduction_metrics["feasibility"] = feasibility
+    reduction_metrics["bounded_lsb_fallback"] = bounded_report
     t1 = time.time()
     reduction_metrics["runtime_total_sec"] = t1 - t0
     reduction_metrics["input_count"] = len(leaks)
