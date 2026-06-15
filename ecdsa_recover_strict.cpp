@@ -464,7 +464,7 @@ static int try_primary_dupR(Ctx& C, Secp& S, const vector<Row>& rows,
         gp[rows[i].r_hex + "|" + rows[i].pub].push_back(i);
     }
     int found=0;
-    BNWrap denom, k, rinv, tmp;
+    BNWrap denom, k, k2, rinv, tmp, chk1, chk2;
     for(auto& kv: gp){
         auto& idxs=kv.second;
         if((int)idxs.size()<2) continue;
@@ -478,18 +478,22 @@ static int try_primary_dupR(Ctx& C, Secp& S, const vector<Row>& rows,
                     else        BN_mod_add(denom.n,R1.s.n,R2.s.n,C.N,C.ctx);
                     if(BN_is_zero(denom.n)) continue;
                     if(!bn_invm(C, denom.n, denom.n)) continue;
-                    if(path==0) BN_mod_sub(k.n,R1.z.n,R2.z.n,C.N,C.ctx);
-                    else        BN_mod_add(k.n,R1.z.n,R2.z.n,C.N,C.ctx);
+                    BN_mod_sub(k.n,R1.z.n,R2.z.n,C.N,C.ctx);
                     bn_mulm(C, k.n, denom.n, k.n);
                     if(BN_is_zero(k.n)) continue;
 
                     // r-from-k verification
                     if(!r_from_k_matches(C, S, R1.r_hex, k.n)) continue;
+                    if(path==0) BN_copy(k2.n, k.n);
+                    else        BN_mod_sub(k2.n, C.N, k.n, C.N, C.ctx);
+                    if(BN_is_zero(k2.n)) continue;
 
                     if(!bn_invm(C, R1.r.n, rinv.n)) continue;
                     BN_mod_mul(tmp.n, R1.s.n, k.n, C.N, C.ctx);
                     BN_mod_sub(tmp.n, tmp.n, R1.z.n, C.N, C.ctx);
                     bn_mulm(C, tmp.n, rinv.n, tmp.n); // tmp=d
+                    if(!ecdsa_ok(C, R1.s.n, R1.z.n, R1.r.n, tmp.n, k.n, chk1, chk2)) continue;
+                    if(!ecdsa_ok(C, R2.s.n, R2.z.n, R2.r.n, tmp.n, k2.n, chk1, chk2)) continue;
                     string dhex = bn_hex(tmp.n);
                     auto pubs = S.pub_from_priv_bn(dhex);
                     if(R1.pub==pubs.first || R1.pub==pubs.second){
@@ -753,7 +757,7 @@ static int lcg_scan_bucket(Ctx& C, Secp& S, const vector<Row>& rows,
                 for(long long da = -a_max; da <= a_max && !found; ++da){
                     for(long long bb = -b_max; bb <= b_max; ++bb){
                         if(try_ab(da, bb)){ found=true; break; }
-                        if(++tried >= local_cap) break;
+                        if(tried >= local_cap) break;
                     }
                 }
             }

@@ -1023,6 +1023,8 @@ def build_duplicate_r_focus_subset(
                     group_kind = "exact_replay"
                 elif len(s_set) == 1 and len(z_set) > 1:
                     same_r_same_s_diff_z_groups += 1
+                    nontrivial_groups += 1
+                    is_nontrivial = True
                     group_kind = "same_r_same_s_diff_z"
                 elif len(s_set) > 1:
                     same_r_diff_s_groups += 1
@@ -1289,6 +1291,9 @@ def build_duplicate_r_pair_diagnostics(
     pair_reason_counts: Counter[str] = Counter()
     row_verification_counts: Counter[str] = Counter()
     z_recompute_counts: Counter[str] = Counter()
+    z_recompute_by_context_source: Counter[str] = Counter()
+    trusted_z_recompute_counts: Counter[str] = Counter()
+    untrusted_z_recompute_counts: Counter[str] = Counter()
     group_reports: list[dict[str, Any]] = []
     pair_samples: list[dict[str, Any]] = []
     total_pairs = 0
@@ -1346,8 +1351,17 @@ def build_duplicate_r_pair_diagnostics(
                 row_reasons.append(f"signature_{verify_reason}")
             z_ok, z_reason = _recompute_z_from_context(obj)
             z_recompute_counts[z_reason] += 1
+            ctx_source = str(obj.get("sighash_context_source") or "unknown")
+            z_recompute_by_context_source[f"{ctx_source}:{z_reason}"] += 1
+            if ctx_source == "extraction_match":
+                trusted_z_recompute_counts[z_reason] += 1
+            elif ctx_source == "row_fallback_unverified":
+                untrusted_z_recompute_counts[z_reason] += 1
             if z_ok is False:
-                row_reasons.append(z_reason)
+                if ctx_source == "row_fallback_unverified":
+                    row_reasons.append(f"{z_reason}_untrusted_context")
+                else:
+                    row_reasons.append(z_reason)
             for reason in row_reasons:
                 row_reason_counts[reason] += 1
             row_summaries.append(
@@ -1355,6 +1369,7 @@ def build_duplicate_r_pair_diagnostics(
                     **_safe_row_id(obj, idx),
                     "signature_verification": verify_reason,
                     "z_recompute": z_reason,
+                    "sighash_context_source": ctx_source,
                     "sighash_byte": sighash_byte,
                     "row_sighash": obj.get("sighash"),
                     "reasons": row_reasons,
@@ -1384,47 +1399,60 @@ def build_duplicate_r_pair_diagnostics(
                     if len(pair_samples) < max_pair_samples:
                         pair_samples.append({"r": format(r, "064x"), "reason": reason, "rows": [_safe_row_id(x1, i1), _safe_row_id(x2, i2)]})
                     continue
-                if s1 == s2:
-                    reason = "same_s_noninvertible"
-                    pair_reason_counts[reason] += 1
-                    group_pair_reasons[reason] += 1
-                    continue
                 if z1 == z2:
                     reason = "same_z_no_nonce_reuse_signal"
                     pair_reason_counts[reason] += 1
                     group_pair_reasons[reason] += 1
                     continue
-                denom = (s1 - s2) % SECP256K1_N
-                if denom == 0 or r_inv is None:
-                    reason = "bad_inverse"
-                    pair_reason_counts[reason] += 1
-                    group_pair_reasons[reason] += 1
-                    continue
                 direct_candidate_pairs += 1
                 group_direct += 1
-                k = ((z1 - z2) % SECP256K1_N) * pow(denom, -1, SECP256K1_N) % SECP256K1_N
-                d = (((s1 * k - z1) % SECP256K1_N) * r_inv) % SECP256K1_N
-                lhs1 = (s1 * k - z1) % SECP256K1_N
-                lhs2 = (s2 * k - z2) % SECP256K1_N
-                rhs = (r * d) % SECP256K1_N
-                if lhs1 != rhs or lhs2 != rhs:
-                    reason = "algebraic_equation_failed"
-                    pair_reason_counts[reason] += 1
-                    group_pair_reasons[reason] += 1
-                    continue
-                match, match_reason = _derived_pubkey_matches(d, {p for p in (pub1, pub2) if p})
-                if match:
-                    reason = "direct_recovery_valid"
+                branch_results: list[str] = []
+                valid_branch = ""
+                for branch, denom in (
+                    ("same_k", (s1 - s2) % SECP256K1_N),
+                    ("negated_k", (s1 + s2) % SECP256K1_N),
+                ):
+                    if denom == 0 or r_inv is None:
+                        branch_results.append(f"{branch}:bad_inverse")
+                        continue
+                    k = ((z1 - z2) % SECP256K1_N) * pow(denom, -1, SECP256K1_N) % SECP256K1_N
+                    if k == 0:
+                        branch_results.append(f"{branch}:zero_k")
+                        continue
+                    k2 = k if branch == "same_k" else (-k) % SECP256K1_N
+                    if k2 == 0:
+                        branch_results.append(f"{branch}:zero_k2")
+                        continue
+                    d = (((s1 * k - z1) % SECP256K1_N) * r_inv) % SECP256K1_N
+                    lhs1 = (s1 * k - z1) % SECP256K1_N
+                    lhs2 = (s2 * k2 - z2) % SECP256K1_N
+                    rhs = (r * d) % SECP256K1_N
+                    if lhs1 != rhs or lhs2 != rhs:
+                        branch_results.append(f"{branch}:algebraic_equation_failed")
+                        continue
+                    match, match_reason = _derived_pubkey_matches(d, {p for p in (pub1, pub2) if p})
+                    if match:
+                        valid_branch = branch
+                        break
+                    if match is False:
+                        branch_results.append(f"{branch}:derived_pubkey_mismatch")
+                    else:
+                        branch_results.append(f"{branch}:{match_reason}")
+                if valid_branch:
+                    reason = f"direct_recovery_valid_{valid_branch}"
                     direct_valid_pairs += 1
                     group_valid += 1
-                elif match is False:
-                    reason = "derived_pubkey_mismatch"
                 else:
-                    reason = match_reason
+                    reason = "direct_recovery_failed_all_branches"
                 pair_reason_counts[reason] += 1
                 group_pair_reasons[reason] += 1
                 if len(pair_samples) < max_pair_samples:
-                    pair_samples.append({"r": format(r, "064x"), "reason": reason, "rows": [_safe_row_id(x1, i1), _safe_row_id(x2, i2)]})
+                    pair_samples.append({
+                        "r": format(r, "064x"),
+                        "reason": reason,
+                        "branch_results": branch_results,
+                        "rows": [_safe_row_id(x1, i1), _safe_row_id(x2, i2)],
+                    })
 
         pubs = {
             normalize_pubkey_hex(str(obj.get("pubkey_hex") or obj.get("pub") or ""))
@@ -1457,9 +1485,14 @@ def build_duplicate_r_pair_diagnostics(
         "row_reason_counts": dict(row_reason_counts),
         "row_verification_counts": dict(row_verification_counts),
         "z_recompute_counts": dict(z_recompute_counts),
+        "z_recompute_by_context_source": dict(z_recompute_by_context_source),
+        "trusted_z_recompute_counts": dict(trusted_z_recompute_counts),
+        "untrusted_z_recompute_counts": dict(untrusted_z_recompute_counts),
         "sighash_reconstruction": {
             "available": bool(z_recompute_counts and any(k in z_recompute_counts for k in ("z_recompute_match", "z_recompute_mismatch"))),
-            "reason": "z is recomputed for rows carrying sighash_context; older rows without context are reported as missing_sighash_context",
+            "trusted_context_source": "extraction_match",
+            "untrusted_context_source": "row_fallback_unverified",
+            "reason": "z is recomputed for rows carrying sighash_context; extraction_match is authoritative, row_fallback_unverified is diagnostic only",
             "required_fields": ["sighash_context.version", "sighash_context.locktime", "sighash_context.inputs", "sighash_context.outputs", "sighash_context.script_code", "sighash"],
         },
         "groups": group_reports,
@@ -1485,6 +1518,9 @@ def summarize_duplicate_r_pair_diagnostics(report: dict[str, Any]) -> dict[str, 
         "pair_reason_counts": report.get("pair_reason_counts", {}),
         "row_verification_counts": report.get("row_verification_counts", {}),
         "z_recompute_counts": report.get("z_recompute_counts", {}),
+        "z_recompute_by_context_source": report.get("z_recompute_by_context_source", {}),
+        "trusted_z_recompute_counts": report.get("trusted_z_recompute_counts", {}),
+        "untrusted_z_recompute_counts": report.get("untrusted_z_recompute_counts", {}),
         "sighash_reconstruction": report.get("sighash_reconstruction", {}),
     }
 
@@ -2029,6 +2065,7 @@ def build_signer_relation_neighborhood_subset(
     min_sigs: int,
     max_signers: int,
     max_rows_per_signer: int,
+    max_pairs_per_signer: int,
     neighbor_window: int,
 ) -> dict[str, Any]:
     """Build a bounded signer-local subset for delta/affine nonce-relation scans.
@@ -2104,24 +2141,31 @@ def build_signer_relation_neighborhood_subset(
         ),
         reverse=True,
     )
+    eligible_signer_count = len(signer_stats)
     if max_signers > 0:
         signer_stats = signer_stats[:max_signers]
 
     selected_raw: dict[tuple[str, str, int], str] = {}
     top_report = []
     rows_per_signer = max(2, int(max_rows_per_signer))
+    pair_budget = max(1, int(max_pairs_per_signer))
+    # Relation stages are quadratic per signer. Enforce a row cap derived from
+    # n*(n-1)/2 <= pair_budget so a single active pubkey cannot dominate a run.
+    pair_budget_rows = max(2, int((1 + math.isqrt(1 + 8 * pair_budget)) // 2))
+    effective_rows_per_signer = min(rows_per_signer, pair_budget_rows)
     window = max(1, int(neighbor_window))
+    estimated_pairs_total = 0
     for stat in signer_stats:
         pub = stat["pub"]
         ordered = sorted(
             stat["rows"],
             key=lambda item: _signature_order_key(item[2], item[0]),
         )
-        if len(ordered) > rows_per_signer:
+        if len(ordered) > effective_rows_per_signer:
             # Preserve the newest rows and a deterministic prefix sample. This
             # keeps old anomalies reachable while bounding per-signer cost.
-            head_n = max(0, min(len(ordered), rows_per_signer // 4))
-            tail_n = rows_per_signer - head_n
+            head_n = max(0, min(len(ordered), effective_rows_per_signer // 4))
+            tail_n = effective_rows_per_signer - head_n
             ordered = ordered[:head_n] + ordered[-tail_n:]
 
         signer_selected = 0
@@ -2152,12 +2196,14 @@ def build_signer_relation_neighborhood_subset(
                 "pubkey_prefix": pub[:20],
                 "source_rows": stat["count"],
                 "selected_rows": signer_selected,
+                "estimated_pairs": signer_selected * (signer_selected - 1) // 2,
                 "dup_r_values": stat["dup_r_values"],
                 "dup_r_events": stat["dup_r_events"],
                 "recovered_pubkey": stat["recovered_pubkey"],
                 "recovered_r_hits": stat["recovered_r_hits"],
             }
         )
+        estimated_pairs_total += signer_selected * (signer_selected - 1) // 2
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as out:
@@ -2171,13 +2217,16 @@ def build_signer_relation_neighborhood_subset(
         "bad_json_rows": bad_json_rows,
         "missing_pubkey_rows": missing_pubkey_rows,
         "signer_groups_total": len(groups),
-        "eligible_signers": len([s for s in signer_stats if int(s["count"]) >= max(2, int(min_sigs))]),
+        "eligible_signers": eligible_signer_count,
         "selected_signers": len(signer_stats),
         "selected_rows": len(selected_raw),
+        "estimated_pairs_total": estimated_pairs_total,
         "policy": {
             "min_sigs": int(min_sigs),
             "max_signers": int(max_signers),
             "max_rows_per_signer": int(max_rows_per_signer),
+            "max_pairs_per_signer": int(max_pairs_per_signer),
+            "effective_rows_per_signer": int(effective_rows_per_signer),
             "neighbor_window": int(neighbor_window),
             "ranking": "recovered_pubkey+recovered_r+dup_r+count",
         },
@@ -2497,6 +2546,8 @@ def main() -> None:
                     help="Maximum signers selected for relation-neighborhood scans; 0 means no cap")
     ap.add_argument("--relation-max-rows-per-signer", type=int, default=512,
                     help="Maximum rows retained per signer before neighbor expansion")
+    ap.add_argument("--relation-max-pairs-per-signer", type=int, default=8192,
+                    help="Hard quadratic pair budget per signer for relation scans")
     ap.add_argument("--relation-neighbor-window", type=int, default=2,
                     help="Adjacent sorted rows retained around selected signer rows")
     ap.add_argument("--enable-chain-extraction", action="store_true", default=True,
@@ -3111,6 +3162,7 @@ def main() -> None:
             min_sigs=args.relation_min_sigs,
             max_signers=args.relation_max_signers,
             max_rows_per_signer=args.relation_max_rows_per_signer,
+            max_pairs_per_signer=args.relation_max_pairs_per_signer,
             neighbor_window=args.relation_neighbor_window,
         )
         if int(relation_subset_report.get("selected_rows", 0) or 0) >= 2:

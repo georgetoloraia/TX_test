@@ -704,6 +704,8 @@ def main() -> None:
                     help="Forward to automate_recover.py: maximum signers selected for relation-neighborhood scans")
     ap.add_argument("--relation-max-rows-per-signer", type=int, default=512,
                     help="Forward to automate_recover.py: max rows retained per signer for relation-neighborhood scans")
+    ap.add_argument("--relation-max-pairs-per-signer", type=int, default=8192,
+                    help="Forward to automate_recover.py: hard quadratic pair budget per signer for relation scans")
     ap.add_argument("--relation-neighbor-window", type=int, default=2,
                     help="Forward to automate_recover.py: adjacent rows retained around selected signer rows")
     ap.add_argument("--hnp-timeout-sec", type=int, default=120,
@@ -982,6 +984,7 @@ def main() -> None:
             "--relation-min-sigs", str(args.relation_min_sigs),
             "--relation-max-signers", str(args.relation_max_signers),
             "--relation-max-rows-per-signer", str(args.relation_max_rows_per_signer),
+            "--relation-max-pairs-per-signer", str(args.relation_max_pairs_per_signer),
             "--relation-neighbor-window", str(args.relation_neighbor_window),
             "--hnp-timeout-sec", str(args.hnp_timeout_sec),
             "--hnp-min-leaks", str(args.hnp_min_leaks),

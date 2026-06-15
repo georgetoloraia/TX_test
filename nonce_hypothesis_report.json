@@ -1,36 +1,35 @@
 {
-  "input": "signatures.dup_r_recoverable.jsonl",
+  "input": "signatures.hnp_leaks.jsonl",
   "output": "nonce_hypothesis_k.jsonl",
   "models": [
+    "height-counter-sha256",
     "height-direct",
     "height-sha256",
+    "timestamp-counter-sha256",
     "timestamp-direct",
-    "timestamp-sha256",
-    "txid-sha256",
-    "txid-vin-sha256",
-    "txid-vin-sighash-sha256"
+    "timestamp-sha256"
   ],
   "bounds": {
-    "time_window_sec": 3,
+    "time_window_sec": 2,
     "time_step_sec": 1,
-    "counter_max": 5,
+    "counter_max": 3,
     "small_k_start": 1,
     "small_k_end": 0,
-    "max_candidates": 500000
+    "max_candidates": 200000
   },
   "observed": {
-    "total_rows": 18,
-    "usable_rows": 18,
+    "total_rows": 0,
+    "usable_rows": 0,
     "target_pubkey": null,
     "target_matched_rows": null,
-    "unique_r": 5,
+    "unique_r": 0,
     "missing_block_time_rows": 0,
     "missing_block_height_rows": 0,
     "missing_txid_rows": 0,
     "missing_vin_rows": 0,
     "skipped_bad_rows": 0
   },
-  "tested_candidates": 140,
+  "tested_candidates": 0,
   "matched_candidates": 0,
   "model_match_counts": {},
   "stopped_by_budget": false
