@@ -22,6 +22,7 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
+from collections import Counter
 from pathlib import Path
 
 
@@ -439,6 +440,7 @@ def build_cycle_artifact_paths(run_dir: Path, cycle: int, cycle_start: int, args
     recovered_json = _resolve_artifact_path(args.recovered, "recovered_keys.jsonl", cycle_dir)
     for p in (audit_report, decision_report, recovered_json):
         p.parent.mkdir(parents=True, exist_ok=True)
+    Path(args.known_k_full_corpus_index_db).parent.mkdir(parents=True, exist_ok=True)
     return {
         "dir": cycle_dir,
         "audit_report": audit_report,
@@ -471,9 +473,18 @@ def build_cycle_artifact_paths(run_dir: Path, cycle: int, cycle_start: int, args
         "relation_neighborhood": cycle_dir / "signatures.relation_neighborhood.jsonl",
         "relation_neighborhood_report": cycle_dir / "relation_neighborhood_report.json",
         "recovery_chain_report": cycle_dir / "recovery_chain_report.json",
+        "recovery_store_report": cycle_dir / "recovery_store_report.json",
+        "known_k_chain_report": cycle_dir / "known_k_chain_report.json",
+        "known_priv_chain_report": cycle_dir / "known_priv_chain_report.json",
+        "known_k_full_corpus_report": cycle_dir / "known_k_full_corpus_report.json",
+        "known_k_full_corpus_sigs": cycle_dir / "signatures.known_k_full_corpus.jsonl",
+        "known_k_full_corpus_index_db": Path(args.known_k_full_corpus_index_db),
+        "known_k_full_corpus_index_report": cycle_dir / "known_k_full_corpus_index_report.json",
         "recovery_graph_subset": cycle_dir / "signatures.recovery_graph_focus.jsonl",
         "recovery_graph_report": cycle_dir / "recovery_graph_report.json",
         "recovery_graph_expansion_report": cycle_dir / "recovery_graph_expansion_report.json",
+        "unresolved_targets": cycle_dir / "signatures.unresolved_targets.jsonl",
+        "unresolved_targets_report": cycle_dir / "unresolved_recovery_targets.json",
         "pubkey_expansion_report": cycle_dir / "pubkey_expansion_report.json",
         "workset_sigs": cycle_dir / "signatures.workset.jsonl",
         "workset_report": cycle_dir / "recovery_workset_report.json",
@@ -593,6 +604,129 @@ def merge_jsonl_unique(src: Path, dst: Path, kind: str) -> dict[str, int | str]:
             report["added_rows"] = int(report["added_rows"]) + 1
     report["final_rows"] = count_lines(dst)
     return report
+
+
+def summarize_recovery_store(
+    recovered_keys_path: Path,
+    recovered_k_path: Path,
+    out_path: Path,
+    *,
+    cycle_dir: Path | None = None,
+    merge_reports: list[dict[str, int | str]] | None = None,
+) -> dict[str, object]:
+    """Write a metadata-only summary of local recovered artifacts."""
+    key_methods: Counter[str] = Counter()
+    key_sources: Counter[str] = Counter()
+    unique_key_facts: set[str] = set()
+    key_rows = key_bad_rows = 0
+
+    if recovered_keys_path.exists():
+        with recovered_keys_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                key_rows += 1
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    key_bad_rows += 1
+                    continue
+                if not isinstance(obj, dict):
+                    key_bad_rows += 1
+                    continue
+                unique_key_facts.add(_jsonl_dedup_key(raw, obj, "recovered_keys"))
+                key_methods[str(obj.get("method") or "unknown")] += 1
+                key_sources[str(obj.get("source") or "unknown")] += 1
+
+    k_methods: Counter[str] = Counter()
+    k_sources: Counter[str] = Counter()
+    unique_r: set[str] = set()
+    unique_rk_facts: set[str] = set()
+    k_rows = k_bad_rows = k_candidates_total = 0
+
+    if recovered_k_path.exists():
+        with recovered_k_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                k_rows += 1
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    k_bad_rows += 1
+                    continue
+                if not isinstance(obj, dict):
+                    k_bad_rows += 1
+                    continue
+                unique_rk_facts.add(_jsonl_dedup_key(raw, obj, "recovered_k"))
+                if obj.get("r") is not None:
+                    unique_r.add(str(obj.get("r")))
+                if obj.get("k") is not None:
+                    k_candidates_total += 1
+                if isinstance(obj.get("k_candidates"), list):
+                    k_candidates_total += len(obj.get("k_candidates") or [])
+                k_methods[str(obj.get("method") or "unknown")] += 1
+                k_sources[str(obj.get("source") or "unknown")] += 1
+
+    report: dict[str, object] = {
+        "recovered_keys": str(recovered_keys_path),
+        "recovered_k": str(recovered_k_path),
+        "cycle_dir": str(cycle_dir) if cycle_dir else "",
+        "priv_material": "LOCAL_ARTIFACT_ONLY",
+        "recovered_keys_rows": key_rows,
+        "recovered_keys_bad_rows": key_bad_rows,
+        "recovered_keys_unique_facts": len(unique_key_facts),
+        "recovered_keys_duplicate_rows_estimate": max(0, key_rows - key_bad_rows - len(unique_key_facts)),
+        "recovered_key_methods": dict(key_methods),
+        "recovered_key_sources": dict(key_sources),
+        "recovered_k_rows": k_rows,
+        "recovered_k_bad_rows": k_bad_rows,
+        "recovered_k_unique_r": len(unique_r),
+        "recovered_k_unique_facts": len(unique_rk_facts),
+        "recovered_k_candidate_values_total": k_candidates_total,
+        "recovered_k_duplicate_rows_estimate": max(0, k_rows - k_bad_rows - len(unique_rk_facts)),
+        "recovered_k_methods": dict(k_methods),
+        "recovered_k_sources": dict(k_sources),
+        "recovered_keys_sha256": file_sha256(recovered_keys_path),
+        "recovered_k_sha256": file_sha256(recovered_k_path),
+        "merge_reports": merge_reports or [],
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return report
+
+
+def enrich_decision_with_cumulative_recovery(
+    decision: dict[str, object],
+    *,
+    new_unique_recovered_keys: int,
+    cycle_local_recovered_rows: int,
+    new_recovered_k_rows: int,
+    recovery_store_report_path: Path,
+    cycle_recovery_store_report_path: Path,
+    store_report: dict[str, object],
+) -> dict[str, object]:
+    """Add cumulative/global recovery semantics to a cycle-local decision."""
+    out = dict(decision)
+    out["cycle_local_key_recovered"] = bool(decision.get("key_recovered") or decision.get("new_key_recovered"))
+    out["cycle_local_recovered_rows"] = int(cycle_local_recovered_rows)
+    out["new_unique_recovered_keys"] = int(new_unique_recovered_keys)
+    out["new_recovered_k_rows"] = int(new_recovered_k_rows)
+    out["new_global_key_recovered"] = int(new_unique_recovered_keys) > 0
+    out["cumulative_recovered_keys"] = int(store_report.get("recovered_keys_unique_facts", 0) or 0)
+    out["cumulative_recovered_k_unique_r"] = int(store_report.get("recovered_k_unique_r", 0) or 0)
+    out["cumulative_recovery_store"] = {
+        "report": str(recovery_store_report_path),
+        "cycle_report": str(cycle_recovery_store_report_path),
+        "recovered_keys_unique_facts": int(store_report.get("recovered_keys_unique_facts", 0) or 0),
+        "recovered_k_unique_r": int(store_report.get("recovered_k_unique_r", 0) or 0),
+        "recovered_keys_sha256": str(store_report.get("recovered_keys_sha256", "")),
+        "recovered_k_sha256": str(store_report.get("recovered_k_sha256", "")),
+        "priv_material": "LOCAL_ARTIFACT_ONLY",
+    }
+    return out
 
 
 def latest_existing_artifact_names(names: list[str], runs_dir: Path) -> list[Path]:
@@ -751,6 +885,20 @@ def main() -> None:
                     help="Cumulative recovered_keys.jsonl passed into each cycle recovery graph")
     ap.add_argument("--cumulative-recovered-k", default="recovered_k.jsonl",
                     help="Cumulative recovered_k.jsonl passed into each cycle as preload-k when no explicit preload is set")
+    ap.add_argument("--recovery-store-report", default="recovery_store_report.json",
+                    help="Metadata-only cumulative recovery store summary written after each cycle")
+    ap.add_argument("--known-k-full-corpus-index-db", default="known_k_full_corpus.index.sqlite",
+                    help="Persistent SQLite index used for full-corpus known-k propagation across runs")
+    ap.add_argument("--build-known-k-full-corpus-index", action="store_true",
+                    help="Allow automate_recover.py to build/update the persistent full-corpus known-k index during recovery")
+    ap.add_argument("--skip-broad-relation-when-resolved", action="store_true", default=True,
+                    help="Forward to automate_recover.py: skip broad relation/fallback scans when no unresolved evidence remains")
+    ap.add_argument("--no-skip-broad-relation-when-resolved", action="store_false", dest="skip_broad_relation_when_resolved",
+                    help="Forward to automate_recover.py: keep broad relation/fallback scans even when evidence is already explained")
+    ap.add_argument("--enable-suspicious-signer-relation", action="store_true", default=True,
+                    help="Forward to automate_recover.py: run bounded relation scans on audit-flagged signer cohorts")
+    ap.add_argument("--no-enable-suspicious-signer-relation", action="store_false", dest="enable_suspicious_signer_relation",
+                    help="Forward to automate_recover.py: disable audit-flagged signer relation fallback")
 
     ap.add_argument("--signatures", default="signatures.jsonl")
     ap.add_argument("--recovered", default="recovered_keys.jsonl")
@@ -783,11 +931,26 @@ def main() -> None:
     ap.add_argument("--nonce-hypothesis-models",
                     default=(
                         "timestamp-direct,timestamp-sha256,height-direct,height-sha256,"
-                        "txid-sha256,txid-vin-sha256,txid-vin-sighash-sha256,"
-                        "pubkey-txid-vin-sha256,prevout-txid-vin-sha256,"
-                        "timestamp-txid-vin-sha256,timestamp-pubkey-counter-sha256,"
-                        "height-txid-vin-sha256,height-pubkey-counter-sha256,"
-                        "height-time-txid-vin-sha256,pubkey-height-time-txid-vin-sha256"
+                        "txid-sha256,txid-le-sha256,txid-dsha256,txid-le-dsha256,"
+                        "txid-low64-direct,txid-low128-direct,txid-vin-sha256,txid-vin-bin-sha256,"
+                        "txid-vin-counter-sha256,txid-vin-counter-dsha256,txid-vin-bin-dsha256,"
+                        "txid-vin-sighash-sha256,txid-vin-sighash-bin-sha256,"
+                        "txid-lcg32-raw,txid-lcg32-sha256,txid-xorshift32-raw,txid-xorshift32-sha256,"
+                        "pubkey-txid-vin-sha256,pubkey-txid-vin-bin-sha256,pubkey-txid-vin-dsha256,"
+                        "pubkey-txid-vin-counter-sha256,prevout-txid-vin-sha256,prevout-txid-vin-bin-sha256,"
+                        "prevout-counter-sha256,prevout-counter-dsha256,z-direct,z-sha256,z-dsha256,"
+                        "z-low64-direct,z-low128-direct,z-counter-sha256,z-vin-counter-sha256,"
+                        "z-pubkey-counter-sha256,z-lcg32-raw,z-lcg32-sha256,z-xorshift32-raw,z-xorshift32-sha256,"
+                        "timestamp-txid-vin-sha256,timestamp-le32-sha256,"
+                        "timestamp-le64-sha256,timestamp-pubkey-counter-sha256,timestamp-counter-lcg32-raw,"
+                        "timestamp-counter-lcg32-sha256,timestamp-counter-ansi-rand-raw,timestamp-counter-ansi-rand-sha256,"
+                        "timestamp-counter-xorshift32-raw,timestamp-counter-xorshift32-sha256,height-txid-vin-sha256,"
+                        "height-le32-sha256,height-le64-sha256,height-pubkey-counter-sha256,"
+                        "height-counter-lcg32-raw,height-counter-lcg32-sha256,height-counter-ansi-rand-raw,"
+                        "height-counter-ansi-rand-sha256,height-counter-xorshift32-raw,height-counter-xorshift32-sha256,"
+                        "height-time-txid-vin-sha256,height-time-counter-sha256,timestamp-height-counter-sha256,"
+                        "pubkey-height-time-txid-vin-sha256,"
+                        "pubkey-height-time-txid-vin-bin-sha256"
                     ),
                     help="Comma-separated candidate_hypotheses.py models")
     ap.add_argument("--nonce-time-window-sec", type=int, default=0)
@@ -949,6 +1112,7 @@ def main() -> None:
                     "recovery_graph_report.json",
                     "recovery_chain_report.json",
                     "recovery_graph_expansion_report.json",
+                    "known_priv_chain_report.json",
                 ],
                 Path(args.runs_dir),
             )
@@ -1039,9 +1203,18 @@ def main() -> None:
             "--relation-neighborhood-out", str(cycle_artifacts["relation_neighborhood"]),
             "--relation-neighborhood-report", str(cycle_artifacts["relation_neighborhood_report"]),
             "--recovery-chain-report", str(cycle_artifacts["recovery_chain_report"]),
+            "--known-k-chain-report", str(cycle_artifacts["known_k_chain_report"]),
+            "--known-priv-chain-report", str(cycle_artifacts["known_priv_chain_report"]),
+            "--known-k-full-corpus-sigs", args.signatures,
+            "--known-k-full-corpus-report", str(cycle_artifacts["known_k_full_corpus_report"]),
+            "--known-k-full-corpus-out", str(cycle_artifacts["known_k_full_corpus_sigs"]),
+            "--known-k-full-corpus-index-db", str(cycle_artifacts["known_k_full_corpus_index_db"]),
+            "--known-k-full-corpus-index-report", str(cycle_artifacts["known_k_full_corpus_index_report"]),
             "--recovery-graph-subset-out", str(cycle_artifacts["recovery_graph_subset"]),
             "--recovery-graph-report", str(cycle_artifacts["recovery_graph_report"]),
             "--recovery-graph-expansion-report", str(cycle_artifacts["recovery_graph_expansion_report"]),
+            "--unresolved-targets-out", str(cycle_artifacts["unresolved_targets"]),
+            "--unresolved-targets-report", str(cycle_artifacts["unresolved_targets_report"]),
             "--fallback-max-iter", str(max(4 if args.discovery_mode == "max" else 3, effective["max_iter"])),
             "--fallback-random-k-budget", str(resolve_fallback_random_k_budget(args, effective)),
         ]
@@ -1061,6 +1234,12 @@ def main() -> None:
             recover_cmd += ["--target-pubkey", args.target_pubkey]
         if args.enable_sqlite_index:
             recover_cmd.append("--enable-sqlite-index")
+        if args.build_known_k_full_corpus_index:
+            recover_cmd.append("--build-known-k-full-corpus-index")
+        if not args.skip_broad_relation_when_resolved:
+            recover_cmd.append("--no-skip-broad-relation-when-resolved")
+        if not args.enable_suspicious_signer_relation:
+            recover_cmd.append("--no-enable-suspicious-signer-relation")
         if args.sqlite_index_store_raw:
             recover_cmd.append("--sqlite-index-store-raw")
         if args.enable_nonce_hypotheses:
@@ -1093,10 +1272,12 @@ def main() -> None:
             continue
 
         after_recovered = count_lines(cycle_artifacts["recovered_json"])
-        new_rows = max(0, after_recovered - before_recovered)
+        cycle_local_new_rows = max(0, after_recovered - before_recovered)
         cumulative_merge_reports: list[dict[str, int | str]] = []
         cumulative_keys = Path(args.cumulative_recovered_keys)
         cumulative_k = Path(args.cumulative_recovered_k)
+        added_keys = 0
+        added_k = 0
         if cycle_artifacts["recovered_json"].exists():
             cumulative_merge_reports.append(
                 merge_jsonl_unique(cycle_artifacts["recovered_json"], cumulative_keys, "recovered_keys")
@@ -1122,7 +1303,26 @@ def main() -> None:
                 f"recovered_k_added={added_k}",
                 "priv_material=LOCAL_ARTIFACT_ONLY",
             )
-        print(f"Cycle {cycle} complete: recovered_new_rows={new_rows}")
+        store_report = summarize_recovery_store(
+            cumulative_keys,
+            cumulative_k,
+            Path(args.recovery_store_report),
+            cycle_dir=cycle_artifacts["dir"],
+            merge_reports=cumulative_merge_reports,
+        )
+        cycle_artifacts["recovery_store_report"].write_text(
+            json.dumps(store_report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        new_rows = added_keys
+        print(
+            f"Cycle {cycle} complete:",
+            f"new_unique_recovered_keys={new_rows}",
+            f"cycle_local_recovered_rows={cycle_local_new_rows}",
+            f"new_recovered_k_rows={added_k}",
+            f"store_keys={store_report.get('recovered_keys_unique_facts', 0)}",
+            f"store_known_r={store_report.get('recovered_k_unique_r', 0)}",
+        )
 
         anomaly_alert = None
         anomaly_fingerprint_value = None
@@ -1134,6 +1334,16 @@ def main() -> None:
         if decision_path.exists():
             try:
                 d = json.loads(decision_path.read_text(encoding="utf-8"))
+                d = enrich_decision_with_cumulative_recovery(
+                    d,
+                    new_unique_recovered_keys=new_rows,
+                    cycle_local_recovered_rows=cycle_local_new_rows,
+                    new_recovered_k_rows=added_k,
+                    recovery_store_report_path=Path(args.recovery_store_report),
+                    cycle_recovery_store_report_path=cycle_artifacts["recovery_store_report"],
+                    store_report=store_report,
+                )
+                decision_path.write_text(json.dumps(d, indent=2, sort_keys=True) + "\n", encoding="utf-8")
                 decision_obj = d
                 if (
                     int(d.get("cross_pub_duplicate_r", 0)) > 0
@@ -1171,10 +1381,14 @@ def main() -> None:
                         f"target_enabled={target.get('enabled')}\n"
                         f"target_matched_rows={target.get('matched_rows')}\n"
                         f"recovery_viability={d.get('recovery_viability')}\n"
-                        f"new_key_recovered={d.get('new_key_recovered', d.get('key_recovered'))}\n"
+                        f"cycle_local_key_recovered={d.get('cycle_local_key_recovered', d.get('key_recovered'))}\n"
+                        f"new_global_key_recovered={d.get('new_global_key_recovered')}\n"
                         f"valid_recovered_material_present={d.get('valid_recovered_material_present', d.get('key_material_present'))}\n"
                         f"recovery_outcome={d.get('recovery_outcome')}\n"
                         f"new_local_recovered_rows={d.get('new_local_recovered_rows')}\n"
+                        f"new_unique_recovered_keys={new_rows}\n"
+                        f"cycle_local_recovered_rows={cycle_local_new_rows}\n"
+                        f"new_recovered_k_rows={added_k}\n"
                         f"total_valid_recovered_rows={d.get('total_valid_recovered_rows')}\n"
                         f"known_nonce_rows={d.get('known_nonce_rows')}\n"
                         f"external_candidates={external_candidates.get('enabled')}\n"
@@ -1235,6 +1449,7 @@ def main() -> None:
                     cycle_artifacts["hnp_bounded_k_report"],
                     cycle_artifacts["recovery_graph_report"],
                     cycle_artifacts["recovery_graph_expansion_report"],
+                    cycle_artifacts["unresolved_targets_report"],
                     cycle_artifacts["recovery_chain_report"],
                 ]
                 if p.exists()
@@ -1249,20 +1464,22 @@ def main() -> None:
             if bot_token and telegram_chat_id:
                 artifact_summary = recovered_artifact_summary(cycle_artifacts["recovered_json"], new_rows)
                 msg = (
-                    "Recovered new rows.\n"
+                    "Recovered new unique keys.\n"
                     f"run_id={run_id}\n"
                     f"cycle={cycle}\n"
                     f"start_height={cycle_start}\n"
                     f"batch_size={args.batch_size}\n"
-                    f"total_rows={after_recovered}\n"
+                    f"new_unique_recovered_keys={new_rows}\n"
+                    f"cycle_local_recovered_rows={cycle_local_new_rows}\n"
+                    f"cycle_output_total_rows={after_recovered}\n"
                     f"{artifact_summary}"
                 )
                 ok = send_telegram_message(bot_token, telegram_chat_id, msg)
                 print(f"Telegram alert sent={ok} chat_id={telegram_chat_id}")
             else:
-                print("[warn] new rows found but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID is not set; skipping telegram alert")
+                print("[warn] new unique recovered keys found but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID is not set; skipping telegram alert")
             if args.stop_on_found:
-                print("New recovered rows detected; stopping due to --stop-on-found.")
+                print("New unique recovered keys detected; stopping due to --stop-on-found.")
                 break
 
         if anomaly_alert and bot_token and telegram_chat_id:
@@ -1287,6 +1504,14 @@ def main() -> None:
             "batch_size": args.batch_size,
             "artifacts_dir": str(cycle_artifacts["dir"]),
             "new_recovered_rows": new_rows,
+            "cycle_local_recovered_rows": cycle_local_new_rows,
+            "new_recovered_k_rows": added_k,
+            "recovery_store": {
+                "report": str(args.recovery_store_report),
+                "cycle_report": str(cycle_artifacts["recovery_store_report"]),
+                "recovered_keys_unique_facts": store_report.get("recovered_keys_unique_facts", 0),
+                "recovered_k_unique_r": store_report.get("recovered_k_unique_r", 0),
+            },
             "anomaly_detected": bool(anomaly_alert),
             "risk_score": decision_obj.get("risk_score"),
             "risk_verdict": decision_obj.get("risk_verdict"),

@@ -481,30 +481,41 @@ venv/bin/python continuous_pipeline.py \
 ===============================================
 
 ```
-python3 continuous_pipeline.py \
+venv/bin/python continuous_pipeline.py \
   --start-height "$(cat last_processed_block.txt)" \
-  --batch-size 50 \
-  --max-cycles 1 \
-  --threads 4 \
+  --batch-size 100 \
+  --threads 8 \
   --python venv/bin/python \
-  --discovery-mode balanced \
-  --enable-sqlite-index \
+  --random-k-budget 16 \
+  --enable-nonce-hypotheses \
+  --nonce-time-window-sec 2 \
+  --nonce-time-step-sec 1 \
+  --nonce-counter-max 3 \
+  --nonce-max-candidates 100000 \
   --enable-workset \
-  --workset-tail-lines 100000 \
-  --workset-max-rows 150000 \
-  --enable-pubkey-expansion \
-  --pubkey-expansion-phase both \
-  --pubkey-expansion-max-pubkeys 15 \
-  --pubkey-expansion-max-pages-per-address 1 \
-  --pubkey-expansion-max-txs-per-address 25 \
-  --relation-max-signers 30 \
-  --relation-max-rows-per-signer 96 \
-  --relation-max-pairs-per-signer 2048 \
-  --random-k-budget 4 \
-  --fallback-random-k-budget 4 \
-  --hnp-timeout-sec 60 \
-  --hnp-min-leaks 8 \
-  --preload-k-candidates candidate_k.jsonl \
+  --workset-tail-lines 250000 \
+  --workset-max-rows 500000 \
+  --workset-recovered-keys recovered_keys.jsonl \
+  --workset-recovered-k recovered_k.jsonl \
+  --cumulative-recovered-keys recovered_keys.jsonl \
+  --cumulative-recovered-k recovered_k.jsonl
+  ```
+
+  ```
+  venv/bin/python automate_recover.py \
+  --sigs signatures.jsonl \
+  --recover-bin ./ecdsa_recover_strict \
+  --threads 6 \
+  --risk-threshold 40 \
+  --cluster-min-sigs 15 \
+  --cluster-risk-threshold 10 \
+  --max-clusters 80 \
+  --max-iter 3 \
+  --random-k-budget 0 \
+  --enable-nonce-hypotheses \
+  --nonce-counter-max 3 \
+  --nonce-time-window-sec 2 \
+  --nonce-max-candidates 300000 \
   --enable-advanced-recover
   ```
 

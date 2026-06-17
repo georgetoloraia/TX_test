@@ -157,8 +157,12 @@ def ingest_jsonl(db_path: Path, input_path: Path, store_raw: bool = False, batch
         """
 
         source = str(input_path)
+        row = conn.execute("SELECT MAX(line_no) FROM signatures WHERE source_file = ?", (source,)).fetchone()
+        start_after_line = int(row[0] or 0)
         with input_path.open("r", encoding="utf-8", errors="replace") as f:
             for line_no, line in enumerate(f, start=1):
+                if line_no <= start_after_line:
+                    continue
                 raw = line.strip()
                 if not raw:
                     continue
@@ -198,6 +202,8 @@ def ingest_jsonl(db_path: Path, input_path: Path, store_raw: bool = False, batch
         return {
             "db": str(db_path),
             "input": str(input_path),
+            "start_after_line": start_after_line,
+            "scanned_new_lines": total,
             "total_lines": total,
             "inserted_rows": inserted,
             "skipped_duplicate_rows": skipped_dup,
@@ -423,6 +429,79 @@ def extract_duplicate_r(db_path: Path, out_path: Path, recoverable_only: bool = 
         conn.close()
 
 
+def load_recovered_k_r_values(recovered_k_path: Path) -> tuple[set[str], dict[str, Any]]:
+    r_values: set[str] = set()
+    rows = bad_rows = rows_with_k = 0
+    if not recovered_k_path.exists():
+        return r_values, {"exists": False, "rows": 0, "bad_rows": 0, "rows_with_k": 0, "unique_r": 0}
+    with recovered_k_path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            rows += 1
+            try:
+                obj = json.loads(raw)
+                if not isinstance(obj, dict):
+                    bad_rows += 1
+                    continue
+                has_k = obj.get("k") is not None or bool(obj.get("k_candidates"))
+                r_hex = normalize_hex_int(obj.get("r"))
+                if not has_k:
+                    bad_rows += 1
+                    continue
+                rows_with_k += 1
+                r_values.add(r_hex)
+            except Exception:
+                bad_rows += 1
+    return r_values, {
+        "exists": True,
+        "rows": rows,
+        "bad_rows": bad_rows,
+        "rows_with_k": rows_with_k,
+        "unique_r": len(r_values),
+    }
+
+
+def extract_known_r(db_path: Path, recovered_k_path: Path, out_path: Path) -> dict[str, Any]:
+    r_values, k_meta = load_recovered_k_r_values(recovered_k_path)
+    if not r_values:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text("", encoding="utf-8")
+        return {
+            "db": str(db_path),
+            "recovered_k": str(recovered_k_path),
+            "output": str(out_path),
+            "k_facts": k_meta,
+            "selected_rows": 0,
+            "written_rows": 0,
+            "reason": "no_known_r_values",
+        }
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        init_db(conn)
+        conn.execute("DROP TABLE IF EXISTS temp_known_r")
+        conn.execute("CREATE TEMP TABLE temp_known_r(r TEXT NOT NULL PRIMARY KEY)")
+        conn.executemany("INSERT OR IGNORE INTO temp_known_r(r) VALUES (?)", [(r,) for r in sorted(r_values)])
+        report = _write_rows_from_source(
+            conn,
+            out_path,
+            "EXISTS (SELECT 1 FROM temp_known_r t WHERE t.r = signatures.r)",
+            (),
+        )
+        report.update({
+            "db": str(db_path),
+            "recovered_k": str(recovered_k_path),
+            "k_facts": k_meta,
+            "reason": "ok",
+        })
+        return report
+    finally:
+        conn.close()
+
+
 def write_json(path: Path | None, data: dict[str, Any]) -> None:
     text = json.dumps(data, indent=2, sort_keys=True)
     if path:
@@ -461,6 +540,12 @@ def main() -> None:
     p_target.add_argument("--out", default="signatures.index.target.jsonl")
     p_target.add_argument("--report-out")
 
+    p_known_r = sub.add_parser("extract-known-r", help="Extract rows whose r is present in recovered_k.jsonl")
+    p_known_r.add_argument("--db", default="signatures.index.sqlite")
+    p_known_r.add_argument("--recovered-k", default="recovered_k.jsonl")
+    p_known_r.add_argument("--out", default="signatures.index.known_r.jsonl")
+    p_known_r.add_argument("--report-out")
+
     args = ap.parse_args()
     try:
         if args.cmd == "build":
@@ -487,6 +572,13 @@ def main() -> None:
             result = extract_target_pubkey(
                 db_path=Path(args.db),
                 target_pubkey=args.target_pubkey,
+                out_path=Path(args.out),
+            )
+            write_json(Path(args.report_out) if args.report_out else None, result)
+        elif args.cmd == "extract-known-r":
+            result = extract_known_r(
+                db_path=Path(args.db),
+                recovered_k_path=Path(args.recovered_k),
                 out_path=Path(args.out),
             )
             write_json(Path(args.report_out) if args.report_out else None, result)
