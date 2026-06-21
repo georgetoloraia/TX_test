@@ -1084,6 +1084,229 @@ def write_candidate_validation_report(
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def build_recovery_evidence_report(
+    *,
+    out_path: Path,
+    audit_report: dict[str, Any],
+    stage0_subset_info: dict[str, Any] | None,
+    duplicate_r_pair_summary: dict[str, Any] | None,
+    nonce_hypothesis_report: dict[str, Any] | None,
+    hnp_leak_report: dict[str, Any] | None,
+    hnp_bounded_k_report: dict[str, Any] | None,
+    relation_subset_report: dict[str, Any] | None,
+    unresolved_targets_report: dict[str, Any] | None,
+    broad_relation_skip_report: dict[str, Any] | None,
+    known_k_chain_report: dict[str, Any] | None,
+    known_priv_chain_report: dict[str, Any] | None,
+    chain_report: dict[str, Any] | None,
+    pre_validation: dict[str, Any],
+    post_validation: dict[str, Any],
+    material_summary: dict[str, Any],
+    stage_runs: list[dict[str, Any]],
+    hnp_min_leaks: int,
+    recover_deltas_path: Path,
+    recovered_k_path: Path,
+) -> dict[str, Any]:
+    """Write a metadata-only decision aid explaining current recovery blockers.
+
+    This report intentionally stores only counts, statuses, and local artifact
+    paths. It must not include private keys, WIF strings, or nonce values.
+    """
+
+    def i(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    def f(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    stage0 = stage0_subset_info or {}
+    dup_summary = duplicate_r_pair_summary or {}
+    nonce = nonce_hypothesis_report or {}
+    hnp_leaks = hnp_leak_report or {}
+    hnp_bounded = hnp_bounded_k_report or {}
+    relation = relation_subset_report or {}
+    unresolved = unresolved_targets_report or {}
+    broad_skip = broad_relation_skip_report or {}
+    known_k = known_k_chain_report or {}
+    known_priv = known_priv_chain_report or {}
+    chain = chain_report or {}
+
+    risk = audit_report.get("risk", {}) or {}
+    vq = verification_quality(audit_report)
+    invalid_ratio = f(vq.get("invalid_ratio", 0.0))
+    valid_hnp_rows = i(hnp_leaks.get("valid_leak_rows", 0))
+    matched_nonce = i(nonce.get("matched_candidates", 0))
+    tested_nonce = i(nonce.get("tested_candidates", nonce.get("tested", 0)))
+    bounded_candidates = i(hnp_bounded.get("total_candidates", 0))
+    direct_valid_pairs = i(dup_summary.get("direct_valid_pairs", 0))
+    recoverable_focus_groups = i(stage0.get("recoverable_focus_groups", 0))
+    replay_like_rows = i(stage0.get("replay_like_rows", 0))
+    duplicate_r_groups = i(stage0.get("duplicate_r_groups", 0))
+    unresolved_rows = i(unresolved.get("selected_rows", 0))
+    relation_rows = i(relation.get("selected_rows", 0))
+    relation_signers = i(relation.get("selected_signers", 0))
+    relation_truncated = "row_cap_truncated_candidate_pairs" in (relation.get("likely_blockers", []) or [])
+    pre_valid = i(pre_validation.get("valid_rows", 0))
+    post_valid = i(post_validation.get("valid_rows", 0))
+    new_valid = max(0, post_valid - pre_valid)
+    delta_rows = count_nonempty_lines(recover_deltas_path)
+    recovered_k_rows = count_nonempty_lines(recovered_k_path)
+    known_k_new = i(known_k.get("accepted_new_keys", 0)) + i(known_k.get("cumulative_accepted_new_keys", 0))
+    known_priv_new_k = i(known_priv.get("new_k_candidates", 0)) + i(known_priv.get("cumulative_new_k_candidates", 0))
+
+    categories: dict[str, int] = {
+        "recoverable_now": 0,
+        "already_recovered_or_saturated": 0,
+        "replay_only": 0,
+        "hnp_not_ready": 0,
+        "no_nonce_model_match": 0,
+        "nonce_candidates_unvalidated": 0,
+        "no_nonce_relation_detected": 0,
+        "needs_more_targeted_signatures": 0,
+        "data_quality_blocked": 0,
+        "candidate_chain_available": 0,
+    }
+    blockers: list[str] = []
+    next_steps: list[str] = []
+    evidence_items: list[dict[str, Any]] = []
+
+    if direct_valid_pairs > 0 or recoverable_focus_groups > 0:
+        categories["recoverable_now"] += 1
+        evidence_items.append({
+            "type": "duplicate_r_recoverable",
+            "direct_valid_pairs": direct_valid_pairs,
+            "recoverable_focus_groups": recoverable_focus_groups,
+        })
+        if new_valid <= 0:
+            categories["already_recovered_or_saturated"] += 1
+            blockers.append("duplicate_r_recoverable_evidence_present_but_no_new_local_key_rows")
+            next_steps.append("Check recovered_keys/recovered_k store saturation and run known-k chain over full corpus.")
+
+    if duplicate_r_groups > 0 and recoverable_focus_groups == 0 and direct_valid_pairs == 0:
+        categories["replay_only"] += 1
+        blockers.append("duplicate_r_groups_are_replay_like_or_not_algebraically_recoverable")
+
+    if valid_hnp_rows < max(1, int(hnp_min_leaks)):
+        categories["hnp_not_ready"] += 1
+        blockers.append("insufficient_explicit_nonce_leak_rows_for_hnp")
+        next_steps.append("Prioritize collecting more signatures for audit-flagged pubkeys before increasing HNP lattice cost.")
+    elif bounded_candidates > 0:
+        categories["recoverable_now"] += 1
+        evidence_items.append({
+            "type": "explicit_nonce_leak_candidates",
+            "valid_leak_rows": valid_hnp_rows,
+            "bounded_candidates": bounded_candidates,
+        })
+
+    if nonce.get("enabled"):
+        if matched_nonce > 0:
+            categories["nonce_candidates_unvalidated"] += 1
+            evidence_items.append({
+                "type": "nonce_hypothesis_candidates",
+                "matched_candidates": matched_nonce,
+                "tested_candidates": tested_nonce,
+            })
+        elif tested_nonce > 0:
+            categories["no_nonce_model_match"] += 1
+            blockers.append("enabled_nonce_hypothesis_models_matched_zero_r_values")
+
+    if relation_rows >= 2 and delta_rows == 0 and new_valid <= 0:
+        categories["no_nonce_relation_detected"] += 1
+        blockers.append("relation_scan_selected_rows_but_no_delta_lcg_or_recovery_hits")
+    if relation_truncated:
+        categories["needs_more_targeted_signatures"] += 1
+        blockers.append("relation_scan_pair_budget_or_row_cap_truncated_candidate_space")
+        next_steps.append("Narrow relation scan to top audit change-point signers or raise relation budget only for those signers.")
+
+    if unresolved_rows > 0:
+        categories["needs_more_targeted_signatures"] += 1
+        evidence_items.append({
+            "type": "unresolved_recovery_targets",
+            "selected_rows": unresolved_rows,
+        })
+    if replay_like_rows > 0:
+        evidence_items.append({
+            "type": "replay_noise",
+            "replay_like_rows": replay_like_rows,
+        })
+
+    if invalid_ratio >= 0.35:
+        categories["data_quality_blocked"] += 1
+        blockers.append("high_signature_verification_invalid_ratio")
+        next_steps.append("Improve z/sighash reconstruction and pubkey parsing before trusting weak statistical anomalies.")
+
+    if known_k_new > 0 or known_priv_new_k > 0 or recovered_k_rows > 0:
+        categories["candidate_chain_available"] += 1
+        evidence_items.append({
+            "type": "local_chain_material",
+            "recovered_k_rows": recovered_k_rows,
+            "known_k_chain_accepted_new_keys": i(known_k.get("accepted_new_keys", 0)),
+            "known_priv_chain_new_k_candidates": i(known_priv.get("new_k_candidates", 0)),
+        })
+
+    if not next_steps:
+        next_steps.append("Keep scanning deterministically; do not increase random-k unless a bounded candidate source appears.")
+
+    if new_valid > 0:
+        overall_status = "new_key_material_found"
+    elif categories["recoverable_now"] > 0 and categories["already_recovered_or_saturated"] > 0:
+        overall_status = "recoverable_evidence_saturated"
+    elif categories["recoverable_now"] > 0:
+        overall_status = "recoverable_evidence_pending"
+    elif categories["needs_more_targeted_signatures"] > 0:
+        overall_status = "needs_more_targeted_data"
+    else:
+        overall_status = "no_current_recovery_path"
+
+    payload = {
+        "overall_status": overall_status,
+        "secret_material": "LOCAL_ARTIFACT_ONLY",
+        "summary": {
+            "risk_score": i(risk.get("score", 0)),
+            "risk_verdict": risk.get("verdict", "unknown"),
+            "new_local_recovered_rows": i(material_summary.get("new_local_recovered_rows", 0)),
+            "pre_valid_recovered_rows": pre_valid,
+            "post_valid_recovered_rows": post_valid,
+            "stage_count": len(stage_runs),
+            "relation_selected_rows": relation_rows,
+            "relation_selected_signers": relation_signers,
+            "hnp_valid_leak_rows": valid_hnp_rows,
+            "nonce_hypothesis_tested": tested_nonce,
+            "nonce_hypothesis_matched": matched_nonce,
+            "duplicate_r_groups": duplicate_r_groups,
+            "direct_valid_duplicate_r_pairs": direct_valid_pairs,
+            "verification_invalid_ratio": invalid_ratio,
+        },
+        "categories": categories,
+        "blockers": sorted(set(blockers)),
+        "actionable_next_steps": next_steps,
+        "top_evidence_items": evidence_items[:20],
+        "stage_runs": [
+            {k: v for k, v in stage.items() if k in {"name", "rc", "skipped", "reason", "input"}}
+            for stage in stage_runs
+        ],
+        "broad_relation_skip": {
+            "skip": bool(broad_skip.get("skip", False)),
+            "reasons": broad_skip.get("reasons", []),
+            "selected_unresolved_rows": i(broad_skip.get("selected_unresolved_rows", 0)),
+        },
+        "chain_summary": {
+            "new_valid_rows_from_chain_stage": i(chain.get("new_valid_rows_from_chain_stage", 0)),
+            "recovered_pubkeys": i(chain.get("recovered_pubkeys", 0)),
+            "matched_signatures_for_recovered_pubkeys": i(chain.get("matched_signatures_for_recovered_pubkeys", 0)),
+        },
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return payload
+
+
 def recovery_material_summary(
     candidate_report: dict[str, Any],
     pre_validation: dict[str, Any],
@@ -1506,6 +1729,191 @@ def _recompute_z_from_context(obj: dict[str, Any]) -> tuple[bool | None, str]:
         return z_calc == z_row, "z_recompute_match" if z_calc == z_row else "z_recompute_mismatch"
     except Exception as e:
         return None, f"z_recompute_exception:{type(e).__name__}"
+
+
+def _verification_bucket_key(obj: dict[str, Any], verify_reason: str, z_reason: str) -> str:
+    sighash = str(obj.get("sighash") if obj.get("sighash") is not None else "unknown")
+    tx_type = str(obj.get("type") or obj.get("script_type") or "unknown")
+    has_ctx = isinstance(obj.get("sighash_context"), dict)
+    ctx = obj.get("sighash_context") if has_ctx else {}
+    algorithm = str(ctx.get("algorithm") or "none") if isinstance(ctx, dict) else "none"
+    source = str(obj.get("sighash_context_source") or ("present_unsourced" if has_ctx else "missing"))
+    return "|".join([
+        f"verify={verify_reason}",
+        f"z={z_reason}",
+        f"sighash={sighash}",
+        f"type={tx_type}",
+        f"ctx={int(has_ctx)}",
+        f"algo={algorithm}",
+        f"source={source}",
+    ])
+
+
+def build_verification_failure_report(
+    *,
+    sig_path: Path,
+    out_path: Path,
+    max_rows: int = 0,
+    max_samples: int = 25,
+) -> dict[str, Any]:
+    """Explain signature verification quality by extraction/recompute context.
+
+    The report stores only aggregate counts and safe row identifiers. It is meant
+    to answer whether failures are caused by missing sighash context, bad DER,
+    pubkey parsing, z mismatches, unsupported tx types, or true verify failures.
+    """
+    report: dict[str, Any] = {
+        "input": str(sig_path),
+        "max_rows": int(max_rows),
+        "rows_seen": 0,
+        "rows_analyzed": 0,
+        "rows_analyzed_general": 0,
+        "rows_analyzed_context_extra": 0,
+        "context_extra_scan_limit": 0,
+        "bad_json_rows": 0,
+        "verification_counts": {},
+        "z_recompute_counts": {},
+        "by_sighash": {},
+        "by_type": {},
+        "by_has_sighash_context": {},
+        "by_context_algorithm": {},
+        "by_context_source": {},
+        "by_z_source": {},
+        "top_failure_buckets": [],
+        "failure_samples": {},
+        "recommendations": [],
+        "secret_material": "LOCAL_ARTIFACT_ONLY",
+    }
+    verification_counts: Counter[str] = Counter()
+    z_counts: Counter[str] = Counter()
+    by_sighash: Counter[str] = Counter()
+    by_type: Counter[str] = Counter()
+    by_has_ctx: Counter[str] = Counter()
+    by_algorithm: Counter[str] = Counter()
+    by_ctx_source: Counter[str] = Counter()
+    by_z_source: Counter[str] = Counter()
+    bucket_counts: Counter[str] = Counter()
+    samples: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    context_extra_limit = 0 if max_rows <= 0 else max(1000, int(max_rows) // 5)
+    report["context_extra_scan_limit"] = int(context_extra_limit)
+
+    def analyze_row(obj: dict[str, Any], idx: int, *, context_extra: bool) -> None:
+        report["rows_analyzed"] = int(report["rows_analyzed"]) + 1
+        if context_extra:
+            report["rows_analyzed_context_extra"] = int(report["rows_analyzed_context_extra"]) + 1
+        else:
+            report["rows_analyzed_general"] = int(report["rows_analyzed_general"]) + 1
+        ok, verify_reason = _verify_row_signature(obj)
+        z_ok, z_reason = _recompute_z_from_context(obj)
+        verification_counts[verify_reason] += 1
+        z_counts[z_reason] += 1
+        sighash = str(obj.get("sighash") if obj.get("sighash") is not None else "unknown")
+        tx_type = str(obj.get("type") or obj.get("script_type") or "unknown")
+        ctx = obj.get("sighash_context")
+        has_ctx = isinstance(ctx, dict)
+        algorithm = str(ctx.get("algorithm") or "none") if has_ctx else "none"
+        ctx_source = str(obj.get("sighash_context_source") or ("present_unsourced" if has_ctx else "missing"))
+        z_source = str(obj.get("z_source") or obj.get("sighash_context_source") or ("context_present" if has_ctx else "row_only"))
+        by_sighash[sighash] += 1
+        by_type[tx_type] += 1
+        by_has_ctx[str(bool(has_ctx)).lower()] += 1
+        by_algorithm[algorithm] += 1
+        by_ctx_source[ctx_source] += 1
+        by_z_source[z_source] += 1
+        if ok is not True or z_ok is False:
+            bucket = _verification_bucket_key(obj, verify_reason, z_reason)
+            bucket_counts[bucket] += 1
+            if len(samples[bucket]) < max(0, int(max_samples)):
+                sample = _safe_row_id(obj, idx)
+                sample.update({
+                    "verify_reason": verify_reason,
+                    "z_recompute": z_reason,
+                    "sighash": obj.get("sighash"),
+                    "type": tx_type,
+                    "has_sighash_context": has_ctx,
+                    "context_algorithm": algorithm,
+                    "context_source": ctx_source,
+                    "context_extra_sample": bool(context_extra),
+                })
+                samples[bucket].append(sample)
+
+    if not sig_path.exists():
+        report["reason"] = "input_missing"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+        return report
+
+    with sig_path.open("r", encoding="utf-8", errors="replace") as f:
+        for idx, line in enumerate(f):
+            raw = line.strip()
+            if not raw:
+                continue
+            report["rows_seen"] = int(report["rows_seen"]) + 1
+            try:
+                obj = json.loads(raw)
+                if not isinstance(obj, dict):
+                    report["bad_json_rows"] = int(report["bad_json_rows"]) + 1
+                    continue
+            except Exception:
+                report["bad_json_rows"] = int(report["bad_json_rows"]) + 1
+                continue
+            general_limit_reached = max_rows > 0 and int(report["rows_analyzed_general"]) >= int(max_rows)
+            if not general_limit_reached:
+                analyze_row(obj, idx, context_extra=False)
+                continue
+            ctx = obj.get("sighash_context")
+            if isinstance(ctx, dict) and (context_extra_limit <= 0 or int(report["rows_analyzed_context_extra"]) < context_extra_limit):
+                analyze_row(obj, idx, context_extra=True)
+                continue
+            if context_extra_limit > 0 and int(report["rows_analyzed_context_extra"]) >= context_extra_limit:
+                report["reason"] = "max_rows_and_context_extra_limit_reached"
+                break
+            report["reason"] = "max_rows_reached"
+
+    analyzed = int(report["rows_analyzed"])
+    invalid = analyzed - int(verification_counts.get("ok", 0))
+    missing_ctx = int(z_counts.get("missing_sighash_context", 0))
+    z_mismatch = int(z_counts.get("z_recompute_mismatch", 0))
+    pubkey_parse_errors = int(verification_counts.get("pubkey_parse_error", 0))
+    bad_der = sum(
+        count
+        for reason, count in verification_counts.items()
+        if reason in {"missing_signature_hex", "bad_signature_hex", "not_der", "bad_der_length"}
+    )
+    recommendations: list[str] = []
+    if analyzed and missing_ctx / analyzed >= 0.25:
+        recommendations.append("download_future_rows_with_include_sighash_context")
+    if z_mismatch > 0:
+        recommendations.append("inspect_sighash_context_reconstruction_for_z_mismatch")
+    if pubkey_parse_errors > 0:
+        recommendations.append("inspect_pubkey_extraction_for_malformed_or_missing_sec_keys")
+    if bad_der > 0:
+        recommendations.append("inspect_signature_hex_der_extraction")
+    if invalid > 0 and not recommendations:
+        recommendations.append("inspect_verify_false_rows_by_top_failure_bucket")
+
+    report.update({
+        "verification_counts": dict(verification_counts),
+        "z_recompute_counts": dict(z_counts),
+        "by_sighash": dict(by_sighash),
+        "by_type": dict(by_type),
+        "by_has_sighash_context": dict(by_has_ctx),
+        "by_context_algorithm": dict(by_algorithm),
+        "by_context_source": dict(by_ctx_source),
+        "by_z_source": dict(by_z_source),
+        "invalid_rows": invalid,
+        "invalid_ratio": (invalid / analyzed) if analyzed else 0.0,
+        "top_failure_buckets": [
+            {"bucket": bucket, "count": count, "samples": samples.get(bucket, [])}
+            for bucket, count in bucket_counts.most_common(25)
+        ],
+        "failure_samples": {k: v for k, v in list(samples.items())[:25]},
+        "recommendations": recommendations,
+    })
+    report.setdefault("reason", "ok")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    return report
 
 
 def _derived_pubkey_matches(d: int, pubkeys: set[str]) -> tuple[bool | None, str]:
@@ -3157,6 +3565,7 @@ def build_signer_relation_neighborhood_subset(
     recovered_json_path: Path,
     recovered_k_path: Path,
     audit_report: dict[str, Any] | None = None,
+    audit_flagged_only: bool = False,
     out_path: Path,
     report_path: Path,
     min_sigs: int,
@@ -3177,6 +3586,7 @@ def build_signer_relation_neighborhood_subset(
     audit_flagged_pubs: set[str] = set()
     audit_pub_scores: dict[str, int] = {}
     audit_sources: dict[str, list[str]] = defaultdict(list)
+    audit_focus_indices: dict[str, set[int]] = defaultdict(set)
     if audit_report:
         signer_sections = (
             ("signer_change_points", "change_points"),
@@ -3194,6 +3604,19 @@ def build_signer_relation_neighborhood_subset(
                 audit_pub_scores[pub] += min(20, int(item.get("drift_flags", 0) or 0))
                 audit_pub_scores[pub] += min(15, int(item.get("change_points_total", 0) or 0) // 10)
                 audit_pub_scores[pub] += min(15, int(float(item.get("mixture_mode_score", 0.0) or 0.0) * 3))
+                for key in ("change_points_hamming", "change_points_lsb8_mean", "change_points_msb8_mean"):
+                    for idx in item.get(key, []) or []:
+                        try:
+                            audit_focus_indices[pub].add(max(0, int(idx)))
+                        except Exception:
+                            continue
+                for flag in item.get("top_flags", []) or []:
+                    if not isinstance(flag, dict):
+                        continue
+                    try:
+                        audit_focus_indices[pub].add(max(0, int(flag.get("index"))))
+                    except Exception:
+                        continue
         for c in ((audit_report.get("clusters", {}) or {}).get("top_clusters", []) or []):
             key = str(c.get("cluster") or "")
             if not key.startswith("pub:"):
@@ -3262,6 +3685,9 @@ def build_signer_relation_neighborhood_subset(
                 "audit_flagged": pub in audit_flagged_pubs,
                 "audit_score": int(audit_pub_scores.get(pub, 0)),
                 "audit_sources": sorted(set(audit_sources.get(pub, []))),
+                "audit_focus_indices": sorted(audit_focus_indices.get(pub, set())),
+                "audit_focus_index_count": len(audit_focus_indices.get(pub, set())),
+                "dup_r_hexes": {r for r, c in r_counts.items() if c > 1},
                 "dup_r_events": dup_r_events,
                 "dup_r_values": sum(1 for c in r_counts.values() if c > 1),
                 "same_r_diff_signature_values": same_r_diff_sz,
@@ -3282,6 +3708,9 @@ def build_signer_relation_neighborhood_subset(
         ),
         reverse=True,
     )
+    eligible_before_audit_filter = len(signer_stats)
+    if audit_flagged_only:
+        signer_stats = [s for s in signer_stats if bool(s.get("audit_flagged"))]
     eligible_signer_count = len(signer_stats)
     if max_signers > 0:
         signer_stats = signer_stats[:max_signers]
@@ -3302,14 +3731,58 @@ def build_signer_relation_neighborhood_subset(
             stat["rows"],
             key=lambda item: _signature_order_key(item[2], item[0]),
         )
-        if len(ordered) > effective_rows_per_signer:
-            # Preserve the newest rows and a deterministic prefix sample. This
-            # keeps old anomalies reachable while bounding per-signer cost.
-            source_len = len(ordered)
-            head_n = max(0, min(len(ordered), effective_rows_per_signer // 4))
-            tail_n = effective_rows_per_signer - head_n
-            ordered = ordered[:head_n] + ordered[-tail_n:]
-            rows_dropped_by_cap = max(0, source_len - len(ordered))
+        source_len = len(ordered)
+        selected_positions: set[int] = set()
+        for focus_idx in stat.get("audit_focus_indices", []) or []:
+            try:
+                pos = int(focus_idx)
+            except Exception:
+                continue
+            if source_len <= 0:
+                continue
+            pos = min(max(0, pos), source_len - 1)
+            for np in range(max(0, pos - window), min(source_len, pos + window + 1)):
+                selected_positions.add(np)
+
+        dup_r_hexes = stat.get("dup_r_hexes", set()) or set()
+        for pos, (_, _, obj) in enumerate(ordered):
+            try:
+                r_hex = format(parse_int(obj.get("r")), "064x")
+            except Exception:
+                continue
+            if r_hex in dup_r_hexes or r_hex in recovered_r:
+                for np in range(max(0, pos - window), min(source_len, pos + window + 1)):
+                    selected_positions.add(np)
+
+        if len(selected_positions) < effective_rows_per_signer:
+            head_budget = max(1, effective_rows_per_signer // 5)
+            tail_budget = max(1, effective_rows_per_signer // 3)
+            for pos in range(0, min(source_len, head_budget)):
+                selected_positions.add(pos)
+            for pos in range(max(0, source_len - tail_budget), source_len):
+                selected_positions.add(pos)
+
+        if len(selected_positions) < effective_rows_per_signer and source_len > 0:
+            stride = max(1, source_len // max(1, effective_rows_per_signer))
+            for pos in range(0, source_len, stride):
+                selected_positions.add(pos)
+                if len(selected_positions) >= effective_rows_per_signer:
+                    break
+
+        if len(selected_positions) > effective_rows_per_signer:
+            focus = set()
+            for focus_idx in stat.get("audit_focus_indices", []) or []:
+                try:
+                    pos = min(max(0, int(focus_idx)), source_len - 1)
+                except Exception:
+                    continue
+                focus.update(range(max(0, pos - window), min(source_len, pos + window + 1)))
+            priority = sorted(selected_positions, key=lambda p: (p not in focus, p))
+            selected_positions = set(priority[:effective_rows_per_signer])
+
+        if source_len > effective_rows_per_signer:
+            rows_dropped_by_cap = max(0, source_len - len(selected_positions))
+            ordered = [ordered[pos] for pos in sorted(selected_positions)]
         else:
             rows_dropped_by_cap = 0
 
@@ -3348,6 +3821,8 @@ def build_signer_relation_neighborhood_subset(
                 "audit_flagged": bool(stat["audit_flagged"]),
                 "audit_score": int(stat["audit_score"]),
                 "audit_sources": stat["audit_sources"],
+                "audit_focus_index_count": int(stat.get("audit_focus_index_count", 0)),
+                "audit_focus_indices_sample": list(stat.get("audit_focus_indices", []) or [])[:20],
                 "dup_r_values": stat["dup_r_values"],
                 "dup_r_events": stat["dup_r_events"],
                 "same_r_diff_signature_values": stat["same_r_diff_signature_values"],
@@ -3401,8 +3876,10 @@ def build_signer_relation_neighborhood_subset(
             "effective_rows_per_signer": int(effective_rows_per_signer),
             "neighbor_window": int(neighbor_window),
             "ranking": "audit_flagged+audit_score+recovered_pubkey+recovered_r+dup_r+count",
+            "audit_flagged_only": bool(audit_flagged_only),
         },
         "audit_flagged_pubkeys": len(audit_flagged_pubs),
+        "eligible_signers_before_audit_filter": eligible_before_audit_filter,
         "audit_flagged_selected": sum(1 for s in signer_stats if bool(s.get("audit_flagged"))),
         "top_signers": top_report[:100],
         "secret_material": "LOCAL_ARTIFACT_ONLY",
@@ -3542,6 +4019,12 @@ def build_cluster_subset(
     signer_drift_flagged = int(
         ((audit_report or {}).get("signer_longitudinal_drift", {}) or {}).get("signer_count_flagged", 0) or 0
     )
+    signer_change_flagged = int(
+        ((audit_report or {}).get("signer_change_points", {}) or {}).get("signer_count_flagged", 0) or 0
+    )
+    signer_mixture_flagged = int(
+        ((audit_report or {}).get("signer_mixture_modes", {}) or {}).get("signer_count_flagged", 0) or 0
+    )
 
     cluster_rows = []
     for key, rows in grouped.items():
@@ -3554,6 +4037,10 @@ def build_cluster_subset(
         if global_drift_flags > 0:
             drift_weight += 8
         if signer_drift_flagged > 0:
+            drift_weight += 6
+        if signer_change_flagged > 0:
+            drift_weight += 6
+        if signer_mixture_flagged > 0:
             drift_weight += 6
         context_score = min(40, fdr_bits * 6) + drift_weight
         stats["fdr_bits_r"] = fdr_bits
@@ -3668,6 +4155,12 @@ def main() -> None:
                     help="Local recovered_keys.jsonl used to seed/deduplicate recovery graph without printing secrets")
     ap.add_argument("--candidate-validation-report", default="candidate_validation_report.json",
                     help="Local metadata-only report for external candidate validation")
+    ap.add_argument("--recovery-evidence-report", default="recovery_evidence_report.json",
+                    help="Metadata-only classifier explaining current recovery evidence and blockers")
+    ap.add_argument("--verification-failure-report", default="verification_failure_report.json",
+                    help="Metadata-only report explaining signature verification failures by context")
+    ap.add_argument("--verification-failure-max-rows", type=int, default=0,
+                    help="Max rows to analyze for verification-failure report (0 = all active rows)")
     ap.add_argument("--enable-nonce-hypotheses", action="store_true",
                     help="Generate bounded weak-nonce r->k candidates and validate them locally")
     ap.add_argument("--nonce-hypothesis-models",
@@ -3767,6 +4260,8 @@ def main() -> None:
                     help="Max signature rows to scan for known-k propagation (0 = no cap)")
     ap.add_argument("--known-priv-chain-report", default="known_priv_chain_report.json",
                     help="Metadata-only report for deriving additional r->k facts from confirmed private keys")
+    ap.add_argument("--preload-chain-report", default="preload_chain_report.json",
+                    help="Metadata-only report for deriving from preloaded recovered k/private-key artifacts")
     ap.add_argument("--known-priv-chain-max-rows", type=int, default=0,
                     help="Max signature rows to scan for known-private-key propagation (0 = no cap)")
     ap.add_argument("--known-k-full-corpus-sigs", default="",
@@ -3805,6 +4300,11 @@ def main() -> None:
                     help="When duplicate-r is resolved, still run a bounded relation scan on audit-flagged signer cohorts")
     ap.add_argument("--no-enable-suspicious-signer-relation", action="store_false", dest="enable_suspicious_signer_relation",
                     help="Disable the bounded audit-flagged signer relation fallback")
+    ap.add_argument("--suspicious-signer-relation-audit-only", action="store_true", default=True,
+                    help="For the suspicious-signer fallback, scan only audit-flagged signers (default)")
+    ap.add_argument("--no-suspicious-signer-relation-audit-only", action="store_false",
+                    dest="suspicious_signer_relation_audit_only",
+                    help="Allow the suspicious-signer fallback to include non-audit signers ranked by recovered/dup-r context")
     ap.add_argument("--disable-cluster-gating", action="store_true",
                     help="Recover on full signature file (legacy behavior)")
     ap.add_argument("--enable-advanced-recover", action="store_true", default=True,
@@ -3875,6 +4375,8 @@ def main() -> None:
         args.hnp_candidates_out,
         args.hnp_report_out,
         args.candidate_validation_report,
+        args.recovery_evidence_report,
+        args.verification_failure_report,
         args.nonce_hypothesis_out,
         args.nonce_hypothesis_report,
         args.combined_preload_k_out,
@@ -3890,6 +4392,9 @@ def main() -> None:
         args.strong_signal_out,
         args.relation_neighborhood_out,
         args.relation_neighborhood_report,
+        args.known_k_chain_report,
+        args.known_priv_chain_report,
+        args.preload_chain_report,
         args.recovery_graph_subset_out,
         args.recovery_graph_report,
         args.recovery_graph_expansion_report,
@@ -3991,6 +4496,8 @@ def main() -> None:
     cross_pub_dup_r = int(report.get("cross_pub_duplicate_r", {}).get("collision_count", 0))
     drift_flags = int(report.get("height_time_drift", {}).get("drift_flags", 0))
     signer_drift_flagged = int(report.get("signer_longitudinal_drift", {}).get("signer_count_flagged", 0))
+    signer_change_flagged = int(report.get("signer_change_points", {}).get("signer_count_flagged", 0))
+    signer_mixture_flagged = int(report.get("signer_mixture_modes", {}).get("signer_count_flagged", 0))
     sighash_segments = report.get("sighash_segments", {}).get("segments", [])
     sighash_anomaly = any((int(s.get("duplicate_r", 0)) > 0 or int(s.get("fdr_bits_r", 0)) > 0) for s in sighash_segments)
     fusion = report.get("signal_fusion", {}) or {}
@@ -4017,6 +4524,8 @@ def main() -> None:
     print(f"Duplicate-r groups: {dup_r}")
     print(f"Cross-pub duplicate-r groups: {cross_pub_dup_r}")
     print(f"Height/time drift flags: {drift_flags}")
+    if signer_change_flagged or signer_mixture_flagged:
+        print(f"Signer anomaly flags: change_points={signer_change_flagged} mixture_modes={signer_mixture_flagged}")
     print(f"Signal fusion: tier={fusion_tier} conf={fusion_conf:.3f} recommendation={fusion_reco}")
     print(
         "Verification quality:",
@@ -4024,6 +4533,18 @@ def main() -> None:
         f"invalid={vq['invalid']}",
         f"invalid_ratio={vq['invalid_ratio']:.4f}",
     )
+    verification_failure_report = build_verification_failure_report(
+        sig_path=sigs,
+        out_path=Path(args.verification_failure_report),
+        max_rows=max(0, int(args.verification_failure_max_rows)),
+    )
+    if verification_failure_report.get("rows_analyzed", 0):
+        print(
+            "Verification failure report:",
+            f"invalid_ratio={float(verification_failure_report.get('invalid_ratio', 0.0)):.4f}",
+            f"top_recommendations={','.join(verification_failure_report.get('recommendations', [])[:3])}",
+            f"report={args.verification_failure_report}",
+        )
 
     should_recover = (
         args.force_recover
@@ -4034,6 +4555,8 @@ def main() -> None:
         or dup_r > 0
         or cross_pub_dup_r > 0
         or drift_flags > 0
+        or signer_change_flagged > 0
+        or signer_mixture_flagged > 0
         or sighash_anomaly
     )
     hard_signal = (
@@ -4041,6 +4564,8 @@ def main() -> None:
         or cross_pub_dup_r > 0
         or drift_flags > 0
         or signer_drift_flagged > 0
+        or signer_change_flagged > 0
+        or signer_mixture_flagged > 0
         or sighash_anomaly
     )
     if low_quality_data and not (hard_signal or args.force_recover or args.exhaustive_recover or external_candidate_requested):
@@ -4050,6 +4575,28 @@ def main() -> None:
 
     if not should_recover:
         print("Recovery skipped by policy (low anomaly signal).")
+        recovery_evidence_report = build_recovery_evidence_report(
+            out_path=Path(args.recovery_evidence_report),
+            audit_report=report,
+            stage0_subset_info=None,
+            duplicate_r_pair_summary={},
+            nonce_hypothesis_report={},
+            hnp_leak_report={"valid_leak_rows": known_nonce_rows_all},
+            hnp_bounded_k_report={},
+            relation_subset_report={},
+            unresolved_targets_report={},
+            broad_relation_skip_report={"skip": True, "reasons": ["low_anomaly_signal"]},
+            known_k_chain_report={},
+            known_priv_chain_report={},
+            chain_report={},
+            pre_validation={"valid_rows": 0},
+            post_validation={"valid_rows": 0},
+            material_summary={"new_local_recovered_rows": 0},
+            stage_runs=[],
+            hnp_min_leaks=args.hnp_min_leaks,
+            recover_deltas_path=Path(args.recover_deltas_out),
+            recovered_k_path=Path(args.recover_k_out),
+        )
         write_decision(args.decision_out, {
             "should_recover": False,
             "recover_executed": False,
@@ -4063,6 +4610,7 @@ def main() -> None:
             "signal_fusion_confidence": fusion_conf,
             "signal_fusion_recommendation": fusion_reco,
             "verification_quality": vq,
+            "verification_failure_report": verification_failure_report,
             "low_quality_data": low_quality_data,
             "cluster_fallback_used": cluster_fallback_used,
             "sqlite_index": sqlite_index_report,
@@ -4070,6 +4618,7 @@ def main() -> None:
             "source_sigs": str(original_sigs),
             "recover_input": None,
             "cluster_gating_used": not args.disable_cluster_gating,
+            "recovery_evidence_report": recovery_evidence_report,
         })
         try:
             Path(args.baseline_report).write_text(Path(args.audit_report).read_text(encoding="utf-8"), encoding="utf-8")
@@ -4083,6 +4632,28 @@ def main() -> None:
         hard_signal or args.force_recover or args.exhaustive_recover or external_candidate_requested
     ):
         print("Fusion recommendation is monitor_only; recovery skipped.")
+        recovery_evidence_report = build_recovery_evidence_report(
+            out_path=Path(args.recovery_evidence_report),
+            audit_report=report,
+            stage0_subset_info=None,
+            duplicate_r_pair_summary={},
+            nonce_hypothesis_report={},
+            hnp_leak_report={"valid_leak_rows": known_nonce_rows_all},
+            hnp_bounded_k_report={},
+            relation_subset_report={},
+            unresolved_targets_report={},
+            broad_relation_skip_report={"skip": True, "reasons": ["fusion_monitor_only"]},
+            known_k_chain_report={},
+            known_priv_chain_report={},
+            chain_report={},
+            pre_validation={"valid_rows": 0},
+            post_validation={"valid_rows": 0},
+            material_summary={"new_local_recovered_rows": 0},
+            stage_runs=[],
+            hnp_min_leaks=args.hnp_min_leaks,
+            recover_deltas_path=Path(args.recover_deltas_out),
+            recovered_k_path=Path(args.recover_k_out),
+        )
         write_decision(args.decision_out, {
             "should_recover": False,
             "recover_executed": False,
@@ -4096,6 +4667,7 @@ def main() -> None:
             "signal_fusion_confidence": fusion_conf,
             "signal_fusion_recommendation": fusion_reco,
             "verification_quality": vq,
+            "verification_failure_report": verification_failure_report,
             "low_quality_data": low_quality_data,
             "cluster_fallback_used": cluster_fallback_used,
             "sqlite_index": sqlite_index_report,
@@ -4103,6 +4675,7 @@ def main() -> None:
             "source_sigs": str(original_sigs),
             "recover_input": None,
             "cluster_gating_used": not args.disable_cluster_gating,
+            "recovery_evidence_report": recovery_evidence_report,
         })
         return
     if fusion_reco == "run_clustered_recovery" and not args.exhaustive_recover:
@@ -4663,6 +5236,173 @@ def main() -> None:
             if before_k == after_k and before_priv == after_priv:
                 break
 
+    def run_preload_chain_propagation(trigger_stage: str) -> dict[str, Any]:
+        """Actively derive from preloaded local facts before C++ stages.
+
+        C++ recovery also accepts preload files, but if a later stage is skipped
+        or only reports saturated evidence, preloaded local k/private-key facts
+        should still unlock any matching signatures in the active/full corpus.
+        This report is metadata-only and does not copy private material into it.
+        """
+        report_payload: dict[str, Any] = {
+            "enabled": bool(args.enable_chain_extraction),
+            "trigger": trigger_stage,
+            "preload_k": None,
+            "preload_recovered_json": None,
+            "active_known_k": None,
+            "full_corpus_known_k": None,
+            "active_known_priv": None,
+            "full_corpus_known_priv": None,
+            "chain_rounds_ran": False,
+            "priv_material": "LOCAL_ARTIFACT_ONLY",
+        }
+        if not args.enable_chain_extraction:
+            Path(args.preload_chain_report).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.preload_chain_report).write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+            return report_payload
+
+        before_priv = count_nonempty_lines(Path(args.recover_json_out))
+        before_k = count_nonempty_lines(Path(args.recover_k_out))
+        preload_reports: list[dict[str, Any]] = []
+
+        preload_k_path = Path(args.preload_k_candidates) if args.preload_k_candidates else None
+        if preload_k_path and preload_k_path.exists() and count_nonempty_lines(preload_k_path) > 0:
+            active_report_path = Path(args.preload_chain_report).with_name(
+                Path(args.preload_chain_report).stem + "_known_k_active.json"
+            )
+            active_report = derive_recovered_keys_from_known_k(
+                sig_path=sigs,
+                recovered_k_path=preload_k_path,
+                recovered_json_path=Path(args.recover_json_out),
+                recovered_txt_path=Path(args.recover_txt_out),
+                report_path=active_report_path,
+                max_rows=max(0, int(args.known_k_chain_max_rows)),
+            )
+            report_payload["preload_k"] = {
+                "path": str(preload_k_path),
+                "rows": count_nonempty_lines(preload_k_path),
+                "sha256": sha256_file(preload_k_path),
+            }
+            report_payload["active_known_k"] = {
+                "report": str(active_report_path),
+                "rows_with_known_r": int(active_report.get("rows_with_known_r", 0) or 0),
+                "accepted_new_keys": int(active_report.get("accepted_new_keys", 0) or 0),
+                "duplicate_existing_keys": int(active_report.get("duplicate_existing_keys", 0) or 0),
+            }
+            preload_reports.append({"name": "preload-known-k-active", **report_payload["active_known_k"]})
+
+            full_corpus_path = Path(args.known_k_full_corpus_sigs) if args.known_k_full_corpus_sigs else None
+            if full_corpus_path and full_corpus_path.exists() and full_corpus_path.resolve() != sigs.resolve():
+                full_report_path = Path(args.preload_chain_report).with_name(
+                    Path(args.preload_chain_report).stem + "_known_k_full_corpus.json"
+                )
+                full_report = derive_recovered_keys_from_known_k(
+                    sig_path=full_corpus_path,
+                    recovered_k_path=preload_k_path,
+                    recovered_json_path=Path(args.recover_json_out),
+                    recovered_txt_path=Path(args.recover_txt_out),
+                    report_path=full_report_path,
+                    max_rows=max(0, int(args.known_k_full_corpus_max_rows)),
+                    known_r_rows_path=Path(args.known_k_full_corpus_out),
+                )
+                report_payload["full_corpus_known_k"] = {
+                    "report": str(full_report_path),
+                    "input": str(full_corpus_path),
+                    "rows_with_known_r": int(full_report.get("rows_with_known_r", 0) or 0),
+                    "accepted_new_keys": int(full_report.get("accepted_new_keys", 0) or 0),
+                    "known_r_rows_written": int(full_report.get("known_r_rows_written", 0) or 0),
+                }
+                preload_reports.append({"name": "preload-known-k-full-corpus", **report_payload["full_corpus_known_k"]})
+
+        preload_recovered_path = Path(args.preload_recovered_json) if getattr(args, "preload_recovered_json", "") else None
+        if preload_recovered_path and preload_recovered_path.exists() and count_nonempty_lines(preload_recovered_path) > 0:
+            active_report_path = Path(args.preload_chain_report).with_name(
+                Path(args.preload_chain_report).stem + "_known_priv_active.json"
+            )
+            active_report = derive_recovered_k_from_known_privs(
+                sig_path=sigs,
+                recovered_json_path=preload_recovered_path,
+                recovered_k_path=Path(args.recover_k_out),
+                report_path=active_report_path,
+                max_rows=max(0, int(args.known_priv_chain_max_rows)),
+            )
+            report_payload["preload_recovered_json"] = {
+                "path": str(preload_recovered_path),
+                "rows": count_nonempty_lines(preload_recovered_path),
+                "sha256": sha256_file(preload_recovered_path),
+            }
+            report_payload["active_known_priv"] = {
+                "report": str(active_report_path),
+                "rows_matching_recovered_pubkey": int(active_report.get("rows_matching_recovered_pubkey", 0) or 0),
+                "new_k_candidates": int(active_report.get("new_k_candidates", 0) or 0),
+                "new_r_groups": int(active_report.get("new_r_groups", 0) or 0),
+            }
+            preload_reports.append({"name": "preload-known-priv-active", **report_payload["active_known_priv"]})
+
+            full_corpus_path = Path(args.known_k_full_corpus_sigs) if args.known_k_full_corpus_sigs else None
+            if full_corpus_path and full_corpus_path.exists() and full_corpus_path.resolve() != sigs.resolve():
+                full_report_path = Path(args.preload_chain_report).with_name(
+                    Path(args.preload_chain_report).stem + "_known_priv_full_corpus.json"
+                )
+                full_report = derive_recovered_k_from_known_privs(
+                    sig_path=full_corpus_path,
+                    recovered_json_path=preload_recovered_path,
+                    recovered_k_path=Path(args.recover_k_out),
+                    report_path=full_report_path,
+                    max_rows=max(0, int(args.known_k_full_corpus_max_rows)),
+                )
+                report_payload["full_corpus_known_priv"] = {
+                    "report": str(full_report_path),
+                    "input": str(full_corpus_path),
+                    "rows_matching_recovered_pubkey": int(full_report.get("rows_matching_recovered_pubkey", 0) or 0),
+                    "new_k_candidates": int(full_report.get("new_k_candidates", 0) or 0),
+                    "new_r_groups": int(full_report.get("new_r_groups", 0) or 0),
+                }
+                preload_reports.append({"name": "preload-known-priv-full-corpus", **report_payload["full_corpus_known_priv"]})
+
+        after_priv = count_nonempty_lines(Path(args.recover_json_out))
+        after_k = count_nonempty_lines(Path(args.recover_k_out))
+        report_payload["rows_before"] = {
+            "recovered_keys": before_priv,
+            "recovered_k": before_k,
+        }
+        report_payload["rows_after_preload_derivation"] = {
+            "recovered_keys": after_priv,
+            "recovered_k": after_k,
+        }
+        report_payload["preload_stage_summaries"] = preload_reports
+
+        if after_priv != before_priv or after_k != before_k:
+            report_payload["chain_rounds_ran"] = True
+            run_chain_propagation(trigger_stage, max_rounds=3)
+
+        report_payload["rows_after_chain_rounds"] = {
+            "recovered_keys": count_nonempty_lines(Path(args.recover_json_out)),
+            "recovered_k": count_nonempty_lines(Path(args.recover_k_out)),
+        }
+        Path(args.preload_chain_report).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.preload_chain_report).write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+        if preload_reports:
+            stage_runs.append({
+                "name": "preload-chain",
+                "rc": 0,
+                "input": str(sigs),
+                "preload_reports": len(preload_reports),
+                "chain_rounds_ran": bool(report_payload["chain_rounds_ran"]),
+            })
+            print(
+                "Preload chain propagation:",
+                f"reports={len(preload_reports)}",
+                f"keys_before={before_priv}",
+                f"keys_after={report_payload['rows_after_chain_rounds']['recovered_keys']}",
+                f"k_before={before_k}",
+                f"k_after={report_payload['rows_after_chain_rounds']['recovered_k']}",
+                f"report={args.preload_chain_report}",
+            )
+        return report_payload
+
+    preload_chain_report = run_preload_chain_propagation("preload-chain")
+
     strong_signal = (
         risk >= max(args.risk_threshold, 80)
         or cross_pub_dup_r > 0
@@ -4687,6 +5427,24 @@ def main() -> None:
         stage1_threads = max(1, min(args.threads, 4))
         stage1_iter = 1
 
+    stage0_resolved_by_preload_report: dict[str, Any] | None = None
+    stage0_resolved_by_preload = False
+    if (
+        args.enable_unresolved_targets
+        and not args.stage0_only
+        and not args.exhaustive_recover
+        and stage0_subset_info
+        and int(stage0_subset_info.get("nontrivial_duplicate_r_groups", 0) or 0) > 0
+    ):
+        stage0_resolved_by_preload_report = build_unresolved_recovery_targets_subset(
+            sig_path=sigs,
+            recovered_json_path=Path(args.recover_json_out),
+            recovered_k_path=Path(args.recover_k_out),
+            out_path=Path(args.unresolved_targets_out),
+            report_path=Path(args.unresolved_targets_report),
+        )
+        stage0_resolved_by_preload = int(stage0_resolved_by_preload_report.get("selected_rows", 0) or 0) == 0
+
     # Direct duplicate-r recovery is algebraically stronger than cluster heuristics.
     # Run it on the full duplicate-r focus subset before any broader clustered stage,
     # because cluster gating can legitimately omit the exact same-r/different-s rows.
@@ -4695,25 +5453,35 @@ def main() -> None:
         and int(stage0_subset_info.get("nontrivial_duplicate_r_groups", 0) or 0) > 0
         and int(stage0_subset_info.get("selected_signatures_recoverable_focus", 0) or 0) > 0
     ):
-        stage0_extra = ["--no-lcg", "--scan-random-k", "0", "--min-count", "1"] + external_candidate_args
-        stage0_rc = run_recover_stage(
-            recover_bin=args.recover_bin,
-            recover_input=str(stage0_recoverable_path),
-            threads=stage1_threads,
-            max_iter=1,
-            stage_name="stage0-dup-r-direct",
-            recover_json_out=args.recover_json_out,
-            recover_txt_out=args.recover_txt_out,
-            recover_k_out=args.recover_k_out,
-            recover_deltas_out=args.recover_deltas_out,
-            recover_collisions_out=args.recover_collisions_out,
-            recover_clusters_out=args.recover_clusters_out,
-            extra_args=stage0_extra,
-        )
-        stage_runs.append({"name": "stage0-dup-r-direct", "rc": stage0_rc})
-        if stage0_rc != 0:
-            raise RuntimeError(f"Recover stage0 duplicate-r failed with exit code {stage0_rc}")
-        run_chain_propagation("stage0-dup-r-direct")
+        if stage0_resolved_by_preload:
+            stage_runs.append({
+                "name": "stage0-dup-r-direct-skip",
+                "rc": 0,
+                "skipped": True,
+                "reason": "preload_chain_resolved_duplicate_r_targets",
+                "selected_unresolved_rows": 0,
+            })
+            print("Skipping Stage0 duplicate-r direct recovery: preload-chain resolved all duplicate-r targets.")
+        else:
+            stage0_extra = ["--no-lcg", "--scan-random-k", "0", "--min-count", "1"] + external_candidate_args
+            stage0_rc = run_recover_stage(
+                recover_bin=args.recover_bin,
+                recover_input=str(stage0_recoverable_path),
+                threads=stage1_threads,
+                max_iter=1,
+                stage_name="stage0-dup-r-direct",
+                recover_json_out=args.recover_json_out,
+                recover_txt_out=args.recover_txt_out,
+                recover_k_out=args.recover_k_out,
+                recover_deltas_out=args.recover_deltas_out,
+                recover_collisions_out=args.recover_collisions_out,
+                recover_clusters_out=args.recover_clusters_out,
+                extra_args=stage0_extra,
+            )
+            stage_runs.append({"name": "stage0-dup-r-direct", "rc": stage0_rc})
+            if stage0_rc != 0:
+                raise RuntimeError(f"Recover stage0 duplicate-r failed with exit code {stage0_rc}")
+            run_chain_propagation("stage0-dup-r-direct")
         stage0_post_validation = post_validate_recovered(Path(args.recover_json_out))
         stage0_new_valid_rows = (
             int(stage0_post_validation["valid_rows"]) - int(pre_recover_validation["valid_rows"])
@@ -4773,6 +5541,7 @@ def main() -> None:
                 "signal_fusion_confidence": fusion_conf,
                 "signal_fusion_recommendation": fusion_reco,
                 "verification_quality": vq,
+                "verification_failure_report": verification_failure_report,
                 "low_quality_data": low_quality_data,
                 "cluster_fallback_used": cluster_fallback_used,
                 "sqlite_index": sqlite_index_report,
@@ -4785,6 +5554,7 @@ def main() -> None:
                 "stage0_subset": stage0_subset_info,
                 "known_k_chain_report": known_k_chain_report,
                 "known_priv_chain_report": known_priv_chain_report,
+                "preload_chain_report": preload_chain_report,
                 "post_recover_validation": stage0_post_validation,
             })
             try:
@@ -4897,6 +5667,7 @@ def main() -> None:
                 recovered_json_path=Path(args.recover_json_out),
                 recovered_k_path=Path(args.recover_k_out),
                 audit_report=report,
+                audit_flagged_only=bool(args.suspicious_signer_relation_audit_only),
                 out_path=Path(args.relation_neighborhood_out),
                 report_path=Path(args.relation_neighborhood_report),
                 min_sigs=args.relation_min_sigs,
@@ -4946,6 +5717,7 @@ def main() -> None:
             recovered_json_path=Path(args.recover_json_out),
             recovered_k_path=Path(args.recover_k_out),
             audit_report=report,
+            audit_flagged_only=False,
             out_path=Path(args.relation_neighborhood_out),
             report_path=Path(args.relation_neighborhood_report),
             min_sigs=args.relation_min_sigs,
@@ -5242,6 +6014,28 @@ def main() -> None:
         pre_recover_validation,
         post_validation,
     )
+    recovery_evidence_report = build_recovery_evidence_report(
+        out_path=Path(args.recovery_evidence_report),
+        audit_report=report,
+        stage0_subset_info=stage0_subset_info,
+        duplicate_r_pair_summary=duplicate_r_pair_summary,
+        nonce_hypothesis_report=nonce_hypothesis_report,
+        hnp_leak_report=hnp_leak_report,
+        hnp_bounded_k_report=hnp_bounded_k_report,
+        relation_subset_report=relation_subset_report,
+        unresolved_targets_report=unresolved_targets_report,
+        broad_relation_skip_report=broad_relation_skip_report,
+        known_k_chain_report=known_k_chain_report,
+        known_priv_chain_report=known_priv_chain_report,
+        chain_report=chain_report,
+        pre_validation=pre_recover_validation,
+        post_validation=post_validation,
+        material_summary=material_summary,
+        stage_runs=stage_runs,
+        hnp_min_leaks=args.hnp_min_leaks,
+        recover_deltas_path=Path(args.recover_deltas_out),
+        recovered_k_path=Path(args.recover_k_out),
+    )
 
     print(f"Recovery automation complete. input={recover_input}")
     write_decision(args.decision_out, {
@@ -5278,6 +6072,7 @@ def main() -> None:
         "signal_fusion_confidence": fusion_conf,
         "signal_fusion_recommendation": fusion_reco,
         "verification_quality": vq,
+        "verification_failure_report": verification_failure_report,
         "low_quality_data": low_quality_data,
         "cluster_fallback_used": cluster_fallback_used,
         "sqlite_index": sqlite_index_report,
@@ -5296,7 +6091,9 @@ def main() -> None:
         "relation_neighborhood_report": relation_subset_report,
         "known_k_chain_report": known_k_chain_report,
         "known_priv_chain_report": known_priv_chain_report,
+        "preload_chain_report": preload_chain_report,
         "recovery_chain_report": chain_report,
+        "recovery_evidence_report": recovery_evidence_report,
         "post_recover_validation": post_validation,
     })
     try:

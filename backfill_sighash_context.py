@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -31,32 +32,89 @@ def row_key(obj: dict[str, Any]) -> tuple[str, int, int, int] | None:
         return None
 
 
-def duplicate_r_values(rows: list[dict[str, Any]]) -> set[int]:
-    counts: Counter[int] = Counter()
-    for obj in rows:
-        try:
-            counts[int(parse_int_value(obj.get("r")))] += 1
-        except Exception:
-            continue
-    return {r for r, c in counts.items() if c > 1}
+def parse_json_object(raw: str) -> dict[str, Any] | None:
+    if not raw.strip():
+        return None
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
 
 
-def load_jsonl(path: Path) -> tuple[list[str], list[dict[str, Any] | None]]:
-    raw_lines: list[str] = []
-    rows: list[dict[str, Any] | None] = []
+def scan_input(path: Path, *, count_duplicate_r: bool) -> tuple[set[int], dict[str, int]]:
+    """Stream the file once to collect global metadata without retaining rows."""
+    r_counts: Counter[int] = Counter()
+    stats: Counter[str] = Counter()
     with path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
-            raw = line.rstrip("\n")
-            raw_lines.append(raw)
-            if not raw.strip():
-                rows.append(None)
+            stats["rows_total"] += 1
+            obj = parse_json_object(line.rstrip("\n"))
+            if not isinstance(obj, dict):
+                if line.strip():
+                    stats["bad_or_non_object_rows"] += 1
                 continue
-            try:
-                obj = json.loads(raw)
-                rows.append(obj if isinstance(obj, dict) else None)
-            except Exception:
-                rows.append(None)
-    return raw_lines, rows
+            stats["dict_rows"] += 1
+            if obj.get("sighash_context"):
+                stats["rows_already_with_context"] += 1
+            if count_duplicate_r:
+                try:
+                    r_counts[int(parse_int_value(obj.get("r")))] += 1
+                except Exception:
+                    stats["rows_without_parseable_r"] += 1
+    dup_r = {r for r, c in r_counts.items() if c > 1} if count_duplicate_r else set()
+    stats["duplicate_r_values"] = len(dup_r)
+    return dup_r, dict(stats)
+
+
+def select_candidate_rows(
+    path: Path,
+    *,
+    duplicate_r: set[int],
+    only_duplicate_r: bool,
+    max_rows: int,
+    max_txs: int,
+) -> tuple[Counter[tuple[str, int, int, int]], list[str], dict[str, int]]:
+    """Stream-select bounded rows and txids to backfill.
+
+    The returned Counter is keyed by (txid, vin, r, s) so the rewrite pass can
+    update exactly the selected number of matching rows without storing raw
+    lines or decoded objects.
+    """
+    selected_keys: Counter[tuple[str, int, int, int]] = Counter()
+    txids: list[str] = []
+    selected_txids: set[str] = set()
+    skipped_txids: set[str] = set()
+    stats: Counter[str] = Counter()
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            obj = parse_json_object(line.rstrip("\n"))
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("sighash_context"):
+                continue
+            key = row_key(obj)
+            if key is None:
+                stats["rows_without_row_key"] += 1
+                continue
+            txid = key[0]
+            if only_duplicate_r and key[2] not in duplicate_r:
+                continue
+            if txid not in selected_txids:
+                if max_txs > 0 and len(txids) >= max_txs:
+                    skipped_txids.add(txid)
+                    stats["rows_skipped_by_max_txs"] += 1
+                    continue
+                selected_txids.add(txid)
+                txids.append(txid)
+            selected_keys[key] += 1
+            stats["candidate_rows"] += 1
+            if max_rows > 0 and stats["candidate_rows"] >= max_rows:
+                break
+    stats["candidate_unique_keys"] = len(selected_keys)
+    stats["unique_txids_selected"] = len(txids)
+    stats["unique_txids_skipped_by_max_txs"] = len(skipped_txids)
+    return selected_keys, txids, dict(stats)
 
 
 def cache_path_for_tx(cache_dir: Path, txid: str) -> Path:
@@ -215,6 +273,91 @@ def extraction_failure_detail(
     }
 
 
+def write_backfilled_jsonl(
+    *,
+    processor: BlockWalker,
+    in_path: Path,
+    out_path: Path,
+    selected_keys: Counter[tuple[str, int, int, int]],
+    context_by_key: dict[tuple[str, int, int, int], dict[str, Any]],
+    tx_by_txid: dict[str, dict[str, Any]],
+    extracted_by_txid: dict[str, dict[int, list[dict[str, Any]]]],
+    require_extraction_match: bool,
+    strip_row_fallback_unverified: bool,
+) -> dict[str, Any]:
+    pending = Counter(selected_keys)
+    updated = 0
+    updated_by_extraction = 0
+    updated_by_row_fallback = 0
+    missing_match = 0
+    stripped_row_fallback_unverified = 0
+    failure_reason_counts: Counter[str] = Counter()
+    extraction_failure_samples: list[dict[str, Any]] = []
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with in_path.open("r", encoding="utf-8", errors="replace") as src, out_path.open("w", encoding="utf-8") as dst:
+        for line in src:
+            raw = line.rstrip("\n")
+            obj = parse_json_object(raw)
+            if not isinstance(obj, dict):
+                dst.write(line)
+                continue
+            if strip_row_fallback_unverified and obj.get("sighash_context_source") == "row_fallback_unverified":
+                changed = False
+                for field in ("sighash_context", "sighash_context_source"):
+                    if field in obj:
+                        obj.pop(field, None)
+                        changed = True
+                if changed:
+                    stripped_row_fallback_unverified += 1
+                    raw = json.dumps(obj, sort_keys=True)
+            key = row_key(obj)
+            if key is None or pending.get(key, 0) <= 0:
+                dst.write(raw + "\n")
+                continue
+            pending[key] -= 1
+            if obj.get("sighash_context"):
+                dst.write(raw + "\n")
+                continue
+
+            ctx = context_by_key.get(key)
+            if not ctx:
+                tx = tx_by_txid.get(key[0])
+                detail = extraction_failure_detail(obj, key, tx, extracted_by_txid.get(key[0], {}))
+                failure_reason_counts[str(detail["reason"])] += 1
+                if len(extraction_failure_samples) < 50:
+                    extraction_failure_samples.append(detail)
+                ctx = None if require_extraction_match else (
+                    fallback_context_from_existing_row(processor, tx, obj) if tx is not None else None
+                )
+                if not ctx:
+                    missing_match += 1
+                    dst.write(raw + "\n")
+                    continue
+                updated_by_row_fallback += 1
+            else:
+                updated_by_extraction += 1
+
+            obj["sighash_context"] = ctx["sighash_context"]
+            obj["sighash_context_source"] = ctx.get("context_source", "row_fallback_unverified")
+            for extra in ("script_code", "redeem_script", "witness_script"):
+                if ctx.get(extra) and not obj.get(extra):
+                    obj[extra] = ctx[extra]
+            dst.write(json.dumps(obj, sort_keys=True) + "\n")
+            updated += 1
+
+    return {
+        "updated_rows": updated,
+        "updated_by_extraction_match": updated_by_extraction,
+        "updated_by_row_fallback": updated_by_row_fallback,
+        "missing_extracted_match": missing_match,
+        "extraction_failure_reason_counts": dict(failure_reason_counts),
+        "extraction_failure_samples": extraction_failure_samples,
+        "selected_rows_not_seen_in_rewrite": int(sum(v for v in pending.values() if v > 0)),
+        "stripped_row_fallback_unverified": stripped_row_fallback_unverified,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Backfill sighash_context for existing signature JSONL rows")
     ap.add_argument("--in", dest="input", required=True, help="Input signatures JSONL")
@@ -232,7 +375,11 @@ def main() -> None:
     ap.add_argument("--no-tx-cache", action="store_true",
                     help="Disable transaction cache and fetch every tx from providers")
     ap.add_argument("--require-extraction-match", action="store_true",
-                    help="Only write contexts copied from a re-extracted matching (txid,vin,r,s); disables row_fallback_unverified")
+                    help="Only write contexts copied from a re-extracted matching (txid,vin,r,s). This is now the default unless --allow-row-fallback is used")
+    ap.add_argument("--allow-row-fallback", action="store_true",
+                    help="Allow unverified fallback contexts built from existing row script fields when re-extraction does not match")
+    ap.add_argument("--strip-row-fallback-unverified", action="store_true",
+                    help="Remove existing sighash_context fields whose source is row_fallback_unverified while streaming the file")
     ap.add_argument("--report", default="sighash_context_backfill_report.json")
     args = ap.parse_args()
 
@@ -242,39 +389,16 @@ def main() -> None:
     if not args.inplace and not args.out:
         raise ValueError("--out is required unless --inplace is used")
 
-    raw_lines, maybe_rows = load_jsonl(in_path)
-    concrete_rows = [r for r in maybe_rows if isinstance(r, dict)]
-    dup_r = duplicate_r_values(concrete_rows) if args.only_duplicate_r else set()
+    dup_r, scan_stats = scan_input(in_path, count_duplicate_r=bool(args.only_duplicate_r))
+    selected_keys, txids, selection_stats = select_candidate_rows(
+        in_path,
+        duplicate_r=dup_r,
+        only_duplicate_r=bool(args.only_duplicate_r),
+        max_rows=max(0, int(args.max_rows)),
+        max_txs=max(0, int(args.max_txs)),
+    )
 
-    candidate_indices: list[int] = []
-    for idx, obj in enumerate(maybe_rows):
-        if not isinstance(obj, dict):
-            continue
-        if obj.get("sighash_context"):
-            continue
-        key = row_key(obj)
-        if key is None:
-            continue
-        if args.only_duplicate_r and key[2] not in dup_r:
-            continue
-        candidate_indices.append(idx)
-        if args.max_rows > 0 and len(candidate_indices) >= args.max_rows:
-            break
-
-    txids: list[str] = []
-    seen_txids: set[str] = set()
-    for idx in candidate_indices:
-        obj = maybe_rows[idx]
-        if not isinstance(obj, dict):
-            continue
-        txid = str(obj.get("txid") or "")
-        if txid and txid not in seen_txids:
-            seen_txids.add(txid)
-            txids.append(txid)
-            if args.max_txs > 0 and len(txids) >= args.max_txs:
-                break
-
-    processor = BlockWalker(deterministic=True, include_sighash_context=True)
+    processor = BlockWalker(deterministic=True, include_sighash_context=True, hydrate_seen_lines=False)
     cache_dir = None if args.no_tx_cache else Path(args.tx_cache_dir)
     cache_stats: Counter[str] = Counter()
     context_by_key: dict[tuple[str, int, int, int], dict[str, Any]] = {}
@@ -293,63 +417,45 @@ def main() -> None:
         except Exception:
             fetch_errors += 1
 
-    updated = 0
-    updated_by_extraction = 0
-    updated_by_row_fallback = 0
-    missing_match = 0
-    failure_reason_counts: Counter[str] = Counter()
-    extraction_failure_samples: list[dict[str, Any]] = []
-    for idx in candidate_indices:
-        obj = maybe_rows[idx]
-        if not isinstance(obj, dict):
-            continue
-        key = row_key(obj)
-        if key is None:
-            continue
-        ctx = context_by_key.get(key)
-        if not ctx:
-            tx = tx_by_txid.get(key[0])
-            detail = extraction_failure_detail(obj, key, tx, extracted_by_txid.get(key[0], {}))
-            failure_reason_counts[str(detail["reason"])] += 1
-            if len(extraction_failure_samples) < 50:
-                extraction_failure_samples.append(detail)
-            ctx = None if args.require_extraction_match else (
-                fallback_context_from_existing_row(processor, tx, obj) if tx is not None else None
-            )
-            if not ctx:
-                missing_match += 1
-                continue
-            updated_by_row_fallback += 1
-        else:
-            updated_by_extraction += 1
-        obj["sighash_context"] = ctx["sighash_context"]
-        obj["sighash_context_source"] = ctx.get("context_source", "row_fallback_unverified")
-        for extra in ("script_code", "redeem_script", "witness_script"):
-            if ctx.get(extra) and not obj.get(extra):
-                obj[extra] = ctx[extra]
-        raw_lines[idx] = json.dumps(obj, sort_keys=True)
-        updated += 1
-
     out_path = in_path if args.inplace else Path(args.out)
     if args.inplace and args.backup:
         backup = in_path.with_suffix(in_path.suffix + ".bak")
-        backup.write_text(in_path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\n".join(raw_lines) + ("\n" if raw_lines else ""), encoding="utf-8")
+        shutil.copyfile(in_path, backup)
+    write_target = out_path
+    tmp_path: Path | None = None
+    if args.inplace:
+        tmp_path = in_path.with_suffix(in_path.suffix + ".backfill.tmp")
+        write_target = tmp_path
+    rewrite_stats = write_backfilled_jsonl(
+        processor=processor,
+        in_path=in_path,
+        out_path=write_target,
+        selected_keys=selected_keys,
+        context_by_key=context_by_key,
+        tx_by_txid=tx_by_txid,
+        extracted_by_txid=extracted_by_txid,
+        require_extraction_match=bool(args.require_extraction_match or not args.allow_row_fallback),
+        strip_row_fallback_unverified=bool(args.strip_row_fallback_unverified),
+    )
+    if tmp_path is not None:
+        tmp_path.replace(in_path)
 
     report = {
         "input": str(in_path),
         "output": str(out_path),
-        "rows_total": len(raw_lines),
-        "candidate_rows": len(candidate_indices),
+        "rows_total": int(scan_stats.get("rows_total", 0)),
+        "dict_rows": int(scan_stats.get("dict_rows", 0)),
+        "bad_or_non_object_rows": int(scan_stats.get("bad_or_non_object_rows", 0)),
+        "rows_already_with_context": int(scan_stats.get("rows_already_with_context", 0)),
+        "duplicate_r_values": int(scan_stats.get("duplicate_r_values", 0)),
+        "candidate_rows": int(selection_stats.get("candidate_rows", 0)),
+        "candidate_unique_keys": int(selection_stats.get("candidate_unique_keys", 0)),
         "unique_txids_fetched": len(txids),
-        "updated_rows": updated,
-        "updated_by_extraction_match": updated_by_extraction,
-        "updated_by_row_fallback": updated_by_row_fallback,
-        "missing_extracted_match": missing_match,
-        "require_extraction_match": bool(args.require_extraction_match),
-        "extraction_failure_reason_counts": dict(failure_reason_counts),
-        "extraction_failure_samples": extraction_failure_samples,
+        "selection": selection_stats,
+        **rewrite_stats,
+        "require_extraction_match": bool(args.require_extraction_match or not args.allow_row_fallback),
+        "allow_row_fallback": bool(args.allow_row_fallback),
+        "strip_row_fallback_unverified": bool(args.strip_row_fallback_unverified),
         "fetch_errors": fetch_errors,
         "tx_cache": {
             "enabled": cache_dir is not None,
@@ -362,9 +468,9 @@ def main() -> None:
     Path(args.report).write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(
         "sighash context backfill complete:",
-        f"candidate_rows={len(candidate_indices)}",
+        f"candidate_rows={selection_stats.get('candidate_rows', 0)}",
         f"txids={len(txids)}",
-        f"updated_rows={updated}",
+        f"updated_rows={rewrite_stats.get('updated_rows', 0)}",
         f"report={args.report}",
     )
 

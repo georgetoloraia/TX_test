@@ -357,6 +357,7 @@ class BlockWalker:
         random_max_height: int = 450000,
         emit_secrets: bool = False,
         include_sighash_context: bool = False,
+        hydrate_seen_lines: bool = True,
     ):
         self.api_endpoints = [
             {"name":"Mempool.space","base_url":"https://mempool.space/api/","weight":9,"requests":0,"last_used":0,
@@ -390,9 +391,12 @@ class BlockWalker:
         # ensure files
         for p in [SIGS_JSONL, R_VALUES_FILE, REPEAT_JSONL, RECOVERED_JSONL, RECOVERED_TXT, SIGSCRIPTS_TXT]:
             if not os.path.exists(p): open(p,"a").close()
-        # warm-start dedup guard from existing signatures.jsonl, so repeated runs
-        # do not keep appending identical rows and inflating replay-like duplicate-r.
-        self._hydrate_seen_lines_from_existing()
+        # Warm-start dedup guard from existing signatures.jsonl, so repeated
+        # downloader runs do not keep appending identical rows and inflating
+        # replay-like duplicate-r. Tools that only fetch/normalize existing txs
+        # can disable this to avoid loading multi-GB signature files into RAM.
+        if hydrate_seen_lines:
+            self._hydrate_seen_lines_from_existing()
 
     def _hydrate_seen_lines_from_existing(self) -> None:
         try:

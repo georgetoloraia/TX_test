@@ -345,8 +345,10 @@ def main() -> None:
     ap.add_argument("--max-txs-per-address", type=int, default=100)
     ap.add_argument("--timeout", type=int, default=20)
     ap.add_argument("--sleep-sec", type=float, default=0.25)
-    ap.add_argument("--include-sighash-context", action="store_true",
-                    help="Store compact transaction context needed to recompute z in later diagnostics.")
+    ap.add_argument("--include-sighash-context", action="store_true", default=True,
+                    help="Store compact transaction context needed to recompute z in later diagnostics (default).")
+    ap.add_argument("--no-include-sighash-context", action="store_false", dest="include_sighash_context",
+                    help="Disable compact sighash context capture for smaller signature rows.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 

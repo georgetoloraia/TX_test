@@ -452,6 +452,8 @@ def build_cycle_artifact_paths(run_dir: Path, cycle: int, cycle_start: int, args
         "recover_collisions": cycle_dir / "r_collisions.jsonl",
         "recover_clusters": cycle_dir / "dupR_clusters.jsonl",
         "candidate_validation_report": cycle_dir / "candidate_validation_report.json",
+        "recovery_evidence_report": cycle_dir / "recovery_evidence_report.json",
+        "verification_failure_report": cycle_dir / "verification_failure_report.json",
         "clustered_sigs": cycle_dir / "signatures.clustered.jsonl",
         "cluster_report": cycle_dir / "cluster_risk_report.json",
         "hnp_candidates": cycle_dir / "hnp_lll_bkz_candidates.txt",
@@ -476,6 +478,7 @@ def build_cycle_artifact_paths(run_dir: Path, cycle: int, cycle_start: int, args
         "recovery_store_report": cycle_dir / "recovery_store_report.json",
         "known_k_chain_report": cycle_dir / "known_k_chain_report.json",
         "known_priv_chain_report": cycle_dir / "known_priv_chain_report.json",
+        "preload_chain_report": cycle_dir / "preload_chain_report.json",
         "known_k_full_corpus_report": cycle_dir / "known_k_full_corpus_report.json",
         "known_k_full_corpus_sigs": cycle_dir / "signatures.known_k_full_corpus.jsonl",
         "known_k_full_corpus_index_db": Path(args.known_k_full_corpus_index_db),
@@ -804,8 +807,10 @@ def main() -> None:
                     help="Lower bound passed to download_signatures.py when --download-mode=random")
     ap.add_argument("--random-max-height", type=int, default=450000,
                     help="Upper bound passed to download_signatures.py when --download-mode=random")
-    ap.add_argument("--include-sighash-context", action="store_true",
-                    help="Store compact transaction context in new signature rows for later z recomputation diagnostics")
+    ap.add_argument("--include-sighash-context", action="store_true", default=True,
+                    help="Store compact transaction context in new signature rows for later z recomputation diagnostics (default)")
+    ap.add_argument("--no-include-sighash-context", action="store_false", dest="include_sighash_context",
+                    help="Disable compact sighash context capture for smaller signature rows")
 
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--risk-threshold", type=int, default=40)
@@ -857,6 +862,8 @@ def main() -> None:
                     help="Forward to automate_recover.py: exact k candidate generation unknown-bit cap")
     ap.add_argument("--hnp-bruteforce-max-candidates", type=int, default=200000,
                     help="Forward to automate_recover.py: global exact k candidate cap")
+    ap.add_argument("--verification-failure-max-rows", type=int, default=0,
+                    help="Forward to automate_recover.py: max rows for verification_failure_report.json (0 = all active rows)")
     ap.add_argument("--stage0-only", action="store_true",
                     help="Forward to automate_recover.py: run only direct duplicate-r Stage0 recovery")
     ap.add_argument("--stop-after-stage0-hit", action="store_true",
@@ -899,6 +906,11 @@ def main() -> None:
                     help="Forward to automate_recover.py: run bounded relation scans on audit-flagged signer cohorts")
     ap.add_argument("--no-enable-suspicious-signer-relation", action="store_false", dest="enable_suspicious_signer_relation",
                     help="Forward to automate_recover.py: disable audit-flagged signer relation fallback")
+    ap.add_argument("--suspicious-signer-relation-audit-only", action="store_true", default=True,
+                    help="Forward to automate_recover.py: fallback scans only audit-flagged signers")
+    ap.add_argument("--no-suspicious-signer-relation-audit-only", action="store_false",
+                    dest="suspicious_signer_relation_audit_only",
+                    help="Forward to automate_recover.py: allow fallback to include non-audit signers")
 
     ap.add_argument("--signatures", default="signatures.jsonl")
     ap.add_argument("--recovered", default="recovered_keys.jsonl")
@@ -1112,6 +1124,9 @@ def main() -> None:
                     "recovery_graph_report.json",
                     "recovery_chain_report.json",
                     "recovery_graph_expansion_report.json",
+                    "recovery_evidence_report.json",
+                    "verification_failure_report.json",
+                    "preload_chain_report.json",
                     "known_priv_chain_report.json",
                 ],
                 Path(args.runs_dir),
@@ -1187,6 +1202,9 @@ def main() -> None:
             "--hnp-bounded-k-out", str(cycle_artifacts["hnp_bounded_k"]),
             "--hnp-bounded-k-report", str(cycle_artifacts["hnp_bounded_k_report"]),
             "--candidate-validation-report", str(cycle_artifacts["candidate_validation_report"]),
+            "--recovery-evidence-report", str(cycle_artifacts["recovery_evidence_report"]),
+            "--verification-failure-report", str(cycle_artifacts["verification_failure_report"]),
+            "--verification-failure-max-rows", str(args.verification_failure_max_rows),
             "--target-sigs-out", str(cycle_artifacts["target_sigs"]),
             "--sqlite-index-db", str(cycle_artifacts["signature_index_db"]),
             "--sqlite-index-build-report", str(cycle_artifacts["signature_index_build_report"]),
@@ -1205,6 +1223,7 @@ def main() -> None:
             "--recovery-chain-report", str(cycle_artifacts["recovery_chain_report"]),
             "--known-k-chain-report", str(cycle_artifacts["known_k_chain_report"]),
             "--known-priv-chain-report", str(cycle_artifacts["known_priv_chain_report"]),
+            "--preload-chain-report", str(cycle_artifacts["preload_chain_report"]),
             "--known-k-full-corpus-sigs", args.signatures,
             "--known-k-full-corpus-report", str(cycle_artifacts["known_k_full_corpus_report"]),
             "--known-k-full-corpus-out", str(cycle_artifacts["known_k_full_corpus_sigs"]),
@@ -1240,6 +1259,8 @@ def main() -> None:
             recover_cmd.append("--no-skip-broad-relation-when-resolved")
         if not args.enable_suspicious_signer_relation:
             recover_cmd.append("--no-enable-suspicious-signer-relation")
+        if not args.suspicious_signer_relation_audit_only:
+            recover_cmd.append("--no-suspicious-signer-relation-audit-only")
         if args.sqlite_index_store_raw:
             recover_cmd.append("--sqlite-index-store-raw")
         if args.enable_nonce_hypotheses:
@@ -1451,6 +1472,9 @@ def main() -> None:
                     cycle_artifacts["recovery_graph_expansion_report"],
                     cycle_artifacts["unresolved_targets_report"],
                     cycle_artifacts["recovery_chain_report"],
+                    cycle_artifacts["recovery_evidence_report"],
+                    cycle_artifacts["verification_failure_report"],
+                    cycle_artifacts["preload_chain_report"],
                 ]
                 if p.exists()
             ]

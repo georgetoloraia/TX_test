@@ -1,36 +1,762 @@
 {
-  "input": "signatures.hnp_leaks.jsonl",
-  "output": "nonce_hypothesis_k.jsonl",
-  "models": [
-    "height-counter-sha256",
-    "height-direct",
-    "height-sha256",
-    "timestamp-counter-sha256",
-    "timestamp-direct",
-    "timestamp-sha256"
-  ],
   "bounds": {
-    "time_window_sec": 2,
-    "time_step_sec": 1,
     "counter_max": 3,
-    "small_k_start": 1,
+    "max_candidates": 300000,
     "small_k_end": 0,
-    "max_candidates": 200000
+    "small_k_start": 1,
+    "time_step_sec": 1,
+    "time_window_sec": 2
   },
-  "observed": {
-    "total_rows": 0,
-    "usable_rows": 0,
-    "target_pubkey": null,
-    "target_matched_rows": null,
-    "unique_r": 0,
-    "missing_block_time_rows": 0,
-    "missing_block_height_rows": 0,
-    "missing_txid_rows": 0,
-    "missing_vin_rows": 0,
-    "skipped_bad_rows": 0
-  },
-  "tested_candidates": 0,
+  "enabled": true,
+  "input": "signatures.dup_r_recoverable.jsonl",
   "matched_candidates": 0,
   "model_match_counts": {},
-  "stopped_by_budget": false
+  "model_readiness": {
+    "height-counter-ansi-rand-raw": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_height"
+      ]
+    },
+    "height-counter-ansi-rand-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_height"
+      ]
+    },
+    "height-counter-lcg32-raw": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_height"
+      ]
+    },
+    "height-counter-lcg32-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_height"
+      ]
+    },
+    "height-counter-xorshift32-raw": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_height"
+      ]
+    },
+    "height-counter-xorshift32-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_height"
+      ]
+    },
+    "height-direct": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_height"
+      ]
+    },
+    "height-le32-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_height"
+      ]
+    },
+    "height-le64-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_height"
+      ]
+    },
+    "height-pubkey-counter-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_height",
+        "pubkey"
+      ]
+    },
+    "height-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_height"
+      ]
+    },
+    "height-time-counter-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_height",
+        "block_time"
+      ]
+    },
+    "height-time-txid-vin-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_height",
+        "block_time",
+        "txid",
+        "vin"
+      ]
+    },
+    "height-txid-vin-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_height",
+        "txid",
+        "vin"
+      ]
+    },
+    "prevout-counter-dsha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "prevout"
+      ]
+    },
+    "prevout-counter-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "prevout"
+      ]
+    },
+    "prevout-txid-vin-bin-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "prevout",
+        "txid",
+        "vin"
+      ]
+    },
+    "prevout-txid-vin-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "prevout",
+        "txid",
+        "vin"
+      ]
+    },
+    "pubkey-height-time-txid-vin-bin-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "pubkey",
+        "block_height",
+        "block_time",
+        "txid",
+        "vin"
+      ]
+    },
+    "pubkey-height-time-txid-vin-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "pubkey",
+        "block_height",
+        "block_time",
+        "txid",
+        "vin"
+      ]
+    },
+    "pubkey-txid-vin-bin-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "pubkey",
+        "txid",
+        "vin"
+      ]
+    },
+    "pubkey-txid-vin-counter-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "pubkey",
+        "txid",
+        "vin"
+      ]
+    },
+    "pubkey-txid-vin-dsha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "pubkey",
+        "txid",
+        "vin"
+      ]
+    },
+    "pubkey-txid-vin-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "pubkey",
+        "txid",
+        "vin"
+      ]
+    },
+    "timestamp-counter-ansi-rand-raw": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_time"
+      ]
+    },
+    "timestamp-counter-ansi-rand-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_time"
+      ]
+    },
+    "timestamp-counter-lcg32-raw": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_time"
+      ]
+    },
+    "timestamp-counter-lcg32-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_time"
+      ]
+    },
+    "timestamp-counter-xorshift32-raw": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_time"
+      ]
+    },
+    "timestamp-counter-xorshift32-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_time"
+      ]
+    },
+    "timestamp-direct": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_time"
+      ]
+    },
+    "timestamp-height-counter-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_time",
+        "block_height"
+      ]
+    },
+    "timestamp-le32-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_time"
+      ]
+    },
+    "timestamp-le64-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_time"
+      ]
+    },
+    "timestamp-pubkey-counter-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_time",
+        "pubkey"
+      ]
+    },
+    "timestamp-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_time"
+      ]
+    },
+    "timestamp-txid-vin-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "block_time",
+        "txid",
+        "vin"
+      ]
+    },
+    "txid-dsha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "txid"
+      ]
+    },
+    "txid-lcg32-raw": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "txid"
+      ]
+    },
+    "txid-lcg32-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "txid"
+      ]
+    },
+    "txid-le-dsha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "txid"
+      ]
+    },
+    "txid-le-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "txid"
+      ]
+    },
+    "txid-low128-direct": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "txid"
+      ]
+    },
+    "txid-low64-direct": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "txid"
+      ]
+    },
+    "txid-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "txid"
+      ]
+    },
+    "txid-vin-bin-dsha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "txid",
+        "vin"
+      ]
+    },
+    "txid-vin-bin-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "txid",
+        "vin"
+      ]
+    },
+    "txid-vin-counter-dsha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "txid",
+        "vin"
+      ]
+    },
+    "txid-vin-counter-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "txid",
+        "vin"
+      ]
+    },
+    "txid-vin-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "txid",
+        "vin"
+      ]
+    },
+    "txid-vin-sighash-bin-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "txid",
+        "vin",
+        "sighash"
+      ]
+    },
+    "txid-vin-sighash-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "txid",
+        "vin",
+        "sighash"
+      ]
+    },
+    "txid-xorshift32-raw": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "txid"
+      ]
+    },
+    "txid-xorshift32-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "txid"
+      ]
+    },
+    "z-counter-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "z"
+      ]
+    },
+    "z-direct": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "z"
+      ]
+    },
+    "z-dsha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "z"
+      ]
+    },
+    "z-lcg32-raw": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "z"
+      ]
+    },
+    "z-lcg32-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "z"
+      ]
+    },
+    "z-low128-direct": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "z"
+      ]
+    },
+    "z-low64-direct": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "z"
+      ]
+    },
+    "z-pubkey-counter-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "z",
+        "pubkey"
+      ]
+    },
+    "z-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "z"
+      ]
+    },
+    "z-vin-counter-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "z",
+        "vin"
+      ]
+    },
+    "z-xorshift32-raw": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "z"
+      ]
+    },
+    "z-xorshift32-sha256": {
+      "missing_fields": [],
+      "ready": true,
+      "required_fields": [
+        "z"
+      ]
+    }
+  },
+  "model_test_counts": {
+    "height-counter-ansi-rand-raw": 20,
+    "height-counter-ansi-rand-sha256": 20,
+    "height-counter-lcg32-raw": 20,
+    "height-counter-lcg32-sha256": 20,
+    "height-counter-xorshift32-raw": 20,
+    "height-counter-xorshift32-sha256": 20,
+    "height-direct": 5,
+    "height-le32-sha256": 5,
+    "height-le64-sha256": 5,
+    "height-pubkey-counter-sha256": 20,
+    "height-sha256": 5,
+    "height-sha256-hex": 5,
+    "height-time-counter-sha256": 20,
+    "height-time-txid-vin-sha256": 5,
+    "height-txid-vin-sha256": 5,
+    "prevout-counter-dsha256": 20,
+    "prevout-counter-sha256": 20,
+    "prevout-txid-vin-bin-sha256": 5,
+    "prevout-txid-vin-sha256": 5,
+    "pubkey-height-time-txid-vin-bin-sha256": 5,
+    "pubkey-height-time-txid-vin-sha256": 5,
+    "pubkey-txid-vin-bin-sha256": 10,
+    "pubkey-txid-vin-counter-sha256": 20,
+    "pubkey-txid-vin-dsha256": 5,
+    "pubkey-txid-vin-sha256": 5,
+    "timestamp-counter-ansi-rand-raw": 100,
+    "timestamp-counter-ansi-rand-sha256": 100,
+    "timestamp-counter-lcg32-raw": 100,
+    "timestamp-counter-lcg32-sha256": 100,
+    "timestamp-counter-xorshift32-raw": 100,
+    "timestamp-counter-xorshift32-sha256": 100,
+    "timestamp-direct": 25,
+    "timestamp-height-counter-sha256": 20,
+    "timestamp-le32-sha256": 25,
+    "timestamp-le64-sha256": 25,
+    "timestamp-pubkey-counter-sha256": 100,
+    "timestamp-sha256": 25,
+    "timestamp-sha256-hex": 25,
+    "timestamp-txid-vin-sha256": 25,
+    "txid-dsha256": 5,
+    "txid-lcg32-raw": 5,
+    "txid-lcg32-sha256": 5,
+    "txid-le-dsha256": 5,
+    "txid-le-sha256": 5,
+    "txid-low128-direct": 10,
+    "txid-low64-direct": 10,
+    "txid-sha256": 5,
+    "txid-vin-bin-dsha256": 10,
+    "txid-vin-bin-sha256": 10,
+    "txid-vin-counter-dsha256": 40,
+    "txid-vin-counter-sha256": 40,
+    "txid-vin-sha256": 10,
+    "txid-vin-sighash-bin-sha256": 10,
+    "txid-vin-sighash-sha256": 5,
+    "txid-xorshift32-raw": 5,
+    "txid-xorshift32-sha256": 5,
+    "z-counter-sha256": 40,
+    "z-direct": 5,
+    "z-dsha256": 10,
+    "z-lcg32-raw": 5,
+    "z-lcg32-sha256": 5,
+    "z-low128-direct": 5,
+    "z-low64-direct": 5,
+    "z-pubkey-counter-sha256": 20,
+    "z-sha256": 10,
+    "z-vin-counter-sha256": 20,
+    "z-xorshift32-raw": 5,
+    "z-xorshift32-sha256": 5
+  },
+  "models": [
+    "height-counter-ansi-rand-raw",
+    "height-counter-ansi-rand-sha256",
+    "height-counter-lcg32-raw",
+    "height-counter-lcg32-sha256",
+    "height-counter-xorshift32-raw",
+    "height-counter-xorshift32-sha256",
+    "height-direct",
+    "height-le32-sha256",
+    "height-le64-sha256",
+    "height-pubkey-counter-sha256",
+    "height-sha256",
+    "height-time-counter-sha256",
+    "height-time-txid-vin-sha256",
+    "height-txid-vin-sha256",
+    "prevout-counter-dsha256",
+    "prevout-counter-sha256",
+    "prevout-txid-vin-bin-sha256",
+    "prevout-txid-vin-sha256",
+    "pubkey-height-time-txid-vin-bin-sha256",
+    "pubkey-height-time-txid-vin-sha256",
+    "pubkey-txid-vin-bin-sha256",
+    "pubkey-txid-vin-counter-sha256",
+    "pubkey-txid-vin-dsha256",
+    "pubkey-txid-vin-sha256",
+    "timestamp-counter-ansi-rand-raw",
+    "timestamp-counter-ansi-rand-sha256",
+    "timestamp-counter-lcg32-raw",
+    "timestamp-counter-lcg32-sha256",
+    "timestamp-counter-xorshift32-raw",
+    "timestamp-counter-xorshift32-sha256",
+    "timestamp-direct",
+    "timestamp-height-counter-sha256",
+    "timestamp-le32-sha256",
+    "timestamp-le64-sha256",
+    "timestamp-pubkey-counter-sha256",
+    "timestamp-sha256",
+    "timestamp-txid-vin-sha256",
+    "txid-dsha256",
+    "txid-lcg32-raw",
+    "txid-lcg32-sha256",
+    "txid-le-dsha256",
+    "txid-le-sha256",
+    "txid-low128-direct",
+    "txid-low64-direct",
+    "txid-sha256",
+    "txid-vin-bin-dsha256",
+    "txid-vin-bin-sha256",
+    "txid-vin-counter-dsha256",
+    "txid-vin-counter-sha256",
+    "txid-vin-sha256",
+    "txid-vin-sighash-bin-sha256",
+    "txid-vin-sighash-sha256",
+    "txid-xorshift32-raw",
+    "txid-xorshift32-sha256",
+    "z-counter-sha256",
+    "z-direct",
+    "z-dsha256",
+    "z-lcg32-raw",
+    "z-lcg32-sha256",
+    "z-low128-direct",
+    "z-low64-direct",
+    "z-pubkey-counter-sha256",
+    "z-sha256",
+    "z-vin-counter-sha256",
+    "z-xorshift32-raw",
+    "z-xorshift32-sha256"
+  ],
+  "models_ready_but_untested": [],
+  "models_tested": [
+    "height-counter-ansi-rand-raw",
+    "height-counter-ansi-rand-sha256",
+    "height-counter-lcg32-raw",
+    "height-counter-lcg32-sha256",
+    "height-counter-xorshift32-raw",
+    "height-counter-xorshift32-sha256",
+    "height-direct",
+    "height-le32-sha256",
+    "height-le64-sha256",
+    "height-pubkey-counter-sha256",
+    "height-sha256",
+    "height-sha256-hex",
+    "height-time-counter-sha256",
+    "height-time-txid-vin-sha256",
+    "height-txid-vin-sha256",
+    "prevout-counter-dsha256",
+    "prevout-counter-sha256",
+    "prevout-txid-vin-bin-sha256",
+    "prevout-txid-vin-sha256",
+    "pubkey-height-time-txid-vin-bin-sha256",
+    "pubkey-height-time-txid-vin-sha256",
+    "pubkey-txid-vin-bin-sha256",
+    "pubkey-txid-vin-counter-sha256",
+    "pubkey-txid-vin-dsha256",
+    "pubkey-txid-vin-sha256",
+    "timestamp-counter-ansi-rand-raw",
+    "timestamp-counter-ansi-rand-sha256",
+    "timestamp-counter-lcg32-raw",
+    "timestamp-counter-lcg32-sha256",
+    "timestamp-counter-xorshift32-raw",
+    "timestamp-counter-xorshift32-sha256",
+    "timestamp-direct",
+    "timestamp-height-counter-sha256",
+    "timestamp-le32-sha256",
+    "timestamp-le64-sha256",
+    "timestamp-pubkey-counter-sha256",
+    "timestamp-sha256",
+    "timestamp-sha256-hex",
+    "timestamp-txid-vin-sha256",
+    "txid-dsha256",
+    "txid-lcg32-raw",
+    "txid-lcg32-sha256",
+    "txid-le-dsha256",
+    "txid-le-sha256",
+    "txid-low128-direct",
+    "txid-low64-direct",
+    "txid-sha256",
+    "txid-vin-bin-dsha256",
+    "txid-vin-bin-sha256",
+    "txid-vin-counter-dsha256",
+    "txid-vin-counter-sha256",
+    "txid-vin-sha256",
+    "txid-vin-sighash-bin-sha256",
+    "txid-vin-sighash-sha256",
+    "txid-xorshift32-raw",
+    "txid-xorshift32-sha256",
+    "z-counter-sha256",
+    "z-direct",
+    "z-dsha256",
+    "z-lcg32-raw",
+    "z-lcg32-sha256",
+    "z-low128-direct",
+    "z-low64-direct",
+    "z-pubkey-counter-sha256",
+    "z-sha256",
+    "z-vin-counter-sha256",
+    "z-xorshift32-raw",
+    "z-xorshift32-sha256"
+  ],
+  "observed": {
+    "field_availability": {
+      "block_height_rows": 18,
+      "block_time_rows": 18,
+      "prevout_rows": 18,
+      "pubkey_rows": 18,
+      "sighash_rows": 18,
+      "txid_rows": 18,
+      "vin_rows": 18,
+      "z_rows": 18
+    },
+    "missing_block_height_rows": 0,
+    "missing_block_time_rows": 0,
+    "missing_prevout_rows": 0,
+    "missing_pubkey_rows": 0,
+    "missing_sighash_rows": 0,
+    "missing_txid_rows": 0,
+    "missing_vin_rows": 0,
+    "missing_z_rows": 0,
+    "skipped_bad_rows": 0,
+    "target_matched_rows": null,
+    "target_pubkey": null,
+    "total_rows": 18,
+    "unique_r": 5,
+    "usable_rows": 18
+  },
+  "output": "nonce_hypothesis_k.jsonl",
+  "rc": 0,
+  "selected_input": "signatures.dup_r_recoverable.jsonl",
+  "selected_input_reason": "stage0_recoverable_duplicate_r",
+  "selected_input_rows": 18,
+  "stopped_by_budget": false,
+  "tested_candidates": 1485
 }
