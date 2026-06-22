@@ -42,6 +42,21 @@ def parse_json_object(raw: str) -> dict[str, Any] | None:
         return None
 
 
+def normalize_pubkey_hex(value: Any) -> str:
+    s = str(value or "").strip().lower()
+    if s.startswith("0x"):
+        s = s[2:]
+    if len(s) not in (66, 130):
+        return ""
+    if any(c not in "0123456789abcdef" for c in s):
+        return ""
+    if len(s) == 66 and s[:2] not in ("02", "03"):
+        return ""
+    if len(s) == 130 and s[:2] != "04":
+        return ""
+    return s
+
+
 def scan_input(path: Path, *, count_duplicate_r: bool) -> tuple[set[int], dict[str, int]]:
     """Stream the file once to collect global metadata without retaining rows."""
     r_counts: Counter[int] = Counter()
@@ -67,6 +82,47 @@ def scan_input(path: Path, *, count_duplicate_r: bool) -> tuple[set[int], dict[s
     return dup_r, dict(stats)
 
 
+def load_target_indexes_from_verification_report(path: Path, *, max_rows: int = 0) -> set[int]:
+    """Load safe row indexes from verification_failure_report.json.
+
+    The verification report intentionally stores no secret material. Row indexes
+    let this tool stream-select exact failed rows without retaining the corpus.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"missing verification report: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    indexes: dict[int, None] = {}
+
+    def add_sample(sample: Any) -> None:
+        if not isinstance(sample, dict):
+            return
+        try:
+            idx = int(sample.get("index"))
+        except Exception:
+            return
+        if idx < 0:
+            return
+        indexes.setdefault(idx, None)
+
+    for bucket in data.get("top_failure_buckets") or []:
+        if not isinstance(bucket, dict):
+            continue
+        for sample in bucket.get("samples") or []:
+            add_sample(sample)
+            if max_rows > 0 and len(indexes) >= max_rows:
+                return set(indexes.keys())
+
+    for samples in (data.get("failure_samples") or {}).values():
+        if not isinstance(samples, list):
+            continue
+        for sample in samples:
+            add_sample(sample)
+            if max_rows > 0 and len(indexes) >= max_rows:
+                return set(indexes.keys())
+
+    return set(indexes.keys())
+
+
 def select_candidate_rows(
     path: Path,
     *,
@@ -74,6 +130,7 @@ def select_candidate_rows(
     only_duplicate_r: bool,
     max_rows: int,
     max_txs: int,
+    target_indexes: set[int] | None = None,
 ) -> tuple[Counter[tuple[str, int, int, int]], list[str], dict[str, int]]:
     """Stream-select bounded rows and txids to backfill.
 
@@ -86,8 +143,11 @@ def select_candidate_rows(
     selected_txids: set[str] = set()
     skipped_txids: set[str] = set()
     stats: Counter[str] = Counter()
+    target_mode = target_indexes is not None
     with path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
+        for idx, line in enumerate(f):
+            if target_mode and idx not in target_indexes:
+                continue
             obj = parse_json_object(line.rstrip("\n"))
             if not isinstance(obj, dict):
                 continue
@@ -98,7 +158,7 @@ def select_candidate_rows(
                 stats["rows_without_row_key"] += 1
                 continue
             txid = key[0]
-            if only_duplicate_r and key[2] not in duplicate_r:
+            if not target_mode and only_duplicate_r and key[2] not in duplicate_r:
                 continue
             if txid not in selected_txids:
                 if max_txs > 0 and len(txids) >= max_txs:
@@ -114,6 +174,8 @@ def select_candidate_rows(
     stats["candidate_unique_keys"] = len(selected_keys)
     stats["unique_txids_selected"] = len(txids)
     stats["unique_txids_skipped_by_max_txs"] = len(skipped_txids)
+    stats["target_index_mode"] = int(target_mode)
+    stats["target_indexes_requested"] = len(target_indexes or set())
     return selected_keys, txids, dict(stats)
 
 
@@ -200,12 +262,15 @@ def build_context_index(
                 "script_code": entry.get("script_code"),
                 "redeem_script": entry.get("redeem_script"),
                 "witness_script": entry.get("witness_script"),
+                "extracted_pubkey": normalize_pubkey_hex(entry.get("pub")),
+                "extracted_type": entry.get("type"),
             }
             extracted_by_vin.setdefault(vin_index, []).append(
                 {
                     "r_prefix": format(r_int, "064x")[:16],
                     "s_prefix": format(s_int, "064x")[:16],
                     "type": entry.get("type"),
+                    "pubkey_prefix": normalize_pubkey_hex(entry.get("pub"))[:20],
                     "has_script_code": bool(entry.get("script_code")),
                 }
             )
@@ -284,6 +349,7 @@ def write_backfilled_jsonl(
     extracted_by_txid: dict[str, dict[int, list[dict[str, Any]]]],
     require_extraction_match: bool,
     strip_row_fallback_unverified: bool,
+    repair_pubkey_from_extraction: bool,
 ) -> dict[str, Any]:
     pending = Counter(selected_keys)
     updated = 0
@@ -291,8 +357,13 @@ def write_backfilled_jsonl(
     updated_by_row_fallback = 0
     missing_match = 0
     stripped_row_fallback_unverified = 0
+    pubkey_match = 0
+    pubkey_mismatch = 0
+    pubkey_missing = 0
+    pubkey_repaired = 0
     failure_reason_counts: Counter[str] = Counter()
     extraction_failure_samples: list[dict[str, Any]] = []
+    pubkey_mismatch_samples: list[dict[str, Any]] = []
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with in_path.open("r", encoding="utf-8", errors="replace") as src, out_path.open("w", encoding="utf-8") as dst:
@@ -338,6 +409,31 @@ def write_backfilled_jsonl(
             else:
                 updated_by_extraction += 1
 
+            extracted_pubkey = normalize_pubkey_hex(ctx.get("extracted_pubkey"))
+            row_pubkey = normalize_pubkey_hex(obj.get("pubkey_hex") or obj.get("pub"))
+            if extracted_pubkey:
+                if not row_pubkey:
+                    pubkey_missing += 1
+                    if repair_pubkey_from_extraction:
+                        obj["pubkey_hex"] = extracted_pubkey
+                        pubkey_repaired += 1
+                elif row_pubkey == extracted_pubkey:
+                    pubkey_match += 1
+                else:
+                    pubkey_mismatch += 1
+                    if len(pubkey_mismatch_samples) < 50:
+                        pubkey_mismatch_samples.append({
+                            "txid_prefix": str(obj.get("txid") or "")[:16],
+                            "vin": obj.get("vin"),
+                            "row_pubkey_prefix": row_pubkey[:20],
+                            "extracted_pubkey_prefix": extracted_pubkey[:20],
+                            "type": obj.get("type"),
+                            "extracted_type": ctx.get("extracted_type"),
+                        })
+                    if repair_pubkey_from_extraction:
+                        obj["pubkey_hex"] = extracted_pubkey
+                        pubkey_repaired += 1
+
             obj["sighash_context"] = ctx["sighash_context"]
             obj["sighash_context_source"] = ctx.get("context_source", "row_fallback_unverified")
             for extra in ("script_code", "redeem_script", "witness_script"):
@@ -353,6 +449,11 @@ def write_backfilled_jsonl(
         "missing_extracted_match": missing_match,
         "extraction_failure_reason_counts": dict(failure_reason_counts),
         "extraction_failure_samples": extraction_failure_samples,
+        "pubkey_match": pubkey_match,
+        "pubkey_mismatch": pubkey_mismatch,
+        "pubkey_missing": pubkey_missing,
+        "pubkey_repaired": pubkey_repaired,
+        "pubkey_mismatch_samples": pubkey_mismatch_samples,
         "selected_rows_not_seen_in_rewrite": int(sum(v for v in pending.values() if v > 0)),
         "stripped_row_fallback_unverified": stripped_row_fallback_unverified,
     }
@@ -368,6 +469,10 @@ def main() -> None:
                     help="Only backfill rows whose r appears more than once (default)")
     ap.add_argument("--all-rows", action="store_false", dest="only_duplicate_r",
                     help="Backfill every row missing sighash_context")
+    ap.add_argument("--from-verification-report", default="",
+                    help="Target exact row indexes from verification_failure_report.json samples")
+    ap.add_argument("--verification-report-max-indexes", type=int, default=0,
+                    help="Max row indexes to load from --from-verification-report; 0 = all samples")
     ap.add_argument("--max-rows", type=int, default=0, help="Maximum candidate rows to backfill; 0 = no limit")
     ap.add_argument("--max-txs", type=int, default=0, help="Maximum unique txids to fetch; 0 = no limit")
     ap.add_argument("--tx-cache-dir", default=".tx_cache/backfill",
@@ -380,6 +485,8 @@ def main() -> None:
                     help="Allow unverified fallback contexts built from existing row script fields when re-extraction does not match")
     ap.add_argument("--strip-row-fallback-unverified", action="store_true",
                     help="Remove existing sighash_context fields whose source is row_fallback_unverified while streaming the file")
+    ap.add_argument("--repair-pubkey-from-extraction", action="store_true",
+                    help="When (txid,vin,r,s) re-extraction matches, replace row pubkey_hex with the extracted pubkey if different or missing")
     ap.add_argument("--report", default="sighash_context_backfill_report.json")
     args = ap.parse_args()
 
@@ -389,13 +496,24 @@ def main() -> None:
     if not args.inplace and not args.out:
         raise ValueError("--out is required unless --inplace is used")
 
-    dup_r, scan_stats = scan_input(in_path, count_duplicate_r=bool(args.only_duplicate_r))
+    target_indexes: set[int] | None = None
+    if args.from_verification_report:
+        target_indexes = load_target_indexes_from_verification_report(
+            Path(args.from_verification_report),
+            max_rows=max(0, int(args.verification_report_max_indexes)),
+        )
+
+    dup_r, scan_stats = scan_input(
+        in_path,
+        count_duplicate_r=bool(args.only_duplicate_r and target_indexes is None),
+    )
     selected_keys, txids, selection_stats = select_candidate_rows(
         in_path,
         duplicate_r=dup_r,
         only_duplicate_r=bool(args.only_duplicate_r),
         max_rows=max(0, int(args.max_rows)),
         max_txs=max(0, int(args.max_txs)),
+        target_indexes=target_indexes,
     )
 
     processor = BlockWalker(deterministic=True, include_sighash_context=True, hydrate_seen_lines=False)
@@ -436,6 +554,7 @@ def main() -> None:
         extracted_by_txid=extracted_by_txid,
         require_extraction_match=bool(args.require_extraction_match or not args.allow_row_fallback),
         strip_row_fallback_unverified=bool(args.strip_row_fallback_unverified),
+        repair_pubkey_from_extraction=bool(args.repair_pubkey_from_extraction),
     )
     if tmp_path is not None:
         tmp_path.replace(in_path)
@@ -452,10 +571,13 @@ def main() -> None:
         "candidate_unique_keys": int(selection_stats.get("candidate_unique_keys", 0)),
         "unique_txids_fetched": len(txids),
         "selection": selection_stats,
+        "from_verification_report": str(args.from_verification_report or ""),
+        "target_indexes_loaded": len(target_indexes or set()),
         **rewrite_stats,
         "require_extraction_match": bool(args.require_extraction_match or not args.allow_row_fallback),
         "allow_row_fallback": bool(args.allow_row_fallback),
         "strip_row_fallback_unverified": bool(args.strip_row_fallback_unverified),
+        "repair_pubkey_from_extraction": bool(args.repair_pubkey_from_extraction),
         "fetch_errors": fetch_errors,
         "tx_cache": {
             "enabled": cache_dir is not None,
