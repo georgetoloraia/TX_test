@@ -1925,8 +1925,16 @@ def build_verification_failure_report(
         if str(reason).startswith("ok")
     )
     invalid = analyzed - valid_reasons
-    missing_ctx = int(z_counts.get("missing_sighash_context", 0))
-    z_mismatch = int(z_counts.get("z_recompute_mismatch", 0))
+    missing_ctx_failures = sum(
+        int(count)
+        for bucket, count in bucket_counts.items()
+        if "z=missing_sighash_context" in str(bucket)
+    )
+    z_mismatch_failures = sum(
+        int(count)
+        for bucket, count in bucket_counts.items()
+        if "z=z_recompute_mismatch" in str(bucket)
+    )
     pubkey_parse_errors = int(verification_counts.get("pubkey_parse_error", 0))
     bad_der = sum(
         count
@@ -1934,9 +1942,9 @@ def build_verification_failure_report(
         if reason in {"missing_signature_hex", "bad_signature_hex", "not_der", "bad_der_length"}
     )
     recommendations: list[str] = []
-    if analyzed and missing_ctx / analyzed >= 0.25:
+    if invalid > 0 and missing_ctx_failures / max(1, invalid) >= 0.25:
         recommendations.append("download_future_rows_with_include_sighash_context")
-    if z_mismatch > 0:
+    if z_mismatch_failures > 0:
         recommendations.append("inspect_sighash_context_reconstruction_for_z_mismatch")
     if pubkey_parse_errors > 0:
         recommendations.append("inspect_pubkey_extraction_for_malformed_or_missing_sec_keys")
@@ -2390,8 +2398,16 @@ def load_recovered_k_map(recovered_k_path: Path) -> tuple[dict[str, set[int]], d
     k_by_r: dict[str, set[int]] = defaultdict(set)
     rows = 0
     bad_rows = 0
+    reflected_added = 0
     if not recovered_k_path.exists():
-        return k_by_r, {"exists": False, "rows": 0, "bad_rows": 0, "unique_r": 0, "unique_k": 0}
+        return k_by_r, {
+            "exists": False,
+            "rows": 0,
+            "bad_rows": 0,
+            "unique_r": 0,
+            "unique_k": 0,
+            "reflected_k_added": 0,
+        }
     with recovered_k_path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
             raw = line.strip()
@@ -2419,7 +2435,15 @@ def load_recovered_k_map(recovered_k_path: Path) -> tuple[dict[str, set[int]], d
                     except Exception:
                         continue
                     if 1 <= k < SECP256K1_N:
-                        k_by_r[format(r, "064x")].add(int(k))
+                        r_key = format(r, "064x")
+                        before = len(k_by_r[r_key])
+                        k_by_r[r_key].add(int(k))
+                        reflected = (-int(k)) % SECP256K1_N
+                        if 1 <= reflected < SECP256K1_N:
+                            k_by_r[r_key].add(reflected)
+                        after = len(k_by_r[r_key])
+                        if after - before > 1:
+                            reflected_added += 1
                         added += 1
                 if added == 0:
                     bad_rows += 1
@@ -2432,6 +2456,7 @@ def load_recovered_k_map(recovered_k_path: Path) -> tuple[dict[str, set[int]], d
         "bad_rows": bad_rows,
         "unique_r": len(k_by_r),
         "unique_k": unique_k,
+        "reflected_k_added": reflected_added,
     }
 
 
