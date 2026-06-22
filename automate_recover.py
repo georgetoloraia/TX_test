@@ -1660,6 +1660,23 @@ def _parse_der_rs(der: bytes | None) -> tuple[int | None, int | None, str | None
         return None, None, f"der_parse_exception:{type(e).__name__}"
 
 
+def _der_int(x: int) -> bytes:
+    raw = int(x).to_bytes(max(1, (int(x).bit_length() + 7) // 8), "big")
+    raw = raw.lstrip(b"\x00") or b"\x00"
+    if raw[0] & 0x80:
+        raw = b"\x00" + raw
+    return raw
+
+
+def _encode_der_rs(r: int, s: int) -> bytes:
+    rb = _der_int(r)
+    sb = _der_int(s)
+    body = b"\x02" + bytes([len(rb)]) + rb + b"\x02" + bytes([len(sb)]) + sb
+    if len(body) >= 128:
+        raise ValueError("DER body too long")
+    return b"\x30" + bytes([len(body)]) + body
+
+
 def _verify_row_signature(obj: dict[str, Any]) -> tuple[bool | None, str]:
     pub = normalize_pubkey_hex(str(obj.get("pubkey_hex") or obj.get("pub") or ""))
     sig_hex = str(obj.get("signature_hex") or obj.get("sig") or "")
@@ -1676,7 +1693,32 @@ def _verify_row_signature(obj: dict[str, Any]) -> tuple[bool | None, str]:
         return None, der_reason or "bad_der"
     try:
         from coincurve import PublicKey  # type: ignore
-        ok = bool(PublicKey(bytes.fromhex(pub)).verify(der, z.to_bytes(32, "big"), hasher=None))
+        pk = PublicKey(bytes.fromhex(pub))
+        msg32 = z.to_bytes(32, "big")
+        ok = bool(pk.verify(der, msg32, hasher=None))
+        if not ok:
+            der_r, der_s, _parse_reason = _parse_der_rs(der)
+            try:
+                row_s = parse_int(obj.get("s"))
+            except Exception:
+                row_s = None
+            if (
+                der_r is not None
+                and der_s is not None
+                and row_s is not None
+                and 1 <= row_s < SECP256K1_N
+                and der_s != row_s
+                and ((SECP256K1_N - der_s) % SECP256K1_N) == row_s
+            ):
+                ok_norm = bool(pk.verify(_encode_der_rs(der_r, row_s), msg32, hasher=None))
+                if ok_norm:
+                    return True, "ok_low_s_normalized"
+            if der_r is not None and der_s is not None and der_s > SECP256K1_N // 2:
+                low_s = (SECP256K1_N - der_s) % SECP256K1_N
+                if 1 <= low_s < SECP256K1_N:
+                    ok_high = bool(pk.verify(_encode_der_rs(der_r, low_s), msg32, hasher=None))
+                    if ok_high:
+                        return True, "ok_high_s_normalized"
         return ok, "ok" if ok else "verify_false"
     except ValueError:
         return False, "pubkey_parse_error"
@@ -1779,6 +1821,8 @@ def build_verification_failure_report(
         "by_context_algorithm": {},
         "by_context_source": {},
         "by_z_source": {},
+        "failure_bucket_counts": {},
+        "failure_reason_counts": {},
         "top_failure_buckets": [],
         "failure_samples": {},
         "recommendations": [],
@@ -1793,6 +1837,7 @@ def build_verification_failure_report(
     by_ctx_source: Counter[str] = Counter()
     by_z_source: Counter[str] = Counter()
     bucket_counts: Counter[str] = Counter()
+    failure_reason_counts: Counter[str] = Counter()
     samples: dict[str, list[dict[str, Any]]] = defaultdict(list)
     context_extra_limit = 0 if max_rows <= 0 else max(1000, int(max_rows) // 5)
     report["context_extra_scan_limit"] = int(context_extra_limit)
@@ -1823,6 +1868,9 @@ def build_verification_failure_report(
         if ok is not True or z_ok is False:
             bucket = _verification_bucket_key(obj, verify_reason, z_reason)
             bucket_counts[bucket] += 1
+            failure_reason_counts[verify_reason] += 1
+            if z_ok is False:
+                failure_reason_counts[z_reason] += 1
             if len(samples[bucket]) < max(0, int(max_samples)):
                 sample = _safe_row_id(obj, idx)
                 sample.update({
@@ -1871,7 +1919,12 @@ def build_verification_failure_report(
             report["reason"] = "max_rows_reached"
 
     analyzed = int(report["rows_analyzed"])
-    invalid = analyzed - int(verification_counts.get("ok", 0))
+    valid_reasons = sum(
+        int(count)
+        for reason, count in verification_counts.items()
+        if str(reason).startswith("ok")
+    )
+    invalid = analyzed - valid_reasons
     missing_ctx = int(z_counts.get("missing_sighash_context", 0))
     z_mismatch = int(z_counts.get("z_recompute_mismatch", 0))
     pubkey_parse_errors = int(verification_counts.get("pubkey_parse_error", 0))
@@ -1903,6 +1956,8 @@ def build_verification_failure_report(
         "by_z_source": dict(by_z_source),
         "invalid_rows": invalid,
         "invalid_ratio": (invalid / analyzed) if analyzed else 0.0,
+        "failure_bucket_counts": dict(bucket_counts),
+        "failure_reason_counts": dict(failure_reason_counts),
         "top_failure_buckets": [
             {"bucket": bucket, "count": count, "samples": samples.get(bucket, [])}
             for bucket, count in bucket_counts.most_common(25)
@@ -4161,6 +4216,8 @@ def main() -> None:
                     help="Metadata-only report explaining signature verification failures by context")
     ap.add_argument("--verification-failure-max-rows", type=int, default=0,
                     help="Max rows to analyze for verification-failure report (0 = all active rows)")
+    ap.add_argument("--verification-failure-max-samples", type=int, default=25,
+                    help="Max safe row-id samples per verification failure bucket")
     ap.add_argument("--enable-nonce-hypotheses", action="store_true",
                     help="Generate bounded weak-nonce r->k candidates and validate them locally")
     ap.add_argument("--nonce-hypothesis-models",
@@ -4537,6 +4594,7 @@ def main() -> None:
         sig_path=sigs,
         out_path=Path(args.verification_failure_report),
         max_rows=max(0, int(args.verification_failure_max_rows)),
+        max_samples=max(0, int(args.verification_failure_max_samples)),
     )
     if verification_failure_report.get("rows_analyzed", 0):
         print(
