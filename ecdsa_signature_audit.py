@@ -211,6 +211,44 @@ def extract_der_signature(sig_hex: str) -> bytes | None:
     return None
 
 
+def parse_der_rs(der: bytes | None) -> tuple[int | None, int | None]:
+    if not der:
+        return None, None
+    try:
+        if len(der) < 8 or der[0] != 0x30:
+            return None, None
+        pos = 2
+        if pos >= len(der) or der[pos] != 0x02:
+            return None, None
+        r_len = der[pos + 1]
+        r = int.from_bytes(der[pos + 2:pos + 2 + r_len], "big")
+        pos += 2 + r_len
+        if pos + 2 > len(der) or der[pos] != 0x02:
+            return None, None
+        s_len = der[pos + 1]
+        s = int.from_bytes(der[pos + 2:pos + 2 + s_len], "big")
+        return r, s
+    except Exception:
+        return None, None
+
+
+def der_int(x: int) -> bytes:
+    raw = int(x).to_bytes(max(1, (int(x).bit_length() + 7) // 8), "big")
+    raw = raw.lstrip(b"\x00") or b"\x00"
+    if raw[0] & 0x80:
+        raw = b"\x00" + raw
+    return raw
+
+
+def encode_der_rs(r: int, s: int) -> bytes:
+    rb = der_int(r)
+    sb = der_int(s)
+    body = b"\x02" + bytes([len(rb)]) + rb + b"\x02" + bytes([len(sb)]) + sb
+    if len(body) >= 128:
+        raise ValueError("DER body too long")
+    return b"\x30" + bytes([len(body)]) + body
+
+
 def rolling_feature(values: list[float], window: int, fn) -> list[float]:
     if window <= 1 or len(values) < window:
         return values[:]
@@ -242,6 +280,8 @@ def verification_gate(
     kept: list[dict[str, Any]] = []
     verifiable = valid = invalid = 0
     dropped = 0
+    valid_low_s_normalized = 0
+    valid_high_s_normalized = 0
     reason_counts: dict[str, int] = defaultdict(int)
     reason_samples: dict[str, list[dict[str, Any]]] = defaultdict(list)
     max_samples_per_reason = 5
@@ -270,7 +310,33 @@ def verification_gate(
             msg32 = int(row["z"]).to_bytes(32, "big", signed=False)
             ok = bool(pk.verify(der, msg32, hasher=None))
             if not ok:
-                fail_reason = "verify_false"
+                der_r, der_s = parse_der_rs(der)
+                row_s = int(row.get("s"))
+                if (
+                    der_r is not None
+                    and der_s is not None
+                    and 1 <= row_s < SECP256K1_N
+                    and der_s != row_s
+                    and ((SECP256K1_N - der_s) % SECP256K1_N) == row_s
+                ):
+                    ok = bool(pk.verify(encode_der_rs(der_r, row_s), msg32, hasher=None))
+                    if ok:
+                        fail_reason = "ok_low_s_normalized"
+                        valid_low_s_normalized += 1
+                if (
+                    not ok
+                    and der_r is not None
+                    and der_s is not None
+                    and der_s > SECP256K1_N // 2
+                ):
+                    low_s = (SECP256K1_N - der_s) % SECP256K1_N
+                    if 1 <= low_s < SECP256K1_N:
+                        ok = bool(pk.verify(encode_der_rs(der_r, low_s), msg32, hasher=None))
+                        if ok:
+                            fail_reason = "ok_high_s_normalized"
+                            valid_high_s_normalized += 1
+                if not ok:
+                    fail_reason = "verify_false"
         except ValueError:
             fail_reason = "pubkey_parse_error"
             ok = False
@@ -301,6 +367,8 @@ def verification_gate(
         "invalid": invalid,
         "dropped": dropped,
         "drop_invalid": bool(drop_invalid),
+        "valid_low_s_normalized": valid_low_s_normalized,
+        "valid_high_s_normalized": valid_high_s_normalized,
         "reason_counts": dict(reason_counts),
         "reason_samples": dict(reason_samples),
     }
