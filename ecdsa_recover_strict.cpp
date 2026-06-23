@@ -200,6 +200,14 @@ static string bn_hex(BIGNUM* x){
     return s;
 }
 
+static bool canonical_scalar_hex(Ctx& C, const string& hx, string& out){
+    BNWrap v;
+    if(!bn_from_hex(hx, v.n)) return false;
+    bn_mod(C, v.n);
+    out = bn_hex(v.n);
+    return true;
+}
+
 // s == k^{-1}(z + r d) mod n  <=> s*k == z + r d mod n
 static bool ecdsa_ok(Ctx& C, const BIGNUM* s, const BIGNUM* z, const BIGNUM* r,
                      const BIGNUM* d, const BIGNUM* k, BNWrap& tmp1, BNWrap& tmp2){
@@ -220,7 +228,8 @@ struct Secp {
     void randomize() {
         unsigned char seed[32];
         if (RAND_bytes(seed, sizeof(seed)) == 1) {
-            (void)secp256k1_context_randomize(ctx, seed);
+            int rc = secp256k1_context_randomize(ctx, seed);
+            if(rc != 1) cerr << "[warn] secp256k1_context_randomize failed\n";
             OPENSSL_cleanse(seed, sizeof(seed));
         }
     }
@@ -247,6 +256,8 @@ struct Secp {
 // r' from k·G check
 static bool r_from_k_matches(Ctx& C, Secp& S, const string& r_hex, const BIGNUM* k){
     if(BN_is_zero(k)) return false;
+    string r_canon;
+    if(!canonical_scalar_hex(C, r_hex, r_canon)) return false;
     // k to 32 bytes
     array<unsigned char,32> k32{};
     vector<unsigned char> tmp(32);
@@ -260,8 +271,24 @@ static bool r_from_k_matches(Ctx& C, Secp& S, const string& r_hex, const BIGNUM*
     // x coord is P[1..32]; reduce mod n
     BNWrap x; BN_bin2bn(P+1, 32, x.n);
     bn_mod(C, x.n);
-    string rx = bn_hex(x.n);
-    return hexlower(r_hex) == rx;
+    return r_canon == bn_hex(x.n);
+}
+
+static bool r_from_k_matches_ctx(Ctx& C, secp256k1_context* ctx, const string& r_hex, const BIGNUM* k){
+    if(BN_is_zero(k)) return false;
+    string r_canon;
+    if(!canonical_scalar_hex(C, r_hex, r_canon)) return false;
+    array<unsigned char,32> k32{};
+    vector<unsigned char> tmp(32);
+    BN_bn2binpad(k, tmp.data(), 32);
+    memcpy(k32.data(), tmp.data(), 32);
+    secp256k1_pubkey R;
+    if(!secp256k1_ec_pubkey_create(ctx, &R, k32.data())) return false;
+    unsigned char P[65]; size_t L=65;
+    secp256k1_ec_pubkey_serialize(ctx, P, &L, &R, SECP256K1_EC_UNCOMPRESSED);
+    BNWrap x; BN_bin2bn(P+1, 32, x.n);
+    bn_mod(C, x.n);
+    return r_canon == bn_hex(x.n);
 }
 
 // ------------------------------- Row / Precompute -------------------------------
@@ -456,7 +483,7 @@ static void log_line(const string& s){
 // ------------------------------- Primary dup-R -------------------------------
 static int try_primary_dupR(Ctx& C, Secp& S, const vector<Row>& rows,
                             RecStore& store, const string& out_json, const string& out_txt, const string& /*out_k*/,
-                            size_t& pairs_tested)
+                            size_t& pairs_tested, int min_count)
 {
     unordered_map<string, vector<int>> gp; gp.reserve(rows.size());
     for(int i=0;i<(int)rows.size();++i){
@@ -467,7 +494,7 @@ static int try_primary_dupR(Ctx& C, Secp& S, const vector<Row>& rows,
     BNWrap denom, k, k2, rinv, tmp, chk1, chk2;
     for(auto& kv: gp){
         auto& idxs=kv.second;
-        if((int)idxs.size()<2) continue;
+        if((int)idxs.size() < max(2, min_count)) continue;
         for(int a=0;a<(int)idxs.size();++a){
             for(int b=a+1;b<(int)idxs.size();++b){
                 pairs_tested++;
@@ -1370,7 +1397,9 @@ static size_t seed_from_known_privs(const std::string& sigs_path,
     std::unordered_set<std::string> wrote_pub;
 
     std::ifstream fin(sigs_path); std::string line;
+    Ctx recover_ctx;
     size_t rows_matched=0, pairs_tested=0;
+    size_t k_accepted=0, k_rejected_r_mismatch=0, k_rejected_zero=0, k_rejected_no_inverse=0;
     while(std::getline(fin,line)){
         std::string rhex, shex, zhex, pub;
         if(!jsonl_get(line,"r",rhex)) continue;
@@ -1396,7 +1425,25 @@ static size_t seed_from_known_privs(const std::string& sigs_path,
             BN_mod_mul(tmp, br, bd, bnN, bctx);
             BN_mod_add(tmp, tmp, bz, bnN, bctx);
             invS = BN_mod_inverse(NULL, bs, bnN, bctx);
+            if(!invS){
+                k_rejected_no_inverse++;
+                BN_free(br); BN_free(bs); BN_free(bz); BN_free(bd);
+                BN_free(tmp); BN_free(k);
+                continue;
+            }
             BN_mod_mul(k, tmp, invS, bnN, bctx);
+            if(BN_is_zero(k)){
+                k_rejected_zero++;
+                BN_free(br); BN_free(bs); BN_free(bz); BN_free(bd);
+                BN_free(tmp); BN_free(k); BN_free(invS);
+                continue;
+            }
+            if(!r_from_k_matches_ctx(recover_ctx, ctx, rhex, k)){
+                k_rejected_r_mismatch++;
+                BN_free(br); BN_free(bs); BN_free(bz); BN_free(bd);
+                BN_free(tmp); BN_free(k); BN_free(invS);
+                continue;
+            }
 
             // n-k
             std::vector<unsigned char> k32(32); BN_bn2binpad(k, k32.data(), 32);
@@ -1407,6 +1454,7 @@ static size_t seed_from_known_privs(const std::string& sigs_path,
 
             auto& S = by_r[rhex];
             S.insert(khex); S.insert(nkhex);
+            k_accepted++;
 
             if(!wrote_pub.count(pub)){
                 wrote_pub.insert(pub);
@@ -1443,7 +1491,12 @@ static size_t seed_from_known_privs(const std::string& sigs_path,
     }
     BN_free(bnN); BN_CTX_free(bctx);
     std::cerr << "[preload-priv] r-buckets seeded: " << buckets
-              << "  (rows matched: " << rows_matched << ", pairs tested: " << pairs_tested << ")\n";
+              << "  (rows matched: " << rows_matched
+              << ", k accepted: " << k_accepted
+              << ", rejected_r_mismatch: " << k_rejected_r_mismatch
+              << ", rejected_zero: " << k_rejected_zero
+              << ", rejected_no_inverse: " << k_rejected_no_inverse
+              << ", pairs tested: " << pairs_tested << ")\n";
     return buckets;
 }
 
@@ -1756,7 +1809,7 @@ int main(int argc, char** argv){
             load_bucket_rows_precompute(path, rows);
             if(rows.empty()) continue;
 
-            f_dup   = try_primary_dupR(C, Slocal, rows, store, A.out_json, A.out_txt, A.out_k, pairs_tested);
+            f_dup   = try_primary_dupR(C, Slocal, rows, store, A.out_json, A.out_txt, A.out_k, pairs_tested, A.min_count);
             f_delta = delta_scan_bucket(C, Slocal, rows, gradient, step_sched, false, A.dg_per_pair_cap, store, A.out_json, A.out_txt, A.out_deltas, pairs_tested);
             f_reflected_delta = reflected_delta_scan_bucket(
                 C, Slocal, rows, gradient, step_sched, false, A.dg_per_pair_cap,
