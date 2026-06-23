@@ -175,6 +175,29 @@ static bool bn_from_hex(const string& hx, BIGNUM* out){
     if (BN_hex2bn(&tmp, t.c_str()) <= 0) return false;
     BN_copy(out, tmp); BN_free(tmp); return true;
 }
+static bool bn_from_json_scalar(const string& raw, BIGNUM* out){
+    string t = raw;
+    while(!t.empty() && isspace((unsigned char)t.front())) t.erase(t.begin());
+    while(!t.empty() && isspace((unsigned char)t.back())) t.pop_back();
+    if(t.empty()) return false;
+    if(t.size()>=2 && t[0]=='0' && (t[1]=='x'||t[1]=='X')) return bn_from_hex(t, out);
+    bool hexish = is_hexlike(t);
+    bool decish = true;
+    for(char c: t){ if(!isdigit((unsigned char)c)){ decish=false; break; } }
+    if(!hexish) return false;
+    BIGNUM* tmp = nullptr;
+    int ok = 0;
+    // JSON string fields in this project are normally fixed-width hex. Raw
+    // unquoted JSON numbers are decimal; jsonl_get cannot preserve the JSON
+    // token type, so use length/characters to avoid interpreting small decimal
+    // numerals as hex.
+    if(decish && t.size() < 64) ok = BN_dec2bn(&tmp, t.c_str());
+    else ok = BN_hex2bn(&tmp, t.c_str());
+    if(ok <= 0 || !tmp) return false;
+    BN_copy(out, tmp);
+    BN_free(tmp);
+    return true;
+}
 static void bn_mod(Ctx& C, BIGNUM* a){ BN_nnmod(a,a,C.N,C.ctx); }
 static void bn_addm(Ctx& C, const BIGNUM* a,const BIGNUM* b,BIGNUM* r){ BN_mod_add(r,a,b,C.N,C.ctx); }
 static void bn_subm(Ctx& C, const BIGNUM* a,const BIGNUM* b,BIGNUM* r){ BN_mod_sub(r,a,b,C.N,C.ctx); }
@@ -202,7 +225,7 @@ static string bn_hex(BIGNUM* x){
 
 static bool canonical_scalar_hex(Ctx& C, const string& hx, string& out){
     BNWrap v;
-    if(!bn_from_hex(hx, v.n)) return false;
+    if(!bn_from_json_scalar(hx, v.n)) return false;
     bn_mod(C, v.n);
     out = bn_hex(v.n);
     return true;
@@ -320,9 +343,16 @@ static bool parse_row(const string& line, Row& out){
     return true;
 }
 static bool precompute_row(Ctx& C, Row& R){
-    if(!bn_from_hex(R.r_hex,R.r.n)) return false;
-    if(!bn_from_hex(R.s_hex,R.s.n)) return false;
-    if(!bn_from_hex(R.z_hex,R.z.n)) return false;
+    if(!bn_from_json_scalar(R.r_hex,R.r.n)) return false;
+    if(!bn_from_json_scalar(R.s_hex,R.s.n)) return false;
+    if(!bn_from_json_scalar(R.z_hex,R.z.n)) return false;
+
+    if(BN_is_zero(R.r.n) || BN_cmp(R.r.n, C.N) >= 0) return false;
+    if(BN_is_zero(R.s.n) || BN_cmp(R.s.n, C.N) >= 0) return false;
+    if(BN_cmp(R.z.n, C.N) >= 0) bn_mod(C, R.z.n);
+    R.r_hex = bn_hex(R.r.n);
+    R.s_hex = bn_hex(R.s.n);
+    R.z_hex = bn_hex(R.z.n);
 
     // Low-S normalization: if s > N/2 -> s = N - s
     if(BN_cmp(R.s.n, C.halfN) > 0){
@@ -485,6 +515,7 @@ struct DiagStats {
     atomic<size_t> primary_inverse_fail{0};
     atomic<size_t> primary_k_zero{0};
     atomic<size_t> primary_r_from_k_mismatch{0};
+    atomic<size_t> primary_path_r_from_k_mismatch{0};
     atomic<size_t> primary_ecdsa_fail{0};
     atomic<size_t> primary_pubkey_mismatch{0};
     atomic<size_t> primary_valid_candidates{0};
@@ -550,6 +581,8 @@ static int try_primary_dupR(Ctx& C, Secp& S, const vector<Row>& rows,
                 GDIAG.primary_pairs++;
                 const Row& R1 = rows[idxs[a]];
                 const Row& R2 = rows[idxs[b]];
+                bool pair_accepted = false;
+                size_t pair_r_mismatch = 0;
                 for(int path=0;path<2;path++){
                     if(path==0) BN_mod_sub(denom.n,R1.s.n,R2.s.n,C.N,C.ctx);
                     else        BN_mod_add(denom.n,R1.s.n,R2.s.n,C.N,C.ctx);
@@ -560,7 +593,7 @@ static int try_primary_dupR(Ctx& C, Secp& S, const vector<Row>& rows,
                     if(BN_is_zero(k.n)){ GDIAG.primary_k_zero++; continue; }
 
                     // r-from-k verification
-                    if(!r_from_k_matches(C, S, R1.r_hex, k.n)){ GDIAG.primary_r_from_k_mismatch++; continue; }
+                    if(!r_from_k_matches(C, S, R1.r_hex, k.n)){ pair_r_mismatch++; GDIAG.primary_path_r_from_k_mismatch++; continue; }
                     if(path==0) BN_copy(k2.n, k.n);
                     else        BN_mod_sub(k2.n, C.N, k.n, C.N, C.ctx);
                     if(BN_is_zero(k2.n)){ GDIAG.primary_k_zero++; continue; }
@@ -596,10 +629,12 @@ static int try_primary_dupR(Ctx& C, Secp& S, const vector<Row>& rows,
                             store.add_k(R1.r_hex, bn_hex(nk.n));
                         }
                         found++;
+                        pair_accepted = true;
                     }else{
                         GDIAG.primary_pubkey_mismatch++;
                     }
                 }
+                if(!pair_accepted) GDIAG.primary_r_from_k_mismatch += pair_r_mismatch;
             }
         }
     }
@@ -1630,7 +1665,7 @@ static void load_k_jsonl_into_store(const string& path, RecStore& store){
                 string rr = hexlower(r);
                 string kk = hexlower(val);
                 BNWrap kbn;
-                if(bn_from_hex(kk, kbn.n)){
+                if(bn_from_json_scalar(kk, kbn.n)){
                     bn_mod(C, kbn.n);
                     if(!BN_is_zero(kbn.n)){
                         store.add_k(rr, bn_hex(kbn.n));
@@ -1751,6 +1786,7 @@ static void write_diag_report(const string& path, const Args& A,
         << ",\"inverse_fail\":" << v(GDIAG.primary_inverse_fail)
         << ",\"k_zero\":" << v(GDIAG.primary_k_zero)
         << ",\"r_from_k_mismatch\":" << v(GDIAG.primary_r_from_k_mismatch)
+        << ",\"path_r_from_k_mismatch\":" << v(GDIAG.primary_path_r_from_k_mismatch)
         << ",\"ecdsa_fail\":" << v(GDIAG.primary_ecdsa_fail)
         << ",\"pubkey_mismatch\":" << v(GDIAG.primary_pubkey_mismatch)
         << ",\"valid_candidates\":" << v(GDIAG.primary_valid_candidates) << "},\n";
