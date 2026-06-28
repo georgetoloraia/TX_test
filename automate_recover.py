@@ -10,6 +10,8 @@ Default behavior is defensive and reproducible.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import math
@@ -826,6 +828,152 @@ def recovery_viability_label(
     return "none"
 
 
+def build_recoverability_verdict(
+    *,
+    audit_report: dict[str, Any],
+    stage0_subset_info: dict[str, Any] | None,
+    duplicate_r_pair_summary: dict[str, Any] | None,
+    hnp_leak_report: dict[str, Any] | None,
+    hnp_bounded_k_report: dict[str, Any] | None,
+    nonce_hypothesis_report: dict[str, Any] | None,
+    known_k_chain_report: dict[str, Any] | None,
+    material_summary: dict[str, Any] | None,
+    min_hnp_leaks: int,
+    min_correlation_samples: int = 50,
+) -> dict[str, Any]:
+    """Separate anomaly risk from algebraic recoverability.
+
+    Risk can be statistical. Recoverability must be backed by a concrete
+    nonce fact: valid duplicate-r algebra, known k overlap, explicit HNP leak,
+    nonce-hypothesis k that matches r, or already validated recovered material.
+    """
+
+    def i(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    def f(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    stage0 = stage0_subset_info or {}
+    dup_pairs = duplicate_r_pair_summary or {}
+    hnp_leaks = hnp_leak_report or {}
+    hnp_bounded = hnp_bounded_k_report or {}
+    nonce = nonce_hypothesis_report or {}
+    known_k = known_k_chain_report or {}
+    material = material_summary or {}
+    risk = audit_report.get("risk", {}) or {}
+    reasons = [str(x) for x in (risk.get("reasons", []) or [])]
+    signature_count = i(audit_report.get("signature_count", 0))
+    correlations = audit_report.get("correlations", {}) or {}
+    strong_correlations = {
+        str(k): f(v)
+        for k, v in correlations.items()
+        if abs(f(v)) > 0.10
+    }
+
+    duplicate_r_groups = i((audit_report.get("duplicates_r", {}) or {}).get("duplicate_count", 0))
+    cross_pub_duplicate_r_groups = i((audit_report.get("cross_pub_duplicate_r", {}) or {}).get("collision_count", 0))
+    direct_valid_pairs = i(dup_pairs.get("direct_valid_pairs", 0))
+    same_r_diff_s_groups = i(stage0.get("same_r_diff_s_groups", 0))
+    recoverable_focus_groups = i(stage0.get("recoverable_focus_groups", 0))
+    known_k_accepted = i(known_k.get("accepted_new_keys", 0)) + i(known_k.get("cumulative_accepted_new_keys", 0))
+    known_k_rows_with_known_r = i(known_k.get("rows_with_known_r", 0))
+    explicit_hnp_leaks = i(hnp_leaks.get("valid_leak_rows", 0))
+    bounded_k_candidates = i(hnp_bounded.get("total_candidates", 0))
+    nonce_matches = i(nonce.get("matched_candidates", nonce.get("matched", 0)))
+    key_recovered = bool(material.get("key_recovered") or material.get("new_key_recovered"))
+
+    algebraic_evidence = {
+        "duplicate_r_valid": direct_valid_pairs > 0 or same_r_diff_s_groups > 0 or recoverable_focus_groups > 0,
+        "known_k_overlap_valid": known_k_accepted > 0,
+        "explicit_hnp_leak_ready": explicit_hnp_leaks >= max(1, int(min_hnp_leaks)),
+        "bounded_k_candidates_available": bounded_k_candidates > 0,
+        "nonce_hypothesis_k_matched_r": nonce_matches > 0,
+        "validated_key_material_present": key_recovered,
+    }
+    recoverable = any(algebraic_evidence.values())
+    statistical_only = (
+        not recoverable
+        and (bool(strong_correlations) or any("correlation" in r.lower() for r in reasons))
+        and duplicate_r_groups == 0
+        and cross_pub_duplicate_r_groups == 0
+        and explicit_hnp_leaks == 0
+        and nonce_matches == 0
+        and known_k_accepted == 0
+    )
+
+    if key_recovered:
+        status = "recovered"
+        reason = "validated_recovered_material_present"
+    elif recoverable:
+        status = "recoverable_evidence_present"
+        reason = "validated_algebraic_nonce_evidence_present"
+    elif statistical_only and signature_count < min_correlation_samples:
+        status = "not_recoverable_small_sample_correlation_only"
+        reason = "correlation_only_below_minimum_sample_size"
+    elif statistical_only:
+        status = "not_recoverable_statistical_only"
+        reason = "statistical_anomaly_without_validated_nonce_fact"
+    elif duplicate_r_groups > 0:
+        status = "not_recoverable_replay_or_unvalidated_duplicate_r"
+        reason = "duplicate_r_present_but_no_valid_same_key_same_r_different_s_z_pair"
+    else:
+        status = "not_recoverable_no_algebraic_evidence"
+        reason = "no_duplicate_r_known_k_explicit_hnp_or_valid_nonce_relation"
+
+    needed_next: list[str] = []
+    if status == "not_recoverable_small_sample_correlation_only":
+        needed_next.append("collect_more_pubkey_signatures")
+        needed_next.append("rerun_segmented_relation_scan_after_sample_size_threshold")
+    elif status == "not_recoverable_statistical_only":
+        needed_next.append("segment_by_pubkey_time_height_sighash_change_point")
+        needed_next.append("test_concrete_nonce_relations_inside_segments")
+    elif status == "not_recoverable_replay_or_unvalidated_duplicate_r":
+        needed_next.append("classify_duplicate_r_pairs_as_replay_vs_same_r_different_s_z")
+        needed_next.append("verify_z_sighash_context_for_duplicate_r_rows")
+    elif status == "not_recoverable_no_algebraic_evidence":
+        needed_next.append("expand_pubkey_signature_collection")
+        needed_next.append("look_for_known_k_overlap_explicit_leaks_or_nonce_model_matches")
+
+    return {
+        "status": status,
+        "recoverable": bool(recoverable),
+        "reason": reason,
+        "risk_verdict": risk.get("verdict", "unknown"),
+        "risk_score": i(risk.get("score", 0)),
+        "signature_count": signature_count,
+        "minimum_correlation_sample_size": int(min_correlation_samples),
+        "minimum_more_signatures_for_correlation": max(0, int(min_correlation_samples) - signature_count),
+        "algebraic_evidence": algebraic_evidence,
+        "evidence_counts": {
+            "duplicate_r_groups": duplicate_r_groups,
+            "cross_pub_duplicate_r_groups": cross_pub_duplicate_r_groups,
+            "direct_valid_duplicate_r_pairs": direct_valid_pairs,
+            "same_r_diff_s_groups": same_r_diff_s_groups,
+            "recoverable_focus_groups": recoverable_focus_groups,
+            "known_k_rows_with_known_r": known_k_rows_with_known_r,
+            "known_k_accepted_new_keys": known_k_accepted,
+            "explicit_hnp_valid_leak_rows": explicit_hnp_leaks,
+            "bounded_k_candidates": bounded_k_candidates,
+            "nonce_hypothesis_matches": nonce_matches,
+        },
+        "statistical_only": bool(statistical_only),
+        "strong_correlations": strong_correlations,
+        "needed_next": needed_next,
+        "rule": (
+            "recoverable=true only if duplicate_r_valid, known_k_overlap_valid, "
+            "explicit_hnp_leak_ready, bounded/nonce-hypothesis candidate evidence, "
+            "or validated recovered material is present"
+        ),
+    }
+
+
 def resolve_python_executable() -> str:
     """Prefer active virtualenv interpreter when available for subprocess parity."""
     venv = os.environ.get("VIRTUAL_ENV", "").strip()
@@ -847,6 +995,361 @@ def write_decision(path: str, payload: dict[str, Any]) -> None:
         json.dump(payload, f, indent=2)
 
 
+def load_json_file(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def write_json_file(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def load_pipeline_index(path: Path) -> dict[str, Any]:
+    data = load_json_file(
+        path,
+        {
+            "version": 1,
+            "processed_pubkeys": {},
+            "processed_reports": {},
+            "alerts": [],
+        },
+    )
+    if not isinstance(data, dict):
+        return {
+            "version": 1,
+            "processed_pubkeys": {},
+            "processed_reports": {},
+            "alerts": [],
+        }
+    data.setdefault("version", 1)
+    data.setdefault("processed_pubkeys", {})
+    data.setdefault("processed_reports", {})
+    data.setdefault("alerts", [])
+    return data
+
+
+def save_pipeline_index(path: Path, index: dict[str, Any]) -> None:
+    write_json_file(path, index)
+
+
+def load_flagged_vulnerable_keys(path: Path) -> dict[str, Any]:
+    data = load_json_file(path, {"version": 1, "entries": []})
+    if not isinstance(data, dict):
+        return {"version": 1, "entries": []}
+    if not isinstance(data.get("entries"), list):
+        data["entries"] = []
+    data.setdefault("version", 1)
+    return data
+
+
+def save_flagged_vulnerable_keys(path: Path, payload: dict[str, Any]) -> None:
+    write_json_file(path, payload)
+
+
+def is_defensive_audit_report(report: dict[str, Any]) -> bool:
+    if not isinstance(report, dict):
+        return False
+    if report.get("audit_mode") == "defensive_nonce_bias":
+        return True
+    if "statistical_metrics" in report:
+        return True
+    if "nonce_bias_profile" in report and "risk_verdict" in report:
+        return True
+    return False
+
+
+def extract_report_pubkeys(report: dict[str, Any]) -> list[str]:
+    pubs: set[str] = set()
+
+    def add_pub(value: Any) -> None:
+        if not value:
+            return
+        text = str(value).strip().lower()
+        if not text:
+            return
+        if text.startswith("pub:"):
+            text = text[4:]
+        if len(text) >= 66 and all(ch in "0123456789abcdef" for ch in text[:66]):
+            pubs.add(text)
+
+    target = report.get("target_filter", {}) or {}
+    add_pub(target.get("target_pubkey"))
+
+    for cluster in ((report.get("clusters", {}) or {}).get("top_clusters", []) or []):
+        add_pub(cluster.get("pubkey"))
+        add_pub(cluster.get("pubkey_hex"))
+        cluster_id = str(cluster.get("cluster") or "")
+        if cluster_id.startswith("pub:"):
+            add_pub(cluster_id[4:])
+
+    for section in ("signer_longitudinal_drift", "signer_change_points", "signer_mixture_modes", "constraint_model_fits"):
+        for item in ((report.get(section, {}) or {}).get("top_flagged_signers", []) or []):
+            add_pub(item.get("pubkey"))
+            add_pub(item.get("pubkey_hex"))
+
+    return sorted(pubs)
+
+
+def build_audit_alert_summary(report: dict[str, Any], source_report: Path, pubkey: str) -> dict[str, Any]:
+    risk = report.get("risk", {}) or {}
+    metrics = report.get("statistical_metrics", {}) or {}
+    return {
+        "pubkey": pubkey,
+        "status": "critical_bias_detected" if str(report.get("risk_verdict")) == "CRITICAL_BIAS_DETECTED" else "biased",
+        "risk_score": float(report.get("risk_score", risk.get("score", 0)) or 0.0),
+        "risk_verdict": str(report.get("risk_verdict", risk.get("verdict", "unknown"))),
+        "signature_count": int(report.get("signature_count", metrics.get("total_signatures_profiled", 0)) or 0),
+        "source_report": str(source_report),
+        "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "summary": {
+            "u_bit_bias": metrics.get("u_bit_bias", {}),
+            "t_bit_bias": metrics.get("t_bit_bias", {}),
+            "u_mod_bias": metrics.get("u_mod_bias", {}),
+            "t_mod_bias": metrics.get("t_mod_bias", {}),
+        },
+    }
+
+
+def append_flagged_vulnerable_keys(path: Path, entries: list[dict[str, Any]]) -> dict[str, Any]:
+    store = load_flagged_vulnerable_keys(path)
+    existing = {
+        (str(row.get("pubkey")), str(row.get("source_report")))
+        for row in store.get("entries", [])
+        if isinstance(row, dict)
+    }
+    added = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        key = (str(entry.get("pubkey")), str(entry.get("source_report")))
+        if key in existing:
+            continue
+        store["entries"].append(entry)
+        existing.add(key)
+        added += 1
+    store["last_updated_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    store["entry_count"] = len(store["entries"])
+    save_flagged_vulnerable_keys(path, store)
+    return {"path": str(path), "added": added, "entry_count": len(store["entries"])}
+
+
+def dispatch_audit_notification(summary: dict[str, Any]) -> dict[str, Any]:
+    bias_summary = summary.get("summary", {}) or {}
+    u_bits = int((bias_summary.get("u_bit_bias", {}) or {}).get("fdr_significant_bit_count", 0) or 0)
+    t_bits = int((bias_summary.get("t_bit_bias", {}) or {}).get("fdr_significant_bit_count", 0) or 0)
+    message = (
+        f"[AUDIT_ALERT] pubkey={summary.get('pubkey')} "
+        f"risk_score={summary.get('risk_score')} "
+        f"verdict={summary.get('risk_verdict')} "
+        f"sigs={summary.get('signature_count')} "
+        f"u_fdr_bits={u_bits} "
+        f"t_fdr_bits={t_bits} "
+        f"source={summary.get('source_report')}"
+    )
+    print(message)
+    return {"dispatched": True, "channel": "mock", "message": message}
+
+
+def _load_audit_report_candidate(path: Path) -> dict[str, Any] | None:
+    try:
+        if not path.is_file():
+            return None
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(report, dict):
+        return None
+    if not is_defensive_audit_report(report):
+        return None
+    return report
+
+
+def scan_audit_reports(search_root: Path, max_workers: int = 8) -> list[tuple[Path, dict[str, Any]]]:
+    if not search_root.exists():
+        return []
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for pattern in ("*audit*.json", "*bias*.json"):
+        for path in search_root.rglob(pattern):
+            if not path.is_file():
+                continue
+            key = str(path.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(path)
+    results: list[tuple[Path, dict[str, Any]]] = []
+    if not candidates:
+        return results
+    workers = max(1, min(int(max_workers), 16))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_map = {pool.submit(_load_audit_report_candidate, path): path for path in candidates}
+        for future in as_completed(future_map):
+            path = future_map[future]
+            try:
+                report = future.result()
+            except Exception:
+                report = None
+            if report is not None:
+                results.append((path, report))
+    results.sort(key=lambda item: str(item[0]))
+    return results
+
+
+def process_defensive_audit_profiles(
+    *,
+    search_root: Path,
+    index_path: Path,
+    security_log_path: Path,
+    max_workers: int = 8,
+) -> dict[str, Any]:
+    index = load_pipeline_index(index_path)
+    scanned = scan_audit_reports(search_root, max_workers=max_workers)
+    alerts: list[dict[str, Any]] = []
+    skipped_already_processed = 0
+    scanned_reports = 0
+
+    for path, report in scanned:
+        scanned_reports += 1
+        risk_score = float(report.get("risk_score", report.get("risk", {}).get("score", 0)) or 0.0)
+        verdict = str(report.get("risk_verdict", report.get("risk", {}).get("verdict", "unknown")))
+        if verdict != "CRITICAL_BIAS_DETECTED" and risk_score <= 60.0:
+            continue
+
+        pubkeys = extract_report_pubkeys(report)
+        if not pubkeys:
+            pubkeys = ["unknown"]
+
+        report_hash = hashlib.sha256(json.dumps(report, sort_keys=True).encode("utf-8")).hexdigest()
+        for pubkey in pubkeys:
+            state = index["processed_pubkeys"].get(pubkey)
+            if isinstance(state, dict) and state.get("status") in {"critical_bias_detected", "biased"}:
+                skipped_already_processed += 1
+                continue
+            alert = build_audit_alert_summary(report, path, pubkey)
+            alerts.append(alert)
+            index["processed_pubkeys"][pubkey] = {
+                "status": alert["status"],
+                "risk_score": alert["risk_score"],
+                "risk_verdict": alert["risk_verdict"],
+                "last_seen_utc": alert["timestamp_utc"],
+                "source_report": alert["source_report"],
+                "report_hash": report_hash,
+            }
+            index["processed_reports"][report_hash] = {
+                "pubkey": pubkey,
+                "source_report": alert["source_report"],
+                "status": alert["status"],
+                "seen_utc": alert["timestamp_utc"],
+            }
+
+    if alerts:
+        append_flagged_vulnerable_keys(security_log_path, alerts)
+        for alert in alerts:
+            index["alerts"].append(
+                {
+                    "pubkey": alert["pubkey"],
+                    "risk_score": alert["risk_score"],
+                    "risk_verdict": alert["risk_verdict"],
+                    "seen_utc": alert["timestamp_utc"],
+                    "source_report": alert["source_report"],
+                }
+            )
+        save_pipeline_index(index_path, index)
+        notifications = [dispatch_audit_notification(alert) for alert in alerts]
+    else:
+        notifications = []
+        save_pipeline_index(index_path, index)
+
+    return {
+        "search_root": str(search_root),
+        "scanned_reports": scanned_reports,
+        "critical_alerts": len(alerts),
+        "skipped_already_processed": skipped_already_processed,
+        "security_log": str(security_log_path),
+        "pipeline_index": str(index_path),
+        "notifications": notifications,
+    }
+
+
+def write_hnp_not_run_artifacts(
+    *,
+    reason: str,
+    sig_path: Path,
+    hnp_leaks_out: str,
+    hnp_leak_report: str,
+    hnp_bounded_k_out: str,
+    hnp_bounded_k_report: str,
+    hnp_candidates_out: str,
+    hnp_report_out: str,
+    known_nonce_rows: int,
+    hnp_min_leaks: int,
+) -> dict[str, Any]:
+    """Write explicit HNP diagnostics even when recovery exits before HNP stages."""
+
+    def write_json(path: str, payload: dict[str, Any]) -> None:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def touch_empty(path: str) -> None:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if not p.exists():
+            p.write_text("", encoding="utf-8")
+
+    total_rows = 0
+    try:
+        with sig_path.open("r", encoding="utf-8") as f:
+            total_rows = sum(1 for line in f if line.strip())
+    except Exception:
+        total_rows = 0
+
+    leak_report = {
+        "input": str(sig_path),
+        "output": str(hnp_leaks_out),
+        "ran": False,
+        "reason": reason,
+        "total_rows": total_rows,
+        "explicit_leak_rows": int(known_nonce_rows),
+        "valid_leak_rows": 0,
+        "min_leaks": int(hnp_min_leaks),
+    }
+    bounded_report = {
+        "input": str(hnp_leaks_out),
+        "output": str(hnp_bounded_k_out),
+        "ran": False,
+        "reason": reason,
+        "total_candidates": 0,
+    }
+    solver_report = {
+        "input": str(hnp_leaks_out),
+        "output": str(hnp_candidates_out),
+        "ran": False,
+        "reason": reason,
+        "total_rows": 0,
+        "rows_with_known_nonce_bits": int(known_nonce_rows),
+        "valid_leaks": 0,
+        "min_leaks": int(hnp_min_leaks),
+    }
+    touch_empty(hnp_leaks_out)
+    touch_empty(hnp_bounded_k_out)
+    touch_empty(hnp_candidates_out)
+    write_json(hnp_leak_report, leak_report)
+    write_json(hnp_bounded_k_report, bounded_report)
+    write_json(hnp_report_out, solver_report)
+    return {
+        "hnp_leak_report": leak_report,
+        "hnp_bounded_k_report": bounded_report,
+        "hnp_solver_report": solver_report,
+    }
+
+
 def run_recover_stage(
     recover_bin: str,
     recover_input: str,
@@ -861,6 +1364,8 @@ def run_recover_stage(
     recover_clusters_out: str,
     extra_args: list[str],
 ) -> int:
+    stage_slug = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in stage_name)
+    rejection_report = str(Path(recover_json_out).parent / f"recovery_rejection_{stage_slug}.json")
     rec_cmd = [
         recover_bin,
         "--sigs", recover_input,
@@ -871,6 +1376,7 @@ def run_recover_stage(
         "--out-deltas", recover_deltas_out,
         "--report-collisions", recover_collisions_out,
         "--export-clusters", recover_clusters_out,
+        "--rejection-report", rejection_report,
         "--max-iter", str(max_iter),
     ] + extra_args
     print(f"[recover-stage] {stage_name}")
@@ -1084,6 +1590,173 @@ def write_candidate_validation_report(
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def build_statistical_signal_hypotheses(audit_report: dict[str, Any]) -> dict[str, Any]:
+    """Explain weak statistical signals as recovery hypotheses, not key material."""
+
+    def i(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    def f(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    hypotheses: list[dict[str, Any]] = []
+    sample_count = i(audit_report.get("signature_count", 0))
+    min_correlation_samples = 25
+
+    bit_bias_r = audit_report.get("bit_bias_r", {}) or {}
+    fdr_r = i(bit_bias_r.get("fdr_significant_bit_count", 0))
+    top_r_bits = [
+        {
+            "bit": i(x.get("bit", -1), -1),
+            "ratio": f(x.get("ratio", 0.0)),
+            "q_value": f(x.get("q_value", 1.0)),
+        }
+        for x in (bit_bias_r.get("top_suspicious_bits", []) or [])[:5]
+        if isinstance(x, dict)
+    ]
+    if fdr_r > 0 or top_r_bits:
+        hypotheses.append({
+            "signal": "r_bit_bias",
+            "strength": "fdr_significant" if fdr_r > 0 else "weak_unconfirmed",
+            "directly_recoverable": False,
+            "why_not_direct": "r is x(k*G); biased r bits do not directly reveal k bits.",
+            "testable_hypotheses": [
+                "segment signer by time/height/sighash and retest bias per segment",
+                "check bounded/small nonce only if leading-zero/tiny-r evidence also appears",
+                "try explicit leak extraction only if fixed bit positions persist across larger samples",
+            ],
+            "safe_next_checks": [
+                "increase targeted signature collection for this pubkey",
+                "run relation scan on same-signer segments, not full corpus",
+                "do not escalate random-k without bounded nonce evidence",
+            ],
+            "top_bits": top_r_bits,
+        })
+
+    correlations = audit_report.get("correlations", {}) or {}
+    strong_corr = [
+        {"name": str(k), "value": f(v)}
+        for k, v in correlations.items()
+        if abs(f(v)) >= 0.10
+    ]
+    strong_corr.sort(key=lambda x: abs(float(x["value"])), reverse=True)
+    if strong_corr:
+        low_sample = sample_count < min_correlation_samples
+        hypotheses.append({
+            "signal": "r_s_z_correlation",
+            "strength": "low_sample_unstable" if low_sample else "candidate_relation_signal",
+            "directly_recoverable": False,
+            "why_not_direct": (
+                "correlation is unstable at this sample size and is not an equation for k or d."
+                if low_sample
+                else "correlation is not an equation for k or d; it must fit a concrete nonce relation."
+            ),
+            "testable_hypotheses": [
+                "k2 = k1 + delta",
+                "k2 = k1 - delta",
+                "k2 = a*k1 + b",
+                "reflected relation k1 + k2 = delta",
+            ],
+            "safe_next_checks": [
+                (
+                    f"collect at least {min_correlation_samples} signatures for this signer before treating "
+                    "correlation as a recovery-priority signal"
+                    if low_sample
+                    else "run bounded relation scan per pubkey/time-window/sighash segment"
+                ),
+                "inspect rejection report for r_from_k_mismatch dominance",
+                "raise relation budget only for signers with repeated correlation across segments",
+            ],
+            "top_correlations": strong_corr[:8],
+            "sample_count": sample_count,
+            "min_reliable_sample_count": min_correlation_samples,
+        })
+
+    sighash_segments = audit_report.get("sighash_segments", {}) or {}
+    interesting_segments: list[dict[str, Any]] = []
+    for seg in (sighash_segments.get("segments", []) or [])[:10]:
+        if not isinstance(seg, dict):
+            continue
+        if (
+            i(seg.get("duplicate_r", 0)) > 0
+            or i(seg.get("fdr_bits_r", 0)) > 0
+            or i(seg.get("tiny_r_lt_2^240", 0)) > 0
+        ):
+            interesting_segments.append({
+                "sighash": seg.get("sighash"),
+                "count": i(seg.get("count", 0)),
+                "duplicate_r": i(seg.get("duplicate_r", 0)),
+                "fdr_bits_r": i(seg.get("fdr_bits_r", 0)),
+                "tiny_r_lt_2_240": i(seg.get("tiny_r_lt_2^240", 0)),
+            })
+    if interesting_segments:
+        directly_recoverable = any(x["duplicate_r"] > 0 for x in interesting_segments)
+        hypotheses.append({
+            "signal": "sighash_segment_anomaly",
+            "strength": "recoverable_candidate" if directly_recoverable else "segmentation_signal",
+            "directly_recoverable": directly_recoverable,
+            "why_not_direct": (
+                "duplicate-r inside a sighash segment can be algebraic evidence"
+                if directly_recoverable
+                else "segment bit-bias identifies a signer mode; it does not reveal k."
+            ),
+            "testable_hypotheses": [
+                "same signer used a weaker nonce mode for one sighash type",
+                "relation model fits inside one sighash segment but not globally",
+                "z/sighash context issue is producing misleading statistics",
+            ],
+            "safe_next_checks": [
+                "build per-sighash relation worksets",
+                "verify z reconstruction for this segment",
+                "classify duplicate-r rows as replay vs same-r/different-s before recovery attempts",
+            ],
+            "segments": interesting_segments,
+        })
+
+    leading_zero = audit_report.get("leading_zero_r", {}) or {}
+    tiny_r = audit_report.get("tiny_r", {}) or {}
+    lz16 = i(leading_zero.get("count_lz_ge_16", 0))
+    tiny240 = i(tiny_r.get("count_lt_2^240", 0))
+    if lz16 > 0 or tiny240 > 0:
+        hypotheses.append({
+            "signal": "tiny_or_leading_zero_r",
+            "strength": "bounded_nonce_candidate" if tiny240 > 0 else "weak_distribution_signal",
+            "directly_recoverable": False,
+            "why_not_direct": "small r is not the same as small k; it only justifies bounded checks if statistically persistent.",
+            "testable_hypotheses": [
+                "small or bounded k for a subset of signatures",
+                "biased nonce generator causing repeated low x-coordinates",
+            ],
+            "safe_next_checks": [
+                "segment by pubkey/time/sighash before bounded-k checks",
+                "require r=x(kG) validation for every candidate",
+            ],
+            "counts": {
+                "leading_zero_r_ge_16": lz16,
+                "tiny_r_lt_2_240": tiny240,
+            },
+        })
+
+    return {
+        "summary": {
+            "hypothesis_count": len(hypotheses),
+            "direct_recovery_signal_count": sum(1 for h in hypotheses if h.get("directly_recoverable")),
+            "statistical_only_count": sum(1 for h in hypotheses if not h.get("directly_recoverable")),
+        },
+        "principle": (
+            "Statistical anomalies prioritize detection; recovery requires duplicate-r, "
+            "known/partial k, bounded k, or a validated nonce relation."
+        ),
+        "hypotheses": hypotheses,
+    }
+
+
 def build_recovery_evidence_report(
     *,
     out_path: Path,
@@ -1151,7 +1824,21 @@ def build_recovery_evidence_report(
     unresolved_rows = i(unresolved.get("selected_rows", 0))
     relation_rows = i(relation.get("selected_rows", 0))
     relation_signers = i(relation.get("selected_signers", 0))
+    relation_top_signers = relation.get("top_signers", []) or []
     relation_truncated = "row_cap_truncated_candidate_pairs" in (relation.get("likely_blockers", []) or [])
+    if not relation_truncated:
+        for signer in relation_top_signers:
+            if not isinstance(signer, dict):
+                continue
+            if "row_cap_truncated_candidate_pairs" in (signer.get("likely_blockers", []) or []):
+                relation_truncated = True
+                break
+    broad_relation_skipped = bool(broad_skip.get("skip"))
+    relation_diagnostic_only = (
+        broad_relation_skipped
+        and relation_rows >= 2
+        and "relation_recovery_disabled_by_fusion_recommendation" in (broad_skip.get("reasons", []) or [])
+    )
     pre_valid = i(pre_validation.get("valid_rows", 0))
     post_valid = i(post_validation.get("valid_rows", 0))
     new_valid = max(0, post_valid - pre_valid)
@@ -1159,6 +1846,7 @@ def build_recovery_evidence_report(
     recovered_k_rows = count_nonempty_lines(recovered_k_path)
     known_k_new = i(known_k.get("accepted_new_keys", 0)) + i(known_k.get("cumulative_accepted_new_keys", 0))
     known_priv_new_k = i(known_priv.get("new_k_candidates", 0)) + i(known_priv.get("cumulative_new_k_candidates", 0))
+    statistical_hypotheses = build_statistical_signal_hypotheses(audit_report)
 
     categories: dict[str, int] = {
         "recoverable_now": 0,
@@ -1216,7 +1904,13 @@ def build_recovery_evidence_report(
             categories["no_nonce_model_match"] += 1
             blockers.append("enabled_nonce_hypothesis_models_matched_zero_r_values")
 
-    if relation_rows >= 2 and delta_rows == 0 and new_valid <= 0:
+    if relation_rows >= 2 and relation_diagnostic_only:
+        categories["no_nonce_relation_detected"] += 1
+        blockers.append("relation_diagnostic_workset_not_executed_as_recovery")
+        next_steps.append(
+            "Relation workset was built for diagnostics only; run exhaustive recovery only if you intentionally want to test statistical-only relations."
+        )
+    elif relation_rows >= 2 and delta_rows == 0 and new_valid <= 0:
         categories["no_nonce_relation_detected"] += 1
         blockers.append("relation_scan_selected_rows_but_no_delta_lcg_or_recovery_hits")
     if relation_truncated:
@@ -1249,6 +1943,18 @@ def build_recovery_evidence_report(
             "known_k_chain_accepted_new_keys": i(known_k.get("accepted_new_keys", 0)),
             "known_priv_chain_new_k_candidates": i(known_priv.get("new_k_candidates", 0)),
         })
+
+    if (
+        statistical_hypotheses.get("summary", {}).get("statistical_only_count", 0)
+        and direct_valid_pairs == 0
+        and recoverable_focus_groups == 0
+        and valid_hnp_rows == 0
+        and matched_nonce == 0
+        and delta_rows == 0
+        and new_valid <= 0
+    ):
+        blockers.append("statistical_signals_without_algebraic_nonce_evidence")
+        next_steps.append("Use statistical signals only to build smaller pubkey/time/sighash worksets; do not treat them as direct recovery facts.")
 
     if not next_steps:
         next_steps.append("Keep scanning deterministically; do not increase random-k unless a bounded candidate source appears.")
@@ -1287,6 +1993,7 @@ def build_recovery_evidence_report(
         "blockers": sorted(set(blockers)),
         "actionable_next_steps": next_steps,
         "top_evidence_items": evidence_items[:20],
+        "statistical_signal_hypotheses": statistical_hypotheses,
         "stage_runs": [
             {k: v for k, v in stage.items() if k in {"name", "rc", "skipped", "reason", "input"}}
             for stage in stage_runs
@@ -3969,6 +4676,425 @@ def build_signer_relation_neighborhood_subset(
     return payload
 
 
+def _row_height_time_sighash(obj: dict[str, Any]) -> tuple[int | None, int | None, str]:
+    height_raw = (
+        obj.get("height")
+        if obj.get("height") is not None
+        else obj.get("block_height")
+        if obj.get("block_height") is not None
+        else obj.get("block")
+    )
+    time_raw = obj.get("time") if obj.get("time") is not None else obj.get("block_time")
+    height = None
+    ts = None
+    try:
+        if height_raw is not None:
+            height = int(parse_int(height_raw))
+    except Exception:
+        height = None
+    try:
+        if time_raw is not None:
+            ts = int(parse_int(time_raw))
+    except Exception:
+        ts = None
+    sighash = str(obj.get("sighash") or obj.get("sighash_type") or obj.get("hash_type") or "unknown")
+    return height, ts, sighash
+
+
+def _relation_row_identity(pub: str, obj: dict[str, Any], fallback: int) -> tuple[str, str, int, str, str]:
+    try:
+        vin = int(parse_int(obj.get("vin") if obj.get("vin") is not None else obj.get("input_index") or 0))
+    except Exception:
+        vin = fallback
+    txid = str(obj.get("txid") or "")
+    try:
+        r_hex = format(parse_int(obj.get("r")), "064x")
+    except Exception:
+        r_hex = ""
+    try:
+        s_hex = format(parse_int(obj.get("s")), "064x")
+    except Exception:
+        s_hex = ""
+    return (pub, txid, vin, r_hex, s_hex)
+
+
+def _write_relation_segment(
+    *,
+    rows: list[tuple[int, str, dict[str, Any]]],
+    pub: str,
+    reason: str,
+    out_dir: Path,
+    segment_index: int,
+    max_rows: int,
+    min_rows: int,
+    metadata: dict[str, Any],
+    seen_signatures: set[tuple[str, str, int, str, str]],
+) -> dict[str, Any] | None:
+    if len(rows) < max(2, int(min_rows)):
+        return None
+    ordered = sorted(rows, key=lambda item: _signature_order_key(item[2], item[0]))
+    if max_rows > 0 and len(ordered) > max_rows:
+        # Preserve temporal coverage while bounding quadratic relation tests.
+        keep: list[tuple[int, str, dict[str, Any]]] = []
+        head = max(1, max_rows // 5)
+        tail = max(1, max_rows // 5)
+        keep.extend(ordered[:head])
+        keep.extend(ordered[-tail:])
+        remaining = max(0, max_rows - len(keep))
+        middle = ordered[head: max(head, len(ordered) - tail)]
+        if remaining > 0 and middle:
+            stride = max(1, len(middle) // remaining)
+            keep.extend(middle[::stride][:remaining])
+        ordered = sorted(keep, key=lambda item: _signature_order_key(item[2], item[0]))
+
+    deduped: list[tuple[int, str, dict[str, Any]]] = []
+    local_seen: set[tuple[str, str, int, str, str]] = set()
+    for fallback, raw, obj in ordered:
+        key = _relation_row_identity(pub, obj, fallback)
+        if key in local_seen:
+            continue
+        local_seen.add(key)
+        deduped.append((fallback, raw, obj))
+    if len(deduped) < max(2, int(min_rows)):
+        return None
+
+    heights: list[int] = []
+    times: list[int] = []
+    sighashes: Counter[str] = Counter()
+    for _, _, obj in deduped:
+        h, t, sh = _row_height_time_sighash(obj)
+        if h is not None:
+            heights.append(h)
+        if t is not None:
+            times.append(t)
+        sighashes[sh] += 1
+
+    digest = hashlib.sha256(
+        ("\n".join(raw for _, raw, _ in deduped)).encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
+    filename = f"seg_{segment_index:04d}_{reason}_{pub[:16]}_{digest}.jsonl"
+    filename = "".join(c if c.isalnum() or c in "._-" else "_" for c in filename)
+    path = out_dir / filename
+    with path.open("w", encoding="utf-8") as out:
+        for _, raw, _ in deduped:
+            out.write(raw + "\n")
+
+    for fallback, _, obj in deduped:
+        seen_signatures.add(_relation_row_identity(pub, obj, fallback))
+
+    return {
+        "path": str(path),
+        "pubkey": pub,
+        "pubkey_prefix": pub[:20],
+        "reason": reason,
+        "rows": len(deduped),
+        "source_rows": len(rows),
+        "estimated_pairs": len(deduped) * (len(deduped) - 1) // 2,
+        "height_min": min(heights) if heights else None,
+        "height_max": max(heights) if heights else None,
+        "time_min": min(times) if times else None,
+        "time_max": max(times) if times else None,
+        "sighash_counts": dict(sighashes.most_common(8)),
+        "metadata": metadata,
+    }
+
+
+def build_segmented_relation_worksets(
+    *,
+    sig_path: Path,
+    recovered_json_path: Path,
+    recovered_k_path: Path,
+    audit_report: dict[str, Any] | None,
+    out_dir: Path,
+    report_path: Path,
+    min_sigs: int,
+    max_signers: int,
+    max_rows_per_segment: int,
+    max_pairs_per_segment: int,
+    max_segments: int,
+    neighbor_window: int,
+    height_window: int,
+    time_window_sec: int,
+) -> dict[str, Any]:
+    """Emit small signer/time/height/sighash/change-point worksets for relation scans.
+
+    Statistical signer anomalies are not recovery facts by themselves. This
+    builder turns them into bounded, auditable worksets where concrete nonce
+    relations can be tested without running one large noisy quadratic scan.
+    """
+    facts = load_recovery_graph_facts(recovered_json_path, recovered_k_path)
+    recovered_pubs: set[str] = facts["recovered_pubs"]
+    recovered_r: set[str] = facts["recovered_r"]
+    audit_pub_scores: dict[str, int] = {}
+    audit_sources: dict[str, list[str]] = defaultdict(list)
+    audit_focus_indices: dict[str, set[int]] = defaultdict(set)
+    if audit_report:
+        for section, label in (
+            ("signer_change_points", "change_points"),
+            ("signer_mixture_modes", "mixture_modes"),
+            ("signer_longitudinal_drift", "longitudinal_drift"),
+        ):
+            for item in ((audit_report.get(section, {}) or {}).get("top_flagged_signers", []) or []):
+                pub = normalize_pubkey_hex(str(item.get("pubkey") or item.get("pub") or ""))
+                if not pub:
+                    continue
+                audit_sources[pub].append(label)
+                audit_pub_scores[pub] = audit_pub_scores.get(pub, 0) + 25
+                audit_pub_scores[pub] += min(25, int(item.get("drift_flags", 0) or 0))
+                audit_pub_scores[pub] += min(20, int(item.get("change_points_total", 0) or 0) // 5)
+                for key in ("change_points_hamming", "change_points_lsb8_mean", "change_points_msb8_mean"):
+                    for idx in item.get(key, []) or []:
+                        try:
+                            audit_focus_indices[pub].add(max(0, int(idx)))
+                        except Exception:
+                            continue
+                for flag in item.get("top_flags", []) or []:
+                    if isinstance(flag, dict):
+                        try:
+                            audit_focus_indices[pub].add(max(0, int(flag.get("index"))))
+                        except Exception:
+                            continue
+        for c in ((audit_report.get("clusters", {}) or {}).get("top_clusters", []) or []):
+            key = str(c.get("cluster") or "")
+            if not key.startswith("pub:"):
+                continue
+            pub = normalize_pubkey_hex(key[4:])
+            if not pub:
+                continue
+            score = int(((c.get("risk", {}) or {}).get("score", 0)) or 0)
+            if score > 0:
+                audit_sources[pub].append("cluster_risk")
+                audit_pub_scores[pub] = audit_pub_scores.get(pub, 0) + min(50, score)
+
+    groups: dict[str, list[tuple[int, str, dict[str, Any]]]] = defaultdict(list)
+    total_rows = 0
+    bad_json_rows = 0
+    if sig_path.exists():
+        with sig_path.open("r", encoding="utf-8", errors="replace") as f:
+            for idx, line in enumerate(f, start=1):
+                raw = line.strip()
+                if not raw:
+                    continue
+                total_rows += 1
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    bad_json_rows += 1
+                    continue
+                if not isinstance(obj, dict):
+                    bad_json_rows += 1
+                    continue
+                pub = normalize_pubkey_hex(str(obj.get("pubkey_hex") or obj.get("pub") or ""))
+                if not pub:
+                    continue
+                groups[pub].append((idx, raw, obj))
+
+    signer_stats: list[dict[str, Any]] = []
+    for pub, rows in groups.items():
+        if len(rows) < max(2, int(min_sigs)):
+            continue
+        r_counts: Counter[str] = Counter()
+        recovered_r_hits = 0
+        for _, _, obj in rows:
+            try:
+                r_hex = format(parse_int(obj.get("r")), "064x")
+            except Exception:
+                continue
+            r_counts[r_hex] += 1
+            if r_hex in recovered_r:
+                recovered_r_hits += 1
+        dup_r_events = sum(c - 1 for c in r_counts.values() if c > 1)
+        score = int(audit_pub_scores.get(pub, 0))
+        if pub in recovered_pubs:
+            score += 50
+        if recovered_r_hits:
+            score += 40 + min(40, recovered_r_hits)
+        if dup_r_events:
+            score += 60 + min(60, dup_r_events)
+        if score <= 0:
+            continue
+        signer_stats.append({
+            "pub": pub,
+            "rows": rows,
+            "count": len(rows),
+            "score": score,
+            "audit_sources": sorted(set(audit_sources.get(pub, []))),
+            "audit_focus_indices": sorted(audit_focus_indices.get(pub, set())),
+            "dup_r_events": dup_r_events,
+            "dup_r_values": sum(1 for c in r_counts.values() if c > 1),
+            "recovered_pubkey": pub in recovered_pubs,
+            "recovered_r_hits": recovered_r_hits,
+        })
+
+    signer_stats.sort(key=lambda s: (int(s["score"]), int(s["count"])), reverse=True)
+    eligible_signers = len(signer_stats)
+    if max_signers > 0:
+        signer_stats = signer_stats[:max_signers]
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Remove stale segment files from this run directory only; reports remain.
+    for old in out_dir.glob("seg_*.jsonl"):
+        try:
+            old.unlink()
+        except Exception:
+            pass
+
+    pair_budget_rows = (
+        max(2, int((1 + math.isqrt(1 + 8 * max(1, int(max_pairs_per_segment)))) // 2))
+        if max_pairs_per_segment > 0 else max_rows_per_segment
+    )
+    effective_max_rows = max(2, min(max_rows_per_segment, pair_budget_rows)) if max_rows_per_segment > 0 else pair_budget_rows
+    segment_records: list[dict[str, Any]] = []
+    selected_signature_keys: set[tuple[str, str, int, str, str]] = set()
+    segment_index = 0
+    window = max(1, int(neighbor_window))
+
+    for stat in signer_stats:
+        if max_segments > 0 and len(segment_records) >= max_segments:
+            break
+        pub = stat["pub"]
+        ordered = sorted(stat["rows"], key=lambda item: _signature_order_key(item[2], item[0]))
+        source_len = len(ordered)
+
+        def add_segment(reason: str, rows: list[tuple[int, str, dict[str, Any]]], metadata: dict[str, Any]) -> None:
+            nonlocal segment_index
+            if max_segments > 0 and len(segment_records) >= max_segments:
+                return
+            segment_index += 1
+            record = _write_relation_segment(
+                rows=rows,
+                pub=pub,
+                reason=reason,
+                out_dir=out_dir,
+                segment_index=segment_index,
+                max_rows=effective_max_rows,
+                min_rows=min_sigs,
+                metadata=metadata,
+                seen_signatures=selected_signature_keys,
+            )
+            if record:
+                segment_records.append(record)
+
+        # Whole signer segment is the baseline for this pubkey, but still capped.
+        add_segment(
+            "pubkey_whole",
+            ordered,
+            {
+                "score": stat["score"],
+                "audit_sources": stat["audit_sources"],
+                "dup_r_events": stat["dup_r_events"],
+                "recovered_r_hits": stat["recovered_r_hits"],
+            },
+        )
+
+        for focus_idx in stat.get("audit_focus_indices", []) or []:
+            if max_segments > 0 and len(segment_records) >= max_segments:
+                break
+            try:
+                pos = min(max(0, int(focus_idx)), source_len - 1)
+            except Exception:
+                continue
+            rows = ordered[max(0, pos - window): min(source_len, pos + window + 1)]
+            add_segment(
+                "change_point_window",
+                rows,
+                {"focus_index": int(pos), "neighbor_window": window, "audit_sources": stat["audit_sources"]},
+            )
+
+        by_sighash: dict[str, list[tuple[int, str, dict[str, Any]]]] = defaultdict(list)
+        by_height_window: dict[int, list[tuple[int, str, dict[str, Any]]]] = defaultdict(list)
+        by_time_window: dict[int, list[tuple[int, str, dict[str, Any]]]] = defaultdict(list)
+        for item in ordered:
+            h, t, sighash = _row_height_time_sighash(item[2])
+            by_sighash[sighash].append(item)
+            if h is not None and height_window > 0:
+                by_height_window[h // height_window].append(item)
+            if t is not None and time_window_sec > 0:
+                by_time_window[t // time_window_sec].append(item)
+
+        for sighash, rows in sorted(by_sighash.items(), key=lambda kv: len(kv[1]), reverse=True):
+            if max_segments > 0 and len(segment_records) >= max_segments:
+                break
+            add_segment("sighash", rows, {"sighash": sighash})
+
+        for bucket, rows in sorted(by_height_window.items(), key=lambda kv: len(kv[1]), reverse=True):
+            if max_segments > 0 and len(segment_records) >= max_segments:
+                break
+            add_segment(
+                "height_window",
+                rows,
+                {"height_bucket": int(bucket), "height_window": int(height_window)},
+            )
+
+        for bucket, rows in sorted(by_time_window.items(), key=lambda kv: len(kv[1]), reverse=True):
+            if max_segments > 0 and len(segment_records) >= max_segments:
+                break
+            add_segment(
+                "time_window",
+                rows,
+                {"time_bucket": int(bucket), "time_window_sec": int(time_window_sec)},
+            )
+
+    manifest_path = out_dir / "manifest.json"
+    manifest = {
+        "source_sigs": str(sig_path),
+        "segment_dir": str(out_dir),
+        "segments": segment_records,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    payload = {
+        "source_sigs": str(sig_path),
+        "segment_dir": str(out_dir),
+        "manifest": str(manifest_path),
+        "total_rows": total_rows,
+        "bad_json_rows": bad_json_rows,
+        "signer_groups_total": len(groups),
+        "eligible_signers": eligible_signers,
+        "selected_signers": len(signer_stats),
+        "segments_written": len(segment_records),
+        "selected_unique_signature_rows_estimate": len(selected_signature_keys),
+        "estimated_pairs_total": sum(int(s.get("estimated_pairs", 0) or 0) for s in segment_records),
+        "policy": {
+            "min_sigs": int(min_sigs),
+            "max_signers": int(max_signers),
+            "max_rows_per_segment": int(max_rows_per_segment),
+            "max_pairs_per_segment": int(max_pairs_per_segment),
+            "effective_max_rows_per_segment": int(effective_max_rows),
+            "max_segments": int(max_segments),
+            "neighbor_window": int(neighbor_window),
+            "height_window": int(height_window),
+            "time_window_sec": int(time_window_sec),
+            "ranking": "audit_score+recovered_pubkey+recovered_r+duplicate_r",
+        },
+        "top_signers": [
+            {
+                "pubkey": s["pub"],
+                "pubkey_prefix": s["pub"][:20],
+                "source_rows": s["count"],
+                "score": s["score"],
+                "audit_sources": s["audit_sources"],
+                "audit_focus_index_count": len(s.get("audit_focus_indices", []) or []),
+                "dup_r_events": s["dup_r_events"],
+                "dup_r_values": s["dup_r_values"],
+                "recovered_pubkey": s["recovered_pubkey"],
+                "recovered_r_hits": s["recovered_r_hits"],
+            }
+            for s in signer_stats[:100]
+        ],
+        "segments": segment_records[:200],
+        "why_this_exists": (
+            "Statistical anomalies are used only to prioritize smaller same-signer "
+            "worksets. Recovery still requires validated duplicate-r, known-k, "
+            "nonce-relation, explicit-leak HNP, or nonce-hypothesis evidence."
+        ),
+        "secret_material": "LOCAL_ARTIFACT_ONLY",
+    }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
 def cluster_key(obj: dict[str, Any]) -> str:
     pub = (obj.get("pubkey_hex") or obj.get("pub") or "").strip().lower()
     if pub:
@@ -4173,6 +5299,27 @@ def main() -> None:
     ap.add_argument("--sigs", default="signatures.jsonl", help="Input signatures JSONL")
     ap.add_argument("--audit-report", default="ecdsa_audit_report.json", help="Audit report output")
     ap.add_argument("--decision-out", default="automate_decision.json", help="Automation decision summary JSON output")
+    ap.add_argument(
+        "--audit-scan-root",
+        default="",
+        help="Optional root directory to batch-scan for defensive audit report JSON files",
+    )
+    ap.add_argument(
+        "--audit-state-index",
+        default="",
+        help="Persistent audit state index JSON path (defaults next to --decision-out)",
+    )
+    ap.add_argument(
+        "--flagged-vulnerable-keys",
+        default="",
+        help="Persistent security log JSON path for critical bias alerts",
+    )
+    ap.add_argument(
+        "--audit-scan-workers",
+        type=int,
+        default=8,
+        help="Parallel workers for batch audit-report JSON parsing",
+    )
     ap.add_argument("--baseline-report", default="ecdsa_audit_report_prev.json",
                     help="Previous audit report JSON path used for automatic delta comparison")
     ap.add_argument("--audit-verify-signatures", action="store_true", default=True,
@@ -4328,6 +5475,28 @@ def main() -> None:
                     help="Hard quadratic pair budget per signer for relation scans")
     ap.add_argument("--relation-neighbor-window", type=int, default=2,
                     help="Adjacent sorted rows retained around selected signer rows")
+    ap.add_argument("--enable-segmented-relation", action="store_true", default=True,
+                    help="Emit smaller pubkey/time/height/sighash/change-point relation worksets for anomaly-driven scans")
+    ap.add_argument("--no-enable-segmented-relation", action="store_false", dest="enable_segmented_relation",
+                    help="Disable segmented relation workset generation")
+    ap.add_argument("--segmented-relation-dir", default="relation_segments",
+                    help="Directory for segmented relation JSONL worksets")
+    ap.add_argument("--segmented-relation-report", default="segmented_relation_report.json",
+                    help="Metadata-only report for segmented relation worksets")
+    ap.add_argument("--segmented-relation-min-sigs", type=int, default=4,
+                    help="Minimum rows required for each segmented relation workset")
+    ap.add_argument("--segmented-relation-max-signers", type=int, default=50,
+                    help="Maximum signers considered for segmented relation worksets; 0 means no cap")
+    ap.add_argument("--segmented-relation-max-segments", type=int, default=80,
+                    help="Maximum segment files written; 0 means no cap")
+    ap.add_argument("--segmented-relation-max-rows", type=int, default=128,
+                    help="Maximum rows per segment before temporal sampling")
+    ap.add_argument("--segmented-relation-max-pairs", type=int, default=8192,
+                    help="Quadratic pair budget per segment, used to cap rows")
+    ap.add_argument("--segmented-relation-height-window", type=int, default=5000,
+                    help="Block-height window size for segmented relation worksets")
+    ap.add_argument("--segmented-relation-time-window-sec", type=int, default=604800,
+                    help="Unix-time window size for segmented relation worksets")
     ap.add_argument("--enable-chain-extraction", action="store_true", default=True,
                     help="After recovered keys exist, rescan full input with cheap propagation to extract more local k/d chains")
     ap.add_argument("--no-enable-chain-extraction", action="store_false", dest="enable_chain_extraction",
@@ -4629,6 +5798,70 @@ def main() -> None:
             f"report={args.verification_failure_report}",
         )
 
+    defensive_audit_mode = is_defensive_audit_report(report)
+    audit_scan_root = Path(args.audit_scan_root) if args.audit_scan_root else Path(args.audit_report).resolve().parent
+    audit_state_index_path = (
+        Path(args.audit_state_index)
+        if args.audit_state_index
+        else Path(args.decision_out).with_name("audit_pipeline_index.json")
+    )
+    flagged_vulnerable_keys_path = (
+        Path(args.flagged_vulnerable_keys)
+        if args.flagged_vulnerable_keys
+        else Path(args.decision_out).with_name("flagged_vulnerable_keys.json")
+    )
+    audit_scan_result: dict[str, Any] | None = None
+    if defensive_audit_mode:
+        audit_scan_result = process_defensive_audit_profiles(
+            search_root=audit_scan_root,
+            index_path=audit_state_index_path,
+            security_log_path=flagged_vulnerable_keys_path,
+            max_workers=max(1, int(args.audit_scan_workers)),
+        )
+        report["audit_scan_result"] = audit_scan_result
+        report["audit_only_mode"] = True
+        if report.get("statistical_metrics") and "risk_score" not in report:
+            report["risk_score"] = int(report.get("risk", {}).get("score", 0) or 0)
+        if report.get("statistical_metrics") and "risk_verdict" not in report:
+            report["risk_verdict"] = str(report.get("risk", {}).get("verdict", "unknown"))
+        write_decision(args.decision_out, {
+            "should_recover": False,
+            "recover_executed": False,
+            "search_attempted": False,
+            "audit_only": True,
+            "audit_scan_root": str(audit_scan_root),
+            "audit_state_index": str(audit_state_index_path),
+            "flagged_vulnerable_keys": str(flagged_vulnerable_keys_path),
+            "audit_scan_result": audit_scan_result,
+            "audit_report_mode": report.get("audit_mode", "defensive_nonce_bias"),
+            "risk_score": float(report.get("risk_score", report.get("risk", {}).get("score", 0)) or 0.0),
+            "risk_verdict": str(report.get("risk_verdict", report.get("risk", {}).get("verdict", "unknown"))),
+            "statistical_metrics": report.get("statistical_metrics", {}),
+            "nonce_bias_profile": report.get("nonce_bias_profile", {}),
+            "verification_quality": vq,
+            "verification_failure_report": verification_failure_report,
+            "sqlite_index": sqlite_index_report,
+            "target_filter": target_filter_info,
+            "source_sigs": str(original_sigs),
+            "recover_input": None,
+            "recover_stages": [],
+            "recover_reason": "defensive_audit_only",
+            "audit_alert_count": int((audit_scan_result or {}).get("critical_alerts", 0) or 0),
+            "audit_alerts": load_flagged_vulnerable_keys(flagged_vulnerable_keys_path).get("entries", []),
+        })
+        print(
+            "Defensive audit mode detected:",
+            f"risk={float(report.get('risk_score', report.get('risk', {}).get('score', 0)) or 0.0):.1f}",
+            f"verdict={report.get('risk_verdict', report.get('risk', {}).get('verdict', 'unknown'))}",
+            f"alerts={(audit_scan_result or {}).get('critical_alerts', 0)}",
+            f"state_index={audit_state_index_path}",
+        )
+        try:
+            Path(args.baseline_report).write_text(Path(args.audit_report).read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            pass
+        return
+
     should_recover = (
         args.force_recover
         or args.exhaustive_recover
@@ -4651,6 +5884,24 @@ def main() -> None:
         or signer_mixture_flagged > 0
         or sighash_anomaly
     )
+    statistical_only_soft_signal = (
+        (drift_flags > 0 or signer_drift_flagged > 0 or signer_change_flagged > 0 or signer_mixture_flagged > 0)
+        and dup_r == 0
+        and cross_pub_dup_r == 0
+        and not sighash_anomaly
+        and not external_candidate_requested
+        and not args.force_recover
+        and not args.exhaustive_recover
+        and risk < args.risk_threshold
+        and fusion_conf < args.fusion_min_confidence
+    )
+    if statistical_only_soft_signal:
+        # Drift/signer segmentation anomalies are useful evidence for monitoring
+        # and workset expansion, but they are not algebraic recovery facts.
+        # Avoid launching broad C++ recovery on large clean datasets unless
+        # stronger evidence or an explicit force/exhaustive request is present.
+        should_recover = False
+        hard_signal = False
     if low_quality_data and not (hard_signal or args.force_recover or args.exhaustive_recover or external_candidate_requested):
         should_recover = False
 
@@ -4658,14 +5909,57 @@ def main() -> None:
 
     if not should_recover:
         print("Recovery skipped by policy (low anomaly signal).")
+        segmented_relation_report: dict[str, Any] | None = None
+        if args.enable_segmented_relation and (
+            statistical_only_soft_signal
+            or drift_flags > 0
+            or signer_drift_flagged > 0
+            or signer_change_flagged > 0
+            or signer_mixture_flagged > 0
+            or sighash_anomaly
+        ):
+            segmented_relation_report = build_segmented_relation_worksets(
+                sig_path=sigs,
+                recovered_json_path=Path(args.recover_json_out),
+                recovered_k_path=Path(args.recover_k_out),
+                audit_report=report,
+                out_dir=Path(args.segmented_relation_dir),
+                report_path=Path(args.segmented_relation_report),
+                min_sigs=args.segmented_relation_min_sigs,
+                max_signers=args.segmented_relation_max_signers,
+                max_rows_per_segment=args.segmented_relation_max_rows,
+                max_pairs_per_segment=args.segmented_relation_max_pairs,
+                max_segments=args.segmented_relation_max_segments,
+                neighbor_window=args.relation_neighbor_window,
+                height_window=args.segmented_relation_height_window,
+                time_window_sec=args.segmented_relation_time_window_sec,
+            )
+            print(
+                "Segmented relation worksets:",
+                f"segments={segmented_relation_report.get('segments_written', 0)}",
+                f"selected_rows={segmented_relation_report.get('selected_unique_signature_rows_estimate', 0)}",
+                f"report={args.segmented_relation_report}",
+            )
+        hnp_skip_artifacts = write_hnp_not_run_artifacts(
+            reason="low_anomaly_signal",
+            sig_path=sigs,
+            hnp_leaks_out=args.hnp_leaks_out,
+            hnp_leak_report=args.hnp_leak_report,
+            hnp_bounded_k_out=args.hnp_bounded_k_out,
+            hnp_bounded_k_report=args.hnp_bounded_k_report,
+            hnp_candidates_out=args.hnp_candidates_out,
+            hnp_report_out=args.hnp_report_out,
+            known_nonce_rows=known_nonce_rows_all,
+            hnp_min_leaks=args.hnp_min_leaks,
+        )
         recovery_evidence_report = build_recovery_evidence_report(
             out_path=Path(args.recovery_evidence_report),
             audit_report=report,
             stage0_subset_info=None,
             duplicate_r_pair_summary={},
             nonce_hypothesis_report={},
-            hnp_leak_report={"valid_leak_rows": known_nonce_rows_all},
-            hnp_bounded_k_report={},
+            hnp_leak_report=hnp_skip_artifacts["hnp_leak_report"],
+            hnp_bounded_k_report=hnp_skip_artifacts["hnp_bounded_k_report"],
             relation_subset_report={},
             unresolved_targets_report={},
             broad_relation_skip_report={"skip": True, "reasons": ["low_anomaly_signal"]},
@@ -4680,6 +5974,8 @@ def main() -> None:
             recover_deltas_path=Path(args.recover_deltas_out),
             recovered_k_path=Path(args.recover_k_out),
         )
+        if segmented_relation_report is not None:
+            recovery_evidence_report["segmented_relation_report"] = segmented_relation_report
         write_decision(args.decision_out, {
             "should_recover": False,
             "recover_executed": False,
@@ -4702,6 +5998,8 @@ def main() -> None:
             "recover_input": None,
             "cluster_gating_used": not args.disable_cluster_gating,
             "recovery_evidence_report": recovery_evidence_report,
+            "segmented_relation_report": segmented_relation_report,
+            "hnp_skip_artifacts": hnp_skip_artifacts,
         })
         try:
             Path(args.baseline_report).write_text(Path(args.audit_report).read_text(encoding="utf-8"), encoding="utf-8")
@@ -4715,14 +6013,26 @@ def main() -> None:
         hard_signal or args.force_recover or args.exhaustive_recover or external_candidate_requested
     ):
         print("Fusion recommendation is monitor_only; recovery skipped.")
+        hnp_skip_artifacts = write_hnp_not_run_artifacts(
+            reason="fusion_monitor_only",
+            sig_path=sigs,
+            hnp_leaks_out=args.hnp_leaks_out,
+            hnp_leak_report=args.hnp_leak_report,
+            hnp_bounded_k_out=args.hnp_bounded_k_out,
+            hnp_bounded_k_report=args.hnp_bounded_k_report,
+            hnp_candidates_out=args.hnp_candidates_out,
+            hnp_report_out=args.hnp_report_out,
+            known_nonce_rows=known_nonce_rows_all,
+            hnp_min_leaks=args.hnp_min_leaks,
+        )
         recovery_evidence_report = build_recovery_evidence_report(
             out_path=Path(args.recovery_evidence_report),
             audit_report=report,
             stage0_subset_info=None,
             duplicate_r_pair_summary={},
             nonce_hypothesis_report={},
-            hnp_leak_report={"valid_leak_rows": known_nonce_rows_all},
-            hnp_bounded_k_report={},
+            hnp_leak_report=hnp_skip_artifacts["hnp_leak_report"],
+            hnp_bounded_k_report=hnp_skip_artifacts["hnp_bounded_k_report"],
             relation_subset_report={},
             unresolved_targets_report={},
             broad_relation_skip_report={"skip": True, "reasons": ["fusion_monitor_only"]},
@@ -4759,6 +6069,7 @@ def main() -> None:
             "recover_input": None,
             "cluster_gating_used": not args.disable_cluster_gating,
             "recovery_evidence_report": recovery_evidence_report,
+            "hnp_skip_artifacts": hnp_skip_artifacts,
         })
         return
     if fusion_reco == "run_clustered_recovery" and not args.exhaustive_recover:
@@ -5699,6 +7010,7 @@ def main() -> None:
         run_chain_propagation("stage1-primary")
 
     relation_subset_report: dict[str, Any] | None = None
+    segmented_relation_report: dict[str, Any] | None = None
     broad_relation_skip_report: dict[str, Any] = {"skip": False, "reasons": []}
     relation_input = recover_input
     relation_source_path = sigs
@@ -5744,7 +7056,7 @@ def main() -> None:
             f"reason={','.join(broad_relation_skip_report.get('reasons', []))}",
             f"selected_unresolved_rows={broad_relation_skip_report.get('selected_unresolved_rows', 0)}",
         )
-        if allow_advanced and strong_signal and args.enable_suspicious_signer_relation:
+        if strong_signal and args.enable_suspicious_signer_relation:
             relation_subset_report = build_signer_relation_neighborhood_subset(
                 sig_path=sigs,
                 recovered_json_path=Path(args.recover_json_out),
@@ -5759,6 +7071,51 @@ def main() -> None:
                 max_pairs_per_signer=args.relation_max_pairs_per_signer,
                 neighbor_window=args.relation_neighbor_window,
             )
+            broad_relation_skip_report["relation_diagnostic_report"] = str(args.relation_neighborhood_report)
+            broad_relation_skip_report["relation_diagnostic_rows"] = int(
+                relation_subset_report.get("selected_rows", 0) or 0
+            )
+            broad_relation_skip_report["relation_diagnostic_signers"] = int(
+                relation_subset_report.get("selected_signers", 0) or 0
+            )
+            if not allow_advanced:
+                broad_relation_skip_report.setdefault("reasons", []).append(
+                    "relation_recovery_disabled_by_fusion_recommendation"
+                )
+            print(
+                "Relation diagnostic workset:",
+                f"selected_rows={relation_subset_report.get('selected_rows', 0)}",
+                f"selected_signers={relation_subset_report.get('selected_signers', 0)}",
+                f"recovery_stage_allowed={bool(allow_advanced)}",
+            )
+            if args.enable_segmented_relation:
+                segmented_relation_report = build_segmented_relation_worksets(
+                    sig_path=sigs,
+                    recovered_json_path=Path(args.recover_json_out),
+                    recovered_k_path=Path(args.recover_k_out),
+                    audit_report=report,
+                    out_dir=Path(args.segmented_relation_dir),
+                    report_path=Path(args.segmented_relation_report),
+                    min_sigs=args.segmented_relation_min_sigs,
+                    max_signers=args.segmented_relation_max_signers,
+                    max_rows_per_segment=args.segmented_relation_max_rows,
+                    max_pairs_per_segment=args.segmented_relation_max_pairs,
+                    max_segments=args.segmented_relation_max_segments,
+                    neighbor_window=args.relation_neighbor_window,
+                    height_window=args.segmented_relation_height_window,
+                    time_window_sec=args.segmented_relation_time_window_sec,
+                )
+                broad_relation_skip_report["segmented_relation_report"] = str(args.segmented_relation_report)
+                broad_relation_skip_report["segmented_relation_segments"] = int(
+                    segmented_relation_report.get("segments_written", 0) or 0
+                )
+                print(
+                    "Segmented relation worksets:",
+                    f"segments={segmented_relation_report.get('segments_written', 0)}",
+                    f"estimated_pairs={segmented_relation_report.get('estimated_pairs_total', 0)}",
+                    f"report={args.segmented_relation_report}",
+                )
+        if allow_advanced and strong_signal and args.enable_suspicious_signer_relation:
             if (
                 int(relation_subset_report.get("selected_rows", 0) or 0) >= 2
                 and int(relation_subset_report.get("audit_flagged_selected", 0) or 0) > 0
@@ -5818,6 +7175,29 @@ def main() -> None:
             )
         else:
             print("Relation neighborhood focus is empty; using primary recovery input for relation scans.")
+        if args.enable_segmented_relation:
+            segmented_relation_report = build_segmented_relation_worksets(
+                sig_path=relation_source_path,
+                recovered_json_path=Path(args.recover_json_out),
+                recovered_k_path=Path(args.recover_k_out),
+                audit_report=report,
+                out_dir=Path(args.segmented_relation_dir),
+                report_path=Path(args.segmented_relation_report),
+                min_sigs=args.segmented_relation_min_sigs,
+                max_signers=args.segmented_relation_max_signers,
+                max_rows_per_segment=args.segmented_relation_max_rows,
+                max_pairs_per_segment=args.segmented_relation_max_pairs,
+                max_segments=args.segmented_relation_max_segments,
+                neighbor_window=args.relation_neighbor_window,
+                height_window=args.segmented_relation_height_window,
+                time_window_sec=args.segmented_relation_time_window_sec,
+            )
+            print(
+                "Segmented relation worksets:",
+                f"segments={segmented_relation_report.get('segments_written', 0)}",
+                f"estimated_pairs={segmented_relation_report.get('estimated_pairs_total', 0)}",
+                f"report={args.segmented_relation_report}",
+            )
 
     if allow_advanced and strong_signal and not broad_relation_skip_report.get("skip"):
         if low_quality_data and not args.exhaustive_recover:
@@ -6172,6 +7552,7 @@ def main() -> None:
         "stage1_skip_report": stage1_skip_report,
         "broad_relation_skip_report": broad_relation_skip_report,
         "relation_neighborhood_report": relation_subset_report,
+        "segmented_relation_report": segmented_relation_report,
         "known_k_chain_report": known_k_chain_report,
         "known_priv_chain_report": known_priv_chain_report,
         "preload_chain_report": preload_chain_report,

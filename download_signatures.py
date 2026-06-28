@@ -583,6 +583,12 @@ class BlockWalker:
             if isinstance(prevout, dict):
                 txin["prevout_spk"]   = prevout.get("scriptpubkey") or prevout.get("scriptPubKey") or ""
                 txin["prevout_value"] = prevout.get("value")
+                txin["prevout_address"] = (
+                    prevout.get("scriptpubkey_address")
+                    or prevout.get("scriptPubKey_address")
+                    or prevout.get("address")
+                    or ""
+                )
             tx["vin"].append(txin)
 
         vout = raw.get("vout") or raw.get("out") or raw.get("outputs") or []

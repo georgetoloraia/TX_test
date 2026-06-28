@@ -512,6 +512,49 @@ def audit_sequential_patterns(values: list[int], name: str) -> dict[str, Any]:
     }
 
 
+def audit_nonce_bias_profile(sigs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Profile nonce-derived residues without attempting key recovery."""
+    if not sigs:
+        return {"count": 0, "error": "no_signatures"}
+
+    u_values: list[int] = []
+    t_values: list[int] = []
+    for row in sigs:
+        try:
+            r = int(row["r"])
+            s = int(row["s"])
+            z = int(row["z"])
+            s_inv = pow(s, -1, SECP256K1_N)
+        except Exception:
+            continue
+        u_values.append((-r * s_inv) % SECP256K1_N)
+        t_values.append((z * s_inv) % SECP256K1_N)
+
+    if not u_values:
+        return {"count": 0, "error": "no_valid_residues"}
+
+    low32_u = [u & 0xFFFFFFFF for u in u_values]
+    low32_t = [t & 0xFFFFFFFF for t in t_values]
+    high32_u = [u >> 224 for u in u_values]
+    high32_t = [t >> 224 for t in t_values]
+
+    return {
+        "count": len(u_values),
+        "u_bit_bias": audit_bit_bias(u_values, "u"),
+        "t_bit_bias": audit_bit_bias(t_values, "t"),
+        "u_mod_bias": audit_mod_bias(u_values, "u"),
+        "t_mod_bias": audit_mod_bias(t_values, "t"),
+        "u_hamming": audit_hamming(u_values, "u"),
+        "t_hamming": audit_hamming(t_values, "t"),
+        "u_sequential_patterns": audit_sequential_patterns(u_values, "u"),
+        "t_sequential_patterns": audit_sequential_patterns(t_values, "t"),
+        "correlations": {
+            "corr_low32_u_t": correlation_score(low32_u, low32_t),
+            "corr_high32_u_t": correlation_score(high32_u, high32_t),
+        },
+    }
+
+
 def audit_correlations(rs: list[int], ss: list[int], zs: list[int]) -> dict[str, float]:
     low32_r = [r & 0xFFFFFFFF for r in rs]
     low32_s = [s & 0xFFFFFFFF for s in ss]
@@ -1260,6 +1303,10 @@ def sigmoid(x: float) -> float:
     return z / (1.0 + z)
 
 
+MIN_CORRELATION_SIGNAL_SAMPLES = 25
+MIN_BIAS_ATTACK_READINESS_SAMPLES = 50
+
+
 def build_signal_fusion(report: dict[str, Any]) -> dict[str, Any]:
     """Unified calibrated ranking across anomaly detectors."""
     dup_r = int(report.get("duplicates_r", {}).get("duplicate_count", 0) or 0)
@@ -1271,7 +1318,12 @@ def build_signal_fusion(report: dict[str, Any]) -> dict[str, Any]:
     signer_cp = int(report.get("signer_change_points", {}).get("signer_count_flagged", 0) or 0)
     signer_mix = int(report.get("signer_mixture_modes", {}).get("signer_count_flagged", 0) or 0)
     signer_fit = int(report.get("constraint_model_fits", {}).get("signer_count_flagged", 0) or 0)
+    signature_count = int(report.get("signature_count", 0) or 0)
     corr_abs_max = max(abs(v) for v in (report.get("correlations", {}) or {}).values()) if report.get("correlations") else 0.0
+    if signature_count < MIN_CORRELATION_SIGNAL_SAMPLES:
+        # Correlations on tiny address/pubkey samples are unstable and should not
+        # drive recovery priority. Keep them in the report, but do not score them.
+        corr_abs_max = 0.0
     hnp_grade = (report.get("hnp_lattice_readiness", {}) or {}).get("summary_grade", "not_ready")
     hnp_map = {"not_ready": 0.0, "watch": 0.5, "ready": 1.0}
     hnp = float(hnp_map.get(hnp_grade, 0.0))
@@ -1318,20 +1370,20 @@ def build_signal_fusion(report: dict[str, Any]) -> dict[str, Any]:
     logit *= quality_scale
     confidence = sigmoid(logit)
 
-    if confidence >= 0.85:
+    if confidence >= 0.75:
         tier = "critical"
-    elif confidence >= 0.65:
+    elif confidence >= 0.55:
         tier = "high"
-    elif confidence >= 0.45:
+    elif confidence >= 0.35:
         tier = "medium"
     else:
         tier = "low"
 
-    recommendation = "monitor_only"
-    if tier in {"critical", "high"}:
-        recommendation = "run_full_recovery"
-    elif tier == "medium":
-        recommendation = "run_clustered_recovery"
+    recommendation = "run_full_recovery"
+    # if tier in {"critical", "high"}:
+    #     recommendation = "run_full_recovery"
+    # elif tier == "medium":
+    #     recommendation = "run_clustered_recovery"
 
     return {
         "confidence": confidence,
@@ -1345,6 +1397,7 @@ def build_signal_fusion(report: dict[str, Any]) -> dict[str, Any]:
 def risk_score(report: dict[str, Any]) -> dict[str, Any]:
     score = 0
     reasons = []
+    signature_count = int(report.get("signature_count", 0) or 0)
     vg = report.get("verification_gate", {}) or {}
     verifiable = int(vg.get("verifiable", 0) or 0)
     valid = int(vg.get("valid", 0) or 0)
@@ -1375,10 +1428,19 @@ def risk_score(report: dict[str, Any]) -> dict[str, Any]:
         score += 20
         reasons.append("too many tiny r values")
 
+    correlation_reasons_suppressed = 0
     for k, v in report["correlations"].items():
         if abs(v) > 0.10:
-            score += 10
-            reasons.append(f"possible correlation: {k}={v:.4f}")
+            if signature_count >= MIN_CORRELATION_SIGNAL_SAMPLES:
+                score += 10
+                reasons.append(f"possible correlation: {k}={v:.4f}")
+            else:
+                correlation_reasons_suppressed += 1
+    if correlation_reasons_suppressed:
+        reasons.append(
+            "correlation signals ignored for risk scoring "
+            f"(sample_count={signature_count}, min_required={MIN_CORRELATION_SIGNAL_SAMPLES})"
+        )
 
     if report.get("cross_pub_duplicate_r", {}).get("collision_count", 0) > 0:
         score += 150
@@ -1469,6 +1531,7 @@ def build_core_report(sigs: list[dict[str, Any]]) -> dict[str, Any]:
         "bit_bias_r": audit_bit_bias(rs, "r"),
         "bit_bias_s": audit_bit_bias(ss, "s", ignore_bits=ignore_s_bits),
         "bit_bias_z": audit_bit_bias(zs, "z"),
+        "nonce_bias_profile": audit_nonce_bias_profile(sigs),
         "byte_uniformity_r": audit_byte_uniformity(rs, "r"),
         "byte_uniformity_s": audit_byte_uniformity(ss, "s"),
         "mod_bias_r": audit_mod_bias(rs, "r"),
@@ -1598,6 +1661,14 @@ def print_report(report: dict[str, Any]) -> None:
     cmf = report.get("constraint_model_fits", {})
     if cmf:
         print(f"Constraint-model fit flagged: {cmf.get('signer_count_flagged', 0)}")
+    nbp = report.get("nonce_bias_profile", {})
+    if nbp:
+        print(
+            "Nonce bias profile:",
+            f"count={nbp.get('count', 0)}",
+            f"u_fdr_bits={nbp.get('u_bit_bias', {}).get('fdr_significant_bit_count', 0)}",
+            f"t_fdr_bits={nbp.get('t_bit_bias', {}).get('fdr_significant_bit_count', 0)}",
+        )
     hnp = report.get("hnp_lattice_readiness", {})
     if hnp:
         print(f"HNP/Lattice readiness: {hnp.get('summary_grade', 'unknown')}")

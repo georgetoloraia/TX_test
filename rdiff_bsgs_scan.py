@@ -82,6 +82,13 @@ def point_key(p: PublicKey) -> bytes:
     return p.format(compressed=True)
 
 
+def point_x_mod_n(p: PublicKey) -> int:
+    raw = p.format(compressed=False)
+    if len(raw) != 65 or raw[0] != 4:
+        raise ValueError("unexpected uncompressed point format")
+    return int.from_bytes(raw[1:33], "big") % N
+
+
 def point_neg(p: PublicKey) -> PublicKey:
     b = bytearray(p.format(compressed=True))
     if b[0] == 2:
@@ -363,6 +370,37 @@ def append_k(out_k: Path, r: int, ks: list[int]) -> None:
         }, separators=(",", ":")) + "\n")
 
 
+def load_existing_key_index(path: Path) -> set[tuple[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    if not path.exists():
+        return seen
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            d = normalize_hex(obj.get("priv_hex") or obj.get("priv") or obj.get("d"))
+            if len(d) != 64:
+                continue
+            pub_candidates = [
+                obj.get("pubkey"),
+                obj.get("pubkey_hex"),
+                obj.get("pubkey_compressed"),
+                obj.get("pubkey_uncompressed"),
+            ]
+            for pub in pub_candidates:
+                pub_norm = normalize_pubkey(pub)
+                if pub_norm:
+                    seen.add((pub_norm, d))
+    return seen
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Bounded BSGS R-difference recovery scan")
     ap.add_argument("--sigs", required=True, help="Input signatures JSONL")
@@ -376,6 +414,12 @@ def main() -> None:
     ap.add_argument("--max-total-pairs", type=int, default=0, help="Global pair cap across all pubkeys (0 = unlimited)")
     ap.add_argument("--min-sigs-per-pubkey", type=int, default=2)
     ap.add_argument("--max-pubkeys", type=int, default=0)
+    ap.add_argument("--pubkey-offset", type=int, default=0,
+                    help="Skip this many eligible pubkeys after sorting; useful for batch coverage")
+    ap.add_argument("--target-pubkey", default="",
+                    help="Only scan this compressed/uncompressed pubkey hex")
+    ap.add_argument("--require-r-x-match", action=argparse.BooleanOptionalAction, default=True,
+                    help="Require reconstructed nonce point R to satisfy x(R) mod n == r")
     ap.add_argument("--mode", choices=("diff", "sum", "both"), default="both",
                     help="Scan R2-R1, R1+R2, or both relations")
     ap.add_argument("--s-variants", choices=("original", "negated", "both"), default="both",
@@ -385,24 +429,47 @@ def main() -> None:
     args = ap.parse_args()
 
     rows, parse_counts = load_rows(Path(args.sigs), max(0, args.max_rows))
+    target_pub = normalize_pubkey(args.target_pubkey)
     by_pub: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for _, obj in rows:
+        if target_pub and obj["_pub_norm"] != target_pub:
+            parse_counts["target_pubkey_filtered_rows"] += 1
+            continue
         by_pub[obj["_pub_norm"]].append(obj)
 
     pub_items = [(pub, rs) for pub, rs in by_pub.items() if len(rs) >= max(2, args.min_sigs_per_pubkey)]
     pub_items.sort(key=lambda x: len(x[1]), reverse=True)
+    if args.pubkey_offset > 0:
+        pub_items = pub_items[args.pubkey_offset:]
     if args.max_pubkeys > 0:
         pub_items = pub_items[: args.max_pubkeys]
 
     table, m, m_g = build_bsgs_table(max(1, args.bound))
-    seen_keys: set[tuple[str, str]] = set()
+    seen_keys: set[tuple[str, str]] = load_existing_key_index(Path(args.out_json))
     stats: Counter[str] = Counter(parse_counts)
     stats["pubkeys_considered"] = len(pub_items)
     stats["bsgs_bound"] = int(args.bound)
     stats["bsgs_table_size"] = len(table)
     stats["s_variants_mode"] = args.s_variants
+    stats["existing_key_rows_loaded"] = len(seen_keys)
+    stats["pubkey_offset"] = max(0, int(args.pubkey_offset))
+    stats["require_r_x_match"] = bool(args.require_r_x_match)
+    if target_pub:
+        stats["target_pubkey_enabled"] = 1
+    pubkey_reports: list[dict[str, Any]] = []
 
     for pub, group in pub_items:
+        pub_report: dict[str, Any] = {
+            "pubkey_prefix": pub[:20],
+            "input_rows": len(group),
+            "variant_rows": 0,
+            "pairs_tested": 0,
+            "pair_cap_hit": False,
+            "global_pair_cap_hit": False,
+            "diff_delta_found": 0,
+            "sum_delta_found": 0,
+            "keys_validated": 0,
+        }
         rpoints: list[tuple[dict[str, Any], PublicKey]] = []
         for row in group:
             for variant in row_s_variants(row, args.s_variants):
@@ -411,9 +478,23 @@ def main() -> None:
                 if rp is None:
                     stats["r_point_derive_failed"] += 1
                     continue
+                try:
+                    r_expected = parse_int(variant["r"]) % N
+                    r_actual = point_x_mod_n(rp)
+                except Exception:
+                    stats["r_x_check_failed"] += 1
+                    pub_report["r_x_check_failed"] = pub_report.get("r_x_check_failed", 0) + 1
+                    continue
+                if r_actual != r_expected:
+                    stats["r_x_mismatch"] += 1
+                    pub_report["r_x_mismatch"] = pub_report.get("r_x_mismatch", 0) + 1
+                    if args.require_r_x_match:
+                        continue
                 rpoints.append((variant, rp))
                 stats["r_point_variants_usable"] += 1
+        pub_report["variant_rows"] = len(rpoints)
         if len(rpoints) < 2:
+            pubkey_reports.append(pub_report)
             continue
 
         pair_count = 0
@@ -421,9 +502,11 @@ def main() -> None:
             for j in range(i + 1, len(rpoints)):
                 if args.max_total_pairs > 0 and stats["pairs_tested"] >= args.max_total_pairs:
                     stats["global_pair_cap_hit"] += 1
+                    pub_report["global_pair_cap_hit"] = True
                     break
                 if pair_count >= max(0, args.max_pairs_per_pubkey):
                     stats["pair_cap_hit"] += 1
+                    pub_report["pair_cap_hit"] = True
                     break
                 row1, rp1 = rpoints[i]
                 row2, rp2 = rpoints[j]
@@ -432,6 +515,7 @@ def main() -> None:
                     continue
                 pair_count += 1
                 stats["pairs_tested"] += 1
+                pub_report["pairs_tested"] += 1
                 if args.progress_every > 0 and stats["pairs_tested"] % args.progress_every == 0:
                     print(
                         "rdiff-bsgs progress:",
@@ -450,9 +534,12 @@ def main() -> None:
                     delta = bsgs_solve_signed(diff, args.bound, table, m, m_g)
                     if delta is not None:
                         stats["diff_delta_found"] += 1
+                        pub_report["diff_delta_found"] += 1
                         d = derive_delta_key(row1, row2, delta)
                         if d is not None and candidate_matches_row(d, row1) and candidate_matches_row(d, row2):
-                            stats["keys_validated"] += int(append_key(Path(args.out_json), Path(args.out_txt), seen_keys, row1, d, "rdiff-bsgs-diff", delta))
+                            added = int(append_key(Path(args.out_json), Path(args.out_txt), seen_keys, row1, d, "rdiff-bsgs-diff", delta))
+                            stats["keys_validated"] += added
+                            pub_report["keys_validated"] += added
                             k1 = recover_k_for_row(d, row1)
                             k2 = recover_k_for_row(d, row2)
                             if k1 and k2:
@@ -469,9 +556,12 @@ def main() -> None:
                     delta = bsgs_solve_signed(sm, args.bound, table, m, m_g)
                     if delta is not None:
                         stats["sum_delta_found"] += 1
+                        pub_report["sum_delta_found"] += 1
                         d = derive_sum_key(row1, row2, delta)
                         if d is not None and candidate_matches_row(d, row1) and candidate_matches_row(d, row2):
-                            stats["keys_validated"] += int(append_key(Path(args.out_json), Path(args.out_txt), seen_keys, row1, d, "rdiff-bsgs-sum", delta))
+                            added = int(append_key(Path(args.out_json), Path(args.out_txt), seen_keys, row1, d, "rdiff-bsgs-sum", delta))
+                            stats["keys_validated"] += added
+                            pub_report["keys_validated"] += added
                             k1 = recover_k_for_row(d, row1)
                             k2 = recover_k_for_row(d, row2)
                             if k1 and k2:
@@ -483,6 +573,7 @@ def main() -> None:
                 break
             if pair_count >= max(0, args.max_pairs_per_pubkey):
                 break
+        pubkey_reports.append(pub_report)
         if args.max_total_pairs > 0 and stats["pairs_tested"] >= args.max_total_pairs:
             break
 
@@ -493,6 +584,7 @@ def main() -> None:
         "bound": int(args.bound),
         "max_pairs_per_pubkey": int(args.max_pairs_per_pubkey),
         "stats": dict(stats),
+        "pubkey_reports": pubkey_reports,
         "priv_material": "LOCAL_ARTIFACT_ONLY",
     }
     Path(args.report).parent.mkdir(parents=True, exist_ok=True)

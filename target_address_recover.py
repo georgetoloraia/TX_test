@@ -27,7 +27,7 @@ from typing import Any
 
 import requests
 
-from download_signatures import BlockWalker
+from download_signatures import BlockWalker, scriptsig_pushes
 
 
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -40,6 +40,12 @@ def sha256(data: bytes) -> bytes:
 
 def hash256(data: bytes) -> bytes:
     return sha256(sha256(data))
+
+
+def hash160(data: bytes) -> bytes:
+    h = hashlib.new("ripemd160")
+    h.update(sha256(data))
+    return h.digest()
 
 
 def base58check_decode(addr: str) -> bytes:
@@ -275,16 +281,33 @@ def tx_block_context(raw: dict[str, Any]) -> tuple[int | None, int | None]:
     return height, block_time
 
 
-def input_spends_address(tx: dict[str, Any], vin_index: int, address: str, scriptpubkey: str) -> bool:
+def input_spends_address_reason(tx: dict[str, Any], vin_index: int, address: str, scriptpubkey: str) -> tuple[bool, str]:
     try:
         inp = tx.get("vin", [])[vin_index]
     except Exception:
-        return False
+        return False, "missing_input"
     prev_addr = str(inp.get("prevout_address") or inp.get("address") or "").strip()
     prev_spk = str(inp.get("prevout_spk") or inp.get("prev_spk") or "").strip().lower()
     if prev_addr and prev_addr.lower() == address.lower():
-        return True
-    return bool(scriptpubkey and prev_spk == scriptpubkey.lower())
+        return True, "prevout_address"
+    if scriptpubkey and prev_spk == scriptpubkey.lower():
+        return True, "prevout_scriptpubkey"
+    # P2SH address pages can omit prevout context. The spending scriptSig still
+    # reveals the redeemScript or nested witness program; hash160(redeemScript)
+    # must equal the P2SH script hash.
+    if scriptpubkey.startswith("a914") and scriptpubkey.endswith("87") and len(scriptpubkey) == 46:
+        try:
+            target_h160 = bytes.fromhex(scriptpubkey[4:-2])
+            pushes = scriptsig_pushes(str(inp.get("scriptsig") or ""))
+            if pushes and hash160(pushes[-1]) == target_h160:
+                return True, "p2sh_redeemscript_hash"
+        except Exception:
+            pass
+    return False, "no_match"
+
+
+def input_spends_address(tx: dict[str, Any], vin_index: int, address: str, scriptpubkey: str) -> bool:
+    return input_spends_address_reason(tx, vin_index, address, scriptpubkey)[0]
 
 
 def signature_row_from_entry(
@@ -336,6 +359,70 @@ def validate_signature_row(row: dict[str, Any]) -> tuple[bool, str, str]:
         return False, f"validation_exception:{type(e).__name__}", "not_checked"
 
 
+def candidate_rows_from_entry(
+    processor: BlockWalker,
+    tx: dict[str, Any],
+    vin_index: int,
+    entry: dict[str, Any],
+    *,
+    address: str,
+    block_height: int | None,
+    block_time: int | None,
+) -> tuple[list[tuple[dict[str, Any], str, str]], list[tuple[dict[str, Any], str, str]]]:
+    """Return verified rows, plus invalid candidate rows for diagnostics.
+
+    P2SH/P2WSH multisig extraction may produce one signature with multiple
+    pub_candidates. We map it by trying each candidate pubkey against the
+    computed z and keeping only candidates that verify.
+    """
+
+    base_row = signature_row_from_entry(
+        processor,
+        tx,
+        vin_index,
+        entry,
+        address=address,
+        block_height=block_height,
+        block_time=block_time,
+    )
+    candidates = []
+    explicit_pub = str(base_row.get("pubkey_hex") or "").strip().lower()
+    if explicit_pub:
+        candidates.append(explicit_pub)
+    for pub in entry.get("pub_candidates") or []:
+        pub_hex = str(pub or "").strip().lower()
+        if pub_hex and pub_hex not in candidates:
+            candidates.append(pub_hex)
+
+    if not candidates:
+        valid, verify_reason, z_reason = validate_signature_row(base_row)
+        return ([(base_row, verify_reason, z_reason)] if valid else []), (
+            [] if valid else [(base_row, verify_reason, z_reason)]
+        )
+
+    valid_rows: list[tuple[dict[str, Any], str, str]] = []
+    invalid_rows: list[tuple[dict[str, Any], str, str]] = []
+    for pub_hex in candidates:
+        row = dict(base_row)
+        row["pubkey_hex"] = pub_hex
+        row["pubkey_match_source"] = "explicit_pubkey" if pub_hex == explicit_pub else "script_pub_candidate"
+        valid, verify_reason, z_reason = validate_signature_row(row)
+        if valid:
+            valid_rows.append((row, verify_reason, z_reason))
+        else:
+            invalid_rows.append((row, verify_reason, z_reason))
+    if valid_rows:
+        return valid_rows, []
+    return [], invalid_rows[: min(5, len(invalid_rows))]
+
+
+def strip_persisted_sighash_context(row: dict[str, Any]) -> None:
+    """Keep computed z/diagnostics but avoid duplicating full tx context per row."""
+
+    row.pop("sighash_context", None)
+    row["sighash_context_source"] = "address_target_extraction_not_persisted"
+
+
 def collect_address_signatures(
     *,
     address: str,
@@ -352,6 +439,7 @@ def collect_address_signatures(
     start_after_txid: str,
     fetch_progress_every: int,
     keep_invalid_signatures: bool,
+    persist_sighash_context: bool,
     dry_run: bool,
 ) -> dict[str, Any]:
     address_type, scriptpubkey = address_to_scriptpubkey(address)
@@ -375,16 +463,20 @@ def collect_address_signatures(
     invalid_rows: list[dict[str, Any]] = []
     invalid_reason_counts: Counter[str] = Counter()
     invalid_samples: list[dict[str, Any]] = []
+    match_reason_counts: Counter[str] = Counter()
     for raw in txs:
         tx = processor.normalize_tx(raw)
         height, block_time = tx_block_context(raw)
         for vin_index in range(len(tx.get("vin", []))):
-            if not input_spends_address(tx, vin_index, address, scriptpubkey):
+            spends_target, match_reason = input_spends_address_reason(tx, vin_index, address, scriptpubkey)
+            if not spends_target:
+                counts["inputs_not_spending_target"] += 1
                 continue
+            match_reason_counts[match_reason] += 1
             counts["matched_spending_inputs"] += 1
             for entry in processor.extract_sigs_from_input(tx, vin_index):
                 counts["candidate_signature_rows"] += 1
-                row = signature_row_from_entry(
+                valid_candidates, invalid_candidates = candidate_rows_from_entry(
                     processor,
                     tx,
                     vin_index,
@@ -393,17 +485,15 @@ def collect_address_signatures(
                     block_height=height,
                     block_time=block_time,
                 )
-                key = (str(row["txid"]), int(row["vin"]), str(row["r"]), str(row["s"]))
-                if key in seen_rows:
-                    counts["duplicate_rows_skipped"] += 1
-                    continue
-                seen_rows.add(key)
-                valid, verify_reason, z_reason = validate_signature_row(row)
-                row["target_address_verify_reason"] = verify_reason
-                row["target_address_z_recompute"] = z_reason
-                if not valid:
+                if invalid_candidates:
+                    counts["candidate_pubkey_validation_failures"] += len(invalid_candidates)
+                for row, verify_reason, z_reason in invalid_candidates:
                     counts["invalid_signature_rows"] += 1
                     invalid_reason_counts[f"verify={verify_reason}|z={z_reason}"] += 1
+                    row["target_address_verify_reason"] = verify_reason
+                    row["target_address_z_recompute"] = z_reason
+                    if not persist_sighash_context:
+                        strip_persisted_sighash_context(row)
                     invalid_rows.append(row)
                     if len(invalid_samples) < 25:
                         invalid_samples.append({
@@ -415,12 +505,38 @@ def collect_address_signatures(
                             "type": row.get("type"),
                             "sighash": row.get("sighash"),
                         })
-                    if not keep_invalid_signatures:
+                    if keep_invalid_signatures:
+                        key = (
+                            str(row["txid"]),
+                            int(row["vin"]),
+                            str(row["r"]),
+                            str(row["s"]),
+                            str(row.get("pubkey_hex") or ""),
+                        )
+                        if key not in seen_rows:
+                            seen_rows.add(key)
+                            rows.append(row)
+                            counts["signature_rows"] += 1
+                for row, verify_reason, z_reason in valid_candidates:
+                    key = (
+                        str(row["txid"]),
+                        int(row["vin"]),
+                        str(row["r"]),
+                        str(row["s"]),
+                        str(row.get("pubkey_hex") or ""),
+                    )
+                    if key in seen_rows:
+                        counts["duplicate_rows_skipped"] += 1
                         continue
-                rows.append(row)
-                counts["signature_rows"] += 1
-                if row.get("pubkey_hex"):
-                    pubkey_prefixes[str(row["pubkey_hex"])[:20]] += 1
+                    seen_rows.add(key)
+                    row["target_address_verify_reason"] = verify_reason
+                    row["target_address_z_recompute"] = z_reason
+                    if not persist_sighash_context:
+                        strip_persisted_sighash_context(row)
+                    rows.append(row)
+                    counts["signature_rows"] += 1
+                    if row.get("pubkey_hex"):
+                        pubkey_prefixes[str(row["pubkey_hex"])[:20]] += 1
     if not dry_run:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with out_path.open("w", encoding="utf-8") as f:
@@ -445,7 +561,9 @@ def collect_address_signatures(
         "invalid_signature_rows": len(invalid_rows),
         "invalid_reason_counts": dict(invalid_reason_counts),
         "invalid_samples": invalid_samples,
+        "match_reason_counts": dict(match_reason_counts),
         "keep_invalid_signatures": bool(keep_invalid_signatures),
+        "persist_sighash_context": bool(persist_sighash_context),
         "pubkey_prefix_counts": dict(pubkey_prefixes.most_common(20)),
         "secret_material": "LOCAL_ARTIFACT_ONLY",
     }
@@ -459,6 +577,82 @@ def run_cmd(cmd: list[str], *, dry_run: bool) -> int:
     if dry_run:
         return 0
     return subprocess.run(cmd).returncode
+
+
+def signature_dedup_key(row: dict[str, Any]) -> str:
+    parts = (
+        str(row.get("txid") or ""),
+        str(row.get("vin") or ""),
+        str(row.get("r") or ""),
+        str(row.get("s") or ""),
+        str(row.get("pubkey_hex") or ""),
+    )
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8", "replace")).hexdigest()
+
+
+def merge_signatures_unique(src: Path, dst: Path, report_path: Path, *, dry_run: bool) -> dict[str, Any]:
+    """Append target-extracted public signature rows into a corpus with exact dedup."""
+
+    seen: set[str] = set()
+    dst_rows = 0
+    src_rows = 0
+    added = 0
+    skipped_dups = 0
+    bad_src_rows = 0
+    bad_dst_rows = 0
+
+    if dst.exists():
+        with dst.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    seen.add(signature_dedup_key(row))
+                    dst_rows += 1
+                except Exception:
+                    bad_dst_rows += 1
+
+    rows_to_add: list[str] = []
+    with src.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            src_rows += 1
+            try:
+                row = json.loads(line)
+            except Exception:
+                bad_src_rows += 1
+                continue
+            key = signature_dedup_key(row)
+            if key in seen:
+                skipped_dups += 1
+                continue
+            seen.add(key)
+            added += 1
+            rows_to_add.append(json.dumps(row, sort_keys=True))
+
+    if not dry_run and rows_to_add:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with dst.open("a", encoding="utf-8") as out:
+            for raw in rows_to_add:
+                out.write(raw + "\n")
+
+    report = {
+        "src": str(src),
+        "dst": str(dst),
+        "dry_run": bool(dry_run),
+        "dst_existing_rows": dst_rows,
+        "src_rows": src_rows,
+        "added_rows": added,
+        "skipped_duplicate_rows": skipped_dups,
+        "bad_src_rows": bad_src_rows,
+        "bad_dst_rows": bad_dst_rows,
+        "dedup_key": "sha256(txid,vin,r,s,pubkey_hex)",
+    }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    return report
 
 
 def main() -> None:
@@ -486,6 +680,8 @@ def main() -> None:
     ap.add_argument("--fetch-progress-every", type=int, default=10,
                     help="Print fetch progress every N pages; 0 disables progress prints")
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--risk-threshold", type=int, default=40,
+                    help="Forward to automate_recover.py; default avoids expensive recovery on monitor-only evidence")
     ap.add_argument("--cluster-min-sigs", type=int, default=2)
     ap.add_argument("--cluster-risk-threshold", type=int, default=5)
     ap.add_argument("--max-clusters", type=int, default=30)
@@ -519,10 +715,27 @@ def main() -> None:
                     help="Temporal neighbor window around suspicious/recovered/duplicate-r positions")
     ap.add_argument("--relation-all-signers", action="store_true",
                     help="Do not restrict relation scans to audit-flagged signers")
+    ap.add_argument("--enable-segmented-relation", action="store_true", default=True,
+                    help="Forward to automate_recover.py to emit segmented relation worksets")
+    ap.add_argument("--no-enable-segmented-relation", action="store_false", dest="enable_segmented_relation",
+                    help="Disable segmented relation workset generation")
+    ap.add_argument("--segmented-relation-max-signers", type=int, default=50)
+    ap.add_argument("--segmented-relation-max-segments", type=int, default=80)
+    ap.add_argument("--segmented-relation-max-rows", type=int, default=128)
+    ap.add_argument("--segmented-relation-max-pairs", type=int, default=8192)
+    ap.add_argument("--segmented-relation-min-sigs", type=int, default=4)
+    ap.add_argument("--segmented-relation-height-window", type=int, default=5000)
+    ap.add_argument("--segmented-relation-time-window-sec", type=int, default=604800)
     ap.add_argument("--exhaustive-recover", action="store_true",
                     help="Forward to automate_recover.py to run all enabled stages even when fusion says monitor_only")
     ap.add_argument("--keep-invalid-signatures", action="store_true",
                     help="Keep locally unverifiable extracted rows in recovery input; default writes them only to signatures.address.invalid.jsonl")
+    ap.add_argument("--persist-sighash-context", action="store_true",
+                    help="Write full per-row sighash_context into signatures.address.jsonl. Default keeps files small after validating z/signature.")
+    ap.add_argument("--merge-into", default="",
+                    help="Optional global signatures JSONL to append this address run into with exact dedup, e.g. signatures.jsonl")
+    ap.add_argument("--merge-report", default="",
+                    help="Optional merge report path; default is <out-dir>/target_address_merge_report.json")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-recover", action="store_true")
     args = ap.parse_args()
@@ -549,6 +762,7 @@ def main() -> None:
         start_after_txid=str(args.start_after_txid or "").strip(),
         fetch_progress_every=max(0, int(args.fetch_progress_every)),
         keep_invalid_signatures=bool(args.keep_invalid_signatures),
+        persist_sighash_context=bool(args.persist_sighash_context),
         dry_run=bool(args.dry_run),
     )
     print(
@@ -558,6 +772,22 @@ def main() -> None:
         f"signature_rows={collect_report['signature_rows']}",
         f"report={collect_report_path}",
     )
+
+    if str(args.merge_into or "").strip() and int(collect_report.get("signature_rows", 0)) > 0:
+        merge_report_path = Path(args.merge_report) if str(args.merge_report or "").strip() else out_dir / "target_address_merge_report.json"
+        merge_report = merge_signatures_unique(
+            sigs_path,
+            Path(str(args.merge_into).strip()),
+            merge_report_path,
+            dry_run=bool(args.dry_run),
+        )
+        print(
+            "target address merge complete:",
+            f"dst={merge_report['dst']}",
+            f"added={merge_report['added_rows']}",
+            f"skipped_dups={merge_report['skipped_duplicate_rows']}",
+            f"report={merge_report_path}",
+        )
 
     if args.no_recover or int(collect_report.get("signature_rows", 0)) <= 0:
         return
@@ -570,7 +800,7 @@ def main() -> None:
         "--decision-out", str(out_dir / "automate_decision.json"),
         "--recover-bin", args.recover_bin,
         "--threads", str(max(1, int(args.threads))),
-        "--risk-threshold", "0",
+        "--risk-threshold", str(max(0, int(args.risk_threshold))),
         "--cluster-min-sigs", str(max(2, int(args.cluster_min_sigs))),
         "--cluster-risk-threshold", str(max(0, int(args.cluster_risk_threshold))),
         "--max-clusters", str(max(1, int(args.max_clusters))),
@@ -589,6 +819,11 @@ def main() -> None:
         "--recover-collisions-out", str(out_dir / "r_collisions.jsonl"),
         "--recover-clusters-out", str(out_dir / "dupR_clusters.jsonl"),
         "--hnp-candidates-out", str(out_dir / "hnp_lll_bkz_candidates.txt"),
+        "--hnp-leaks-out", str(out_dir / "signatures.hnp_leaks.jsonl"),
+        "--hnp-leak-report", str(out_dir / "hnp_leak_report.json"),
+        "--hnp-bounded-k-out", str(out_dir / "hnp_bounded_k_candidates.jsonl"),
+        "--hnp-bounded-k-report", str(out_dir / "hnp_bounded_k_report.json"),
+        "--hnp-report-out", str(out_dir / "hnp_lll_bkz_report.json"),
         "--candidate-validation-report", str(out_dir / "candidate_validation_report.json"),
         "--target-sigs-out", str(out_dir / "signatures.target.jsonl"),
         "--stage0-subset-out", str(out_dir / "signatures.dup_r_focus.jsonl"),
@@ -611,8 +846,21 @@ def main() -> None:
         "--relation-max-rows-per-signer", str(max(2, int(args.relation_max_rows_per_signer))),
         "--relation-max-pairs-per-signer", str(max(1, int(args.relation_max_pairs_per_signer))),
         "--relation-neighbor-window", str(max(1, int(args.relation_neighbor_window))),
+        "--segmented-relation-dir", str(out_dir / "relation_segments"),
+        "--segmented-relation-report", str(out_dir / "segmented_relation_report.json"),
+        "--segmented-relation-min-sigs", str(max(2, int(args.segmented_relation_min_sigs))),
+        "--segmented-relation-max-signers", str(max(1, int(args.segmented_relation_max_signers))),
+        "--segmented-relation-max-segments", str(max(1, int(args.segmented_relation_max_segments))),
+        "--segmented-relation-max-rows", str(max(2, int(args.segmented_relation_max_rows))),
+        "--segmented-relation-max-pairs", str(max(1, int(args.segmented_relation_max_pairs))),
+        "--segmented-relation-height-window", str(max(1, int(args.segmented_relation_height_window))),
+        "--segmented-relation-time-window-sec", str(max(1, int(args.segmented_relation_time_window_sec))),
         "--enable-advanced-recover",
     ]
+    if args.enable_segmented_relation:
+        cmd.append("--enable-segmented-relation")
+    else:
+        cmd.append("--no-enable-segmented-relation")
     if str(args.preload_priv_candidates or "").strip():
         cmd += ["--preload-priv-candidates", str(args.preload_priv_candidates).strip()]
     if str(args.preload_recovered_json or "").strip():

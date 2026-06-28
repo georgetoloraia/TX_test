@@ -23,6 +23,7 @@ import sys
 import urllib.parse
 import urllib.request
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 
@@ -286,6 +287,48 @@ def save_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def load_audit_pipeline_index(path: Path) -> dict:
+    data = load_json(
+        path,
+        {
+            "version": 1,
+            "processed_pubkeys": {},
+            "processed_reports": {},
+            "alerts": [],
+        },
+    )
+    if not isinstance(data, dict):
+        return {
+            "version": 1,
+            "processed_pubkeys": {},
+            "processed_reports": {},
+            "alerts": [],
+        }
+    data.setdefault("version", 1)
+    data.setdefault("processed_pubkeys", {})
+    data.setdefault("processed_reports", {})
+    data.setdefault("alerts", [])
+    return data
+
+
+def save_audit_pipeline_index(path: Path, payload: dict) -> None:
+    save_json(path, payload)
+
+
+def load_flagged_vulnerable_keys(path: Path) -> dict:
+    data = load_json(path, {"version": 1, "entries": []})
+    if not isinstance(data, dict):
+        return {"version": 1, "entries": []}
+    data.setdefault("version", 1)
+    if not isinstance(data.get("entries"), list):
+        data["entries"] = []
+    return data
+
+
+def save_flagged_vulnerable_keys(path: Path, payload: dict) -> None:
+    save_json(path, payload)
+
+
 def now_utc_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -334,6 +377,240 @@ def mark_alert_sent(state: dict, fingerprint: str, summary: str) -> None:
     sent[fingerprint] = {"sent_at": now_utc_iso(), "summary": summary}
 
 
+def _pipeline_warn(path: Path, reason: str, **fields: object) -> None:
+    payload = {"path": str(path), "reason": reason, **fields}
+    print(f"[PIPELINE_WARN] {json.dumps(payload, sort_keys=True)}")
+
+
+def _audit_report_is_complete(report: dict) -> bool:
+    if not isinstance(report, dict):
+        return False
+    if "risk_score" in report and "risk_verdict" in report:
+        return True
+    risk = report.get("risk", {}) or {}
+    return "score" in risk and "verdict" in risk
+
+
+def is_defensive_audit_report(report: dict) -> bool:
+    if not isinstance(report, dict):
+        return False
+    if report.get("audit_mode") == "defensive_nonce_bias":
+        return True
+    if "statistical_metrics" in report:
+        return True
+    if "nonce_bias_profile" in report and "risk_verdict" in report:
+        return True
+    return False
+
+
+def _load_audit_report_candidate(path: Path) -> dict | None:
+    try:
+        if not path.is_file():
+            return None
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        _pipeline_warn(path, "unparseable_json", error=str(e))
+        return None
+    if not isinstance(report, dict):
+        _pipeline_warn(path, "incomplete_schema", detail="json_root_not_object")
+        return None
+    if not is_defensive_audit_report(report):
+        return None
+    if not _audit_report_is_complete(report):
+        _pipeline_warn(path, "incomplete_schema", detail="missing_risk_fields")
+        return None
+    return report
+
+
+def extract_audit_pubkeys(report: dict) -> list[str]:
+    pubs: set[str] = set()
+
+    def add_pub(value: object) -> None:
+        if not value:
+            return
+        text = str(value).strip().lower()
+        if not text:
+            return
+        if text.startswith("pub:"):
+            text = text[4:]
+        if len(text) >= 66 and all(ch in "0123456789abcdef" for ch in text[:66]):
+            pubs.add(text[:66])
+
+    target = report.get("target_filter", {}) or {}
+    add_pub(target.get("target_pubkey"))
+    for cluster in ((report.get("clusters", {}) or {}).get("top_clusters", []) or []):
+        add_pub(cluster.get("pubkey"))
+        add_pub(cluster.get("pubkey_hex"))
+        cluster_id = str(cluster.get("cluster") or "")
+        if cluster_id.startswith("pub:"):
+            add_pub(cluster_id[4:])
+    for section in ("signer_longitudinal_drift", "signer_change_points", "signer_mixture_modes", "constraint_model_fits"):
+        for item in ((report.get(section, {}) or {}).get("top_flagged_signers", []) or []):
+            add_pub(item.get("pubkey"))
+            add_pub(item.get("pubkey_hex"))
+    return sorted(pubs)
+
+
+def scan_audit_reports(search_root: Path, max_workers: int = 8) -> list[tuple[Path, dict]]:
+    if not search_root.exists():
+        return []
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for pattern in ("*audit*.json", "*bias*.json"):
+        for path in search_root.rglob(pattern):
+            if not path.is_file():
+                continue
+            key = str(path.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(path)
+    if not candidates:
+        return []
+    workers = max(1, min(int(max_workers), 16))
+    results: list[tuple[Path, dict]] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_load_audit_report_candidate, path): path for path in candidates}
+        for future in as_completed(futures):
+            path = futures[future]
+            try:
+                report = future.result()
+            except Exception as e:
+                _pipeline_warn(path, "loader_exception", error=str(e))
+                continue
+            if report is not None:
+                results.append((path, report))
+    results.sort(key=lambda item: str(item[0]))
+    return results
+
+
+def process_audit_reports(
+    *,
+    search_root: Path,
+    index_path: Path,
+    security_log_path: Path,
+    max_workers: int = 8,
+) -> dict[str, object]:
+    index = load_audit_pipeline_index(index_path)
+    scanned = scan_audit_reports(search_root, max_workers=max_workers)
+    alerts: list[dict[str, object]] = []
+    total_keys_audited = 0
+    audit_alerts_triggered = 0
+    pass_verdict_count = 0
+    total_signatures_profiled = 0
+    skipped_already_processed = 0
+
+    for path, report in scanned:
+        risk_score = float(report.get("risk_score", report.get("risk", {}).get("score", 0)) or 0.0)
+        risk_verdict = str(report.get("risk_verdict", report.get("risk", {}).get("verdict", "unknown")))
+        sig_count = int(report.get("signature_count", report.get("statistical_metrics", {}).get("total_signatures_profiled", 0)) or 0)
+        total_signatures_profiled += sig_count
+
+        pubkeys = extract_audit_pubkeys(report)
+        if not pubkeys:
+            _pipeline_warn(path, "incomplete_schema", detail="missing_pubkeys")
+            continue
+
+        for pubkey in pubkeys:
+            state = index["processed_pubkeys"].get(pubkey)
+            if isinstance(state, dict) and state.get("status") in {"critical_bias_detected", "pass"}:
+                skipped_already_processed += 1
+                continue
+
+            total_keys_audited += 1
+            critical = risk_verdict == "CRITICAL_BIAS_DETECTED" or risk_score > 60.0
+            status = "critical_bias_detected" if critical else "pass"
+            if status == "pass":
+                pass_verdict_count += 1
+            else:
+                audit_alerts_triggered += 1
+
+            entry = {
+                "pubkey": pubkey,
+                "status": status,
+                "risk_score": risk_score,
+                "risk_verdict": risk_verdict,
+                "signature_count": sig_count,
+                "source_report": str(path),
+                "seen_utc": now_utc_iso(),
+            }
+            index["processed_pubkeys"][pubkey] = dict(entry)
+            index["processed_reports"][hashlib.sha256(json.dumps(report, sort_keys=True).encode("utf-8")).hexdigest()] = {
+                "pubkey": pubkey,
+                "status": status,
+                "source_report": str(path),
+                "seen_utc": entry["seen_utc"],
+            }
+            if critical:
+                alerts.append(
+                    {
+                        "pubkey": pubkey,
+                        "risk_score": risk_score,
+                        "risk_verdict": risk_verdict,
+                        "signature_count": sig_count,
+                        "source_report": str(path),
+                        "summary": report.get("statistical_metrics", {}) or {},
+                        "timestamp_utc": entry["seen_utc"],
+                    }
+                )
+
+    if alerts:
+        store = load_flagged_vulnerable_keys(security_log_path)
+        existing = {
+            (str(row.get("pubkey")), str(row.get("source_report")))
+            for row in store.get("entries", [])
+            if isinstance(row, dict)
+        }
+        for alert in alerts:
+            key = (str(alert.get("pubkey")), str(alert.get("source_report")))
+            if key in existing:
+                continue
+            store["entries"].append(alert)
+            existing.add(key)
+        store["entry_count"] = len(store["entries"])
+        store["last_updated_utc"] = now_utc_iso()
+        save_flagged_vulnerable_keys(security_log_path, store)
+        index["alerts"].extend(
+            {
+                "pubkey": alert["pubkey"],
+                "risk_score": alert["risk_score"],
+                "risk_verdict": alert["risk_verdict"],
+                "source_report": alert["source_report"],
+                "seen_utc": alert["timestamp_utc"],
+            }
+            for alert in alerts
+        )
+
+    save_audit_pipeline_index(index_path, index)
+
+    def dispatch_audit_notification(alert: dict[str, object]) -> dict[str, object]:
+        message = (
+            f"[PIPELINE_AUDIT_ALERT] pubkey={alert.get('pubkey')} "
+            f"risk_score={alert.get('risk_score')} "
+            f"verdict={alert.get('risk_verdict')} "
+            f"sigs={alert.get('signature_count')} "
+            f"source={alert.get('source_report')}"
+        )
+        print(message)
+        return {"dispatched": True, "channel": "mock", "message": message}
+
+    notifications = [dispatch_audit_notification(alert) for alert in alerts]
+    return {
+        "scanned_reports": len(scanned),
+        "total_keys_audited": total_keys_audited,
+        "audit_alerts_triggered": audit_alerts_triggered,
+        "pass_verdict_count": pass_verdict_count,
+        "total_signatures_profiled": total_signatures_profiled,
+        "skipped_already_processed": skipped_already_processed,
+        "processed_pubkeys_total": len(index.get("processed_pubkeys", {}) or {}),
+        "processed_alerts_total": len(index.get("alerts", []) or []),
+        "alerts": alerts,
+        "notifications": notifications,
+        "pipeline_index": str(index_path),
+        "security_log": str(security_log_path),
+    }
+
+
 def append_timeline_event(path: Path, event: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
@@ -363,6 +640,13 @@ def build_daily_summary(events: list[dict], day_iso: str) -> dict:
     recovered_rows = sum(int(e.get("new_recovered_rows", 0)) for e in events)
     anomalies = [e for e in events if bool(e.get("anomaly_detected", False))]
     recover_runs = [e for e in events if bool(e.get("recover_executed", False))]
+    total_keys_audited = sum(int(e.get("total_keys_audited", 0) or 0) for e in events)
+    audit_alerts_triggered = sum(int(e.get("audit_alerts_triggered", 0) or 0) for e in events)
+    pass_verdict_count = sum(int(e.get("pass_verdict_count", 0) or 0) for e in events)
+    total_signatures_profiled = sum(int(e.get("total_signatures_profiled", 0) or 0) for e in events)
+    audit_cycle_count = sum(1 for e in events if int(e.get("total_keys_audited", 0) or 0) > 0)
+    processed_pubkeys_total = int(events[-1].get("processed_pubkeys_total", 0) or 0) if events else 0
+    processed_alerts_total = int(events[-1].get("processed_alerts_total", 0) or 0) if events else 0
 
     stage_counter: dict[str, int] = {}
     for e in events:
@@ -376,6 +660,13 @@ def build_daily_summary(events: list[dict], day_iso: str) -> dict:
         "recover_executed_cycles": len(recover_runs),
         "anomaly_cycles": len(anomalies),
         "new_recovered_rows_total": recovered_rows,
+        "total_keys_audited": total_keys_audited,
+        "audit_alerts_triggered": audit_alerts_triggered,
+        "pass_verdict_count": pass_verdict_count,
+        "total_signatures_profiled": total_signatures_profiled,
+        "audit_cycle_count": audit_cycle_count,
+        "processed_pubkeys_total": processed_pubkeys_total,
+        "processed_alerts_total": processed_alerts_total,
         "stage_run_counts": stage_counter,
         "latest_cycle": events[-1]["cycle"] if events else None,
     }
@@ -394,6 +685,12 @@ def write_daily_reports(reports_dir: Path, day_iso: str, summary: dict, events: 
     lines.append(f"- Recover executed cycles: {summary['recover_executed_cycles']}")
     lines.append(f"- Anomaly cycles: {summary['anomaly_cycles']}")
     lines.append(f"- New recovered rows total: {summary['new_recovered_rows_total']}")
+    lines.append(f"- Total keys audited: {summary.get('total_keys_audited', 0)}")
+    lines.append(f"- Audit alerts triggered: {summary.get('audit_alerts_triggered', 0)}")
+    lines.append(f"- Pass verdict count: {summary.get('pass_verdict_count', 0)}")
+    lines.append(f"- Total signatures profiled: {summary.get('total_signatures_profiled', 0)}")
+    lines.append(f"- Processed pubkeys total: {summary.get('processed_pubkeys_total', 0)}")
+    lines.append(f"- Processed alerts total: {summary.get('processed_alerts_total', 0)}")
     lines.append("")
     lines.append("## Recover Stage Counts")
     if summary["stage_run_counts"]:
@@ -406,7 +703,9 @@ def write_daily_reports(reports_dir: Path, day_iso: str, summary: dict, events: 
     for e in events[-50:]:
         lines.append(
             f"- cycle={e.get('cycle')} start={e.get('start_height')} "
-            f"risk={e.get('risk_score')} anomaly={e.get('anomaly_detected')} "
+            f"risk={e.get('risk_score')} verdict={e.get('risk_verdict')} "
+            f"audit_keys={e.get('total_keys_audited', 0)} audit_alerts={e.get('audit_alerts_triggered', 0)} "
+            f"pass={e.get('pass_verdict_count', 0)} profiled={e.get('total_signatures_profiled', 0)} "
             f"recover={e.get('recover_executed')} new_rows={e.get('new_recovered_rows')}"
         )
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1022,6 +1321,10 @@ def main() -> None:
     run_id = f"{run_stamp}_pipeline_h{args.start_height}_p{os.getpid()}"
     run_dir = Path(args.runs_dir) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    audit_state_index_path = Path(args.audit_state_index) if args.audit_state_index else Path(args.reports_dir) / "audit_pipeline_index.json"
+    flagged_vulnerable_keys_path = (
+        Path(args.flagged_vulnerable_keys) if args.flagged_vulnerable_keys else Path(args.reports_dir) / "flagged_vulnerable_keys.json"
+    )
     save_json(run_dir / "run_manifest.json", {
         "run_id": run_id,
         "started_at_utc": now_utc_iso(),
@@ -1030,6 +1333,8 @@ def main() -> None:
         "max_cycles": args.max_cycles,
         "discovery_mode": args.discovery_mode,
         "python": args.python,
+        "audit_state_index": str(audit_state_index_path),
+        "flagged_vulnerable_keys": str(flagged_vulnerable_keys_path),
     })
     print(f"[run] run_id={run_id} artifacts_dir={run_dir}")
 
@@ -1164,6 +1469,8 @@ def main() -> None:
             "--audit-report", str(cycle_artifacts["audit_report"]),
             "--decision-out", str(cycle_artifacts["decision_report"]),
             "--baseline-report", str(run_dir / "ecdsa_audit_report_prev.json"),
+            "--audit-state-index", str(audit_state_index_path),
+            "--flagged-vulnerable-keys", str(flagged_vulnerable_keys_path),
             "--threads", str(effective["threads"]),
             "--risk-threshold", str(args.risk_threshold),
             "--cluster-min-sigs", str(effective["cluster_min_sigs"]),
@@ -1424,7 +1731,7 @@ def main() -> None:
                         f"hnp_candidates={d.get('hnp_candidate_rows', hnp_candidate_count)}\n"
                     )
             except Exception as e:
-                print(f"[warn] failed to parse decision report: {e}")
+                _pipeline_warn(decision_path, "decision_parse_failed", error=str(e))
         elif audit_path.exists():
             try:
                 a = json.loads(audit_path.read_text(encoding="utf-8"))
@@ -1449,7 +1756,23 @@ def main() -> None:
                         f"risk_verdict={a.get('risk', {}).get('verdict')}\n"
                     )
             except Exception as e:
-                print(f"[warn] failed to parse audit report: {e}")
+                _pipeline_warn(audit_path, "audit_parse_failed", error=str(e))
+
+        audit_cycle_result = process_audit_reports(
+            search_root=cycle_artifacts["dir"],
+            index_path=audit_state_index_path,
+            security_log_path=flagged_vulnerable_keys_path,
+            max_workers=max(1, min(int(args.threads), 16)),
+        )
+        if audit_cycle_result.get("total_keys_audited", 0):
+            print(
+                "[audit-telemetry]",
+                f"keys={audit_cycle_result.get('total_keys_audited', 0)}",
+                f"alerts={audit_cycle_result.get('audit_alerts_triggered', 0)}",
+                f"passes={audit_cycle_result.get('pass_verdict_count', 0)}",
+                f"profiled={audit_cycle_result.get('total_signatures_profiled', 0)}",
+                f"skipped_processed={audit_cycle_result.get('skipped_already_processed', 0)}",
+            )
 
         if args.enable_pubkey_expansion and args.pubkey_expansion_phase in ("after-recovery", "both") and (
             anomaly_alert
@@ -1544,6 +1867,13 @@ def main() -> None:
             "drift_flags": int(decision_obj.get("drift_flags", 0) or 0),
             "sighash_anomaly": bool(decision_obj.get("sighash_anomaly", False)),
             "recover_stages": decision_obj.get("recover_stages", []),
+            "total_keys_audited": int(audit_cycle_result.get("total_keys_audited", 0) or 0),
+            "audit_alerts_triggered": int(audit_cycle_result.get("audit_alerts_triggered", 0) or 0),
+            "pass_verdict_count": int(audit_cycle_result.get("pass_verdict_count", 0) or 0),
+            "total_signatures_profiled": int(audit_cycle_result.get("total_signatures_profiled", 0) or 0),
+            "processed_pubkeys_total": int(audit_cycle_result.get("processed_pubkeys_total", 0) or 0),
+            "processed_alerts_total": int(audit_cycle_result.get("processed_alerts_total", 0) or 0),
+            "audit_pipeline_index": str(audit_state_index_path),
             "cumulative_merge": cumulative_merge_reports,
             "pubkey_expansion": pubkey_expansion_report,
         }
@@ -1553,6 +1883,17 @@ def main() -> None:
         day_events = load_timeline_for_day(timeline_path, day_iso)
         summary = build_daily_summary(day_events, day_iso)
         write_daily_reports(Path(args.reports_dir), day_iso, summary, day_events)
+        print(
+            "[dashboard]",
+            f"day={day_iso}",
+            f"cycles={summary['cycles']}",
+            f"audited_keys={summary.get('total_keys_audited', 0)}",
+            f"alerts={summary.get('audit_alerts_triggered', 0)}",
+            f"passes={summary.get('pass_verdict_count', 0)}",
+            f"profiled={summary.get('total_signatures_profiled', 0)}",
+            f"processed_total={audit_cycle_result.get('processed_pubkeys_total', 0)}",
+            f"new_rows={summary.get('new_recovered_rows_total', 0)}",
+        )
 
         current_start = cycle_start + args.batch_size
 
