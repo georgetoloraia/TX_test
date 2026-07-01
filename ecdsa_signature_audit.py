@@ -1303,8 +1303,8 @@ def sigmoid(x: float) -> float:
     return z / (1.0 + z)
 
 
-MIN_CORRELATION_SIGNAL_SAMPLES = 25
-MIN_BIAS_ATTACK_READINESS_SAMPLES = 50
+MIN_CORRELATION_SIGNAL_SAMPLES = 2
+MIN_BIAS_ATTACK_READINESS_SAMPLES = 5
 
 
 def build_signal_fusion(report: dict[str, Any]) -> dict[str, Any]:

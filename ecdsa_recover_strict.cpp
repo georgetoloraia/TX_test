@@ -1615,19 +1615,57 @@ static size_t seed_from_known_privs(const std::string& sigs_path,
             BN_free(tmp); BN_free(k); BN_free(invS); BN_free(nk);
         }
     }
-    // 4) flush recovered_k jsonl
+    // 4) flush only new recovered_k facts. Repeated known-priv preload runs should
+    // not inflate recovered_k.jsonl with identical snapshot rows.
+    std::unordered_map<std::string, std::unordered_set<std::string>> existing_by_r;
+    {
+        std::ifstream existing_in(out_k_path);
+        std::string existing_line;
+        while(std::getline(existing_in, existing_line)){
+            std::string er;
+            if(!jsonl_get(existing_line, "r", er)) continue;
+            er = hexlower(er);
+            size_t arr_key = existing_line.find("\"k_candidates\"");
+            if(arr_key == std::string::npos) continue;
+            size_t arr_begin = existing_line.find('[', arr_key);
+            size_t arr_end = existing_line.find(']', arr_begin == std::string::npos ? arr_key : arr_begin);
+            if(arr_begin == std::string::npos || arr_end == std::string::npos || arr_end <= arr_begin) continue;
+            size_t p = arr_begin + 1;
+            while(true){
+                size_t q = existing_line.find('"', p);
+                if(q == std::string::npos || q >= arr_end) break;
+                size_t q2 = existing_line.find('"', q + 1);
+                if(q2 == std::string::npos || q2 > arr_end) break;
+                std::string val = existing_line.substr(q + 1, q2 - q - 1);
+                if(val.size() == 64 && is_hexlike(val)) existing_by_r[er].insert(hexlower(val));
+                p = q2 + 1;
+            }
+        }
+    }
+
     size_t buckets = 0;
+    size_t duplicate_k_candidates = 0;
     std::ofstream fk(out_k_path, std::ios::app);
     for(auto &it : by_r){
         if(it.second.empty()) continue;
-        fk << "{\"r\":\""<< it.first <<"\",\"k_candidates\":[";
-        bool first=true;
+        std::vector<std::string> new_candidates;
+        auto& known = existing_by_r[it.first];
         for(const auto& kh: it.second){
-            if(!first) fk << ",";
-            first=false;
-            fk << "\"" << kh << "\"";
+            if(known.count(kh)){
+                duplicate_k_candidates++;
+                continue;
+            }
+            known.insert(kh);
+            new_candidates.push_back(kh);
         }
-        fk << "]}\n";
+        if(new_candidates.empty()) continue;
+        std::sort(new_candidates.begin(), new_candidates.end());
+        fk << "{\"r\":\""<< it.first <<"\",\"k_candidates\":[";
+        for(size_t i = 0; i < new_candidates.size(); ++i){
+            if(i) fk << ",";
+            fk << "\"" << new_candidates[i] << "\"";
+        }
+        fk << "],\"source\":\"known-priv-chain\"}\n";
         buckets++;
     }
     BN_free(bnN); BN_CTX_free(bctx);
@@ -1637,6 +1675,7 @@ static size_t seed_from_known_privs(const std::string& sigs_path,
               << ", rejected_r_mismatch: " << k_rejected_r_mismatch
               << ", rejected_zero: " << k_rejected_zero
               << ", rejected_no_inverse: " << k_rejected_no_inverse
+              << ", duplicate_k_candidates: " << duplicate_k_candidates
               << ", pairs tested: " << pairs_tested << ")\n";
     return buckets;
 }

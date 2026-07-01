@@ -10,6 +10,9 @@ present in real signatures.
 Recovered private/WIF material, if any, is written only to local artifacts in
 the output directory by automate_recover.py.
 """
+"""
+python3 target_address_recover.py   --address input-addr --enable-nonce-hypotheses   --exhaustive-recover   --enable-segmented-relation   --max-iter 4   --random-k-budget 1000000   --hnp-timeout-sec 300   --hnp-min-leaks 4
+"""
 
 from __future__ import annotations
 
@@ -665,8 +668,8 @@ def main() -> None:
                     help="Local file containing known private key candidates; forwarded to automate_recover.py without printing secrets")
     ap.add_argument("--preload-recovered-json", default="",
                     help="Local recovered_keys.jsonl seed file; forwarded to automate_recover.py")
-    ap.add_argument("--max-pages", type=int, default=4)
-    ap.add_argument("--max-txs", type=int, default=100)
+    ap.add_argument("--max-pages", type=int, default=400)
+    ap.add_argument("--max-txs", type=int, default=100000)
     ap.add_argument("--timeout", type=int, default=20)
     ap.add_argument("--sleep-sec", type=float, default=0.25)
     ap.add_argument("--fetch-retries", type=int, default=3,
@@ -684,7 +687,7 @@ def main() -> None:
                     help="Forward to automate_recover.py; default avoids expensive recovery on monitor-only evidence")
     ap.add_argument("--cluster-min-sigs", type=int, default=2)
     ap.add_argument("--cluster-risk-threshold", type=int, default=5)
-    ap.add_argument("--max-clusters", type=int, default=30)
+    ap.add_argument("--max-clusters", type=int, default=300)
     ap.add_argument("--max-iter", type=int, default=2)
     ap.add_argument("--random-k-budget", type=int, default=0)
     ap.add_argument("--fallback-max-iter", type=int, default=0,
@@ -692,7 +695,7 @@ def main() -> None:
     ap.add_argument("--fallback-random-k-budget", type=int, default=-1,
                     help="Forward to automate_recover.py; -1 uses --random-k-budget")
     ap.add_argument("--hnp-timeout-sec", type=int, default=120)
-    ap.add_argument("--hnp-min-leaks", type=int, default=4)
+    ap.add_argument("--hnp-min-leaks", type=int, default=2)
     ap.add_argument("--enable-nonce-hypotheses", action="store_true",
                     help="Forward to automate_recover.py to test bounded weak-nonce hypothesis models")
     ap.add_argument("--nonce-hypothesis-models", default="",
@@ -705,11 +708,11 @@ def main() -> None:
     ap.add_argument("--nonce-max-candidates", type=int, default=200000)
     ap.add_argument("--relation-min-sigs", type=int, default=8,
                     help="Forward to automate_recover.py signer relation subset builder")
-    ap.add_argument("--relation-max-signers", type=int, default=200,
+    ap.add_argument("--relation-max-signers", type=int, default=2000,
                     help="Maximum signers to include in relation scans")
-    ap.add_argument("--relation-max-rows-per-signer", type=int, default=512,
+    ap.add_argument("--relation-max-rows-per-signer", type=int, default=1024,
                     help="Maximum selected rows per signer before pair-budget cap")
-    ap.add_argument("--relation-max-pairs-per-signer", type=int, default=8192,
+    ap.add_argument("--relation-max-pairs-per-signer", type=int, default=16000,
                     help="Pair budget per signer; effective rows are capped by this quadratic limit")
     ap.add_argument("--relation-neighbor-window", type=int, default=2,
                     help="Temporal neighbor window around suspicious/recovered/duplicate-r positions")
